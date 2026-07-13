@@ -31,7 +31,7 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, Choreographer.
     }
 
     override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
-        nativeSetSurface(holder.surface, width, height)
+        // Vulkan 通过 swapchain 重建自动处理 surface 变化，无需重新创建 VkSurface
     }
 
     override fun surfaceDestroyed(holder: SurfaceHolder) {}
@@ -53,7 +53,7 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, Choreographer.
     @dalvik.annotation.optimization.FastNative
     private external fun nativeSetSurface(surface: android.view.Surface, width: Int, height: Int)
 
-    @dalvik.annotation.optimization.CriticalNative
+    @dalvik.annotation.optimization.FastNative
     private external fun nativeRenderFrame()
 
     @dalvik.annotation.optimization.FastNative

@@ -38,20 +38,33 @@ pub struct VulkanRenderer {
 
 impl VulkanRenderer {
     pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
-        let entry = unsafe { ash::Entry::load()? };
+        let entry = match unsafe { ash::Entry::load() } {
+            Ok(e) => e,
+            Err(e) => {
+                log::error!("[vulkan] Entry::load() failed: {:?}", e);
+                return Err(Box::new(e));
+            }
+        };
         let engine_name = CString::new("wl-android")?;
         let app_info = vk::ApplicationInfo::default()
-            .api_version(vk::API_VERSION_1_1)
+            .api_version(vk::API_VERSION_1_0)
             .engine_name(&engine_name);
 
-        let ext_mem = CString::new("VK_KHR_external_memory_fd")?;
-        let android_s = CString::new("VK_KHR_android_surface")?;
-        let ext_names = vec![ext_mem.as_ptr(), android_s.as_ptr()];
+        // Android 需要 VK_KHR_android_surface + VK_KHR_surface 才能创建 surface
+        let android_surf = CString::new("VK_KHR_android_surface").unwrap();
+        let surface = CString::new("VK_KHR_surface").unwrap();
+        let ext_names = vec![android_surf.as_ptr(), surface.as_ptr()];
 
         let inst = vk::InstanceCreateInfo::default()
             .application_info(&app_info)
-            .enabled_extension_names(&ext_names);
-        let instance = unsafe { entry.create_instance(&inst, None)? };
+            .enabled_extension_names(ext_names.as_slice());
+        let instance = match unsafe { entry.create_instance(&inst, None) } {
+            Ok(i) => i,
+            Err(e) => {
+                log::error!("[vulkan] create_instance failed: {:?}", e);
+                return Err(Box::new(e));
+            }
+        };
 
         let pds = unsafe { instance.enumerate_physical_devices()? };
         let (pd, qf) = pds.iter().find_map(|&pd| {
@@ -61,7 +74,8 @@ impl VulkanRenderer {
         }).ok_or("no GPU")?;
 
         let swp_name = CString::new("VK_KHR_swapchain")?;
-        let dev_ext = vec![swp_name.as_ptr(), ext_mem.as_ptr()];
+        let ext_fd = CString::new("VK_KHR_external_memory_fd")?;
+        let dev_ext = vec![swp_name.as_ptr(), ext_fd.as_ptr()];
         let qci = vk::DeviceQueueCreateInfo::default()
             .queue_family_index(qf).queue_priorities(&[1.0f32]);
         let queues = [qci];
@@ -70,7 +84,7 @@ impl VulkanRenderer {
         let device = unsafe { instance.create_device(pd, &dci, None)? };
         let queue = unsafe { device.get_device_queue(qf, 0) };
         let memory_properties = unsafe { instance.get_physical_device_memory_properties(pd) };
-        let has_ext_mem_fd = Self::has_ext(&instance, pd, &ext_mem);
+        let has_ext_mem_fd = false; // TODO: check device ext
 
         let cmd_pool = unsafe { device.create_command_pool(
             &vk::CommandPoolCreateInfo::default().queue_family_index(qf)
