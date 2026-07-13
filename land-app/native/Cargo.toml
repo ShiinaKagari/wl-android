@@ -1,0 +1,18 @@
+[package]
+name = "land-native"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+land-common = { path = "../../crates/land-common" }
+ash = "0.38"
+log = "0.4"
+android_logger = "0.14"
+
+[dependencies.jni]
+version = "0.21"
+features = ["invocation"]

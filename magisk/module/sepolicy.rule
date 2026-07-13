@@ -1,0 +1,37 @@
+# wl-android-daemon SELinux 策略
+# landd 在 tmpfs 上创建 socket，双向转发帧和触摸事件
+
+# 进程类型
+type landd;
+typeattribute landd mlstrustedsubject;
+
+# tmpfs 操作 (创建 socket 目录和文件)
+allow landd tmpfs:dir { create_dir_perms search write };
+allow landd tmpfs:sock_file { create_file_perms write };
+allow landd tmpfs:file { write append };
+
+# Unix stream socket 操作
+allow landd self:unix_stream_socket { create_socket_perms bind listen accept };
+
+# 接受来自 App 的连接
+allow appdomain landd:unix_stream_socket { connectto read write };
+allow landd appdomain:unix_stream_socket { accept read write getattr };
+
+# 接受来自容器进程的连接
+allow container_domain landd:unix_stream_socket { connectto read write };
+allow landd container_domain:unix_stream_socket { accept read write getattr };
+
+# 接受来自任何域的通用连接 (兜底)
+allow unconfineddomain landd:unix_stream_socket connectto;
+allow landd unconfineddomain:unix_stream_socket accept;
+
+# 文件系统权限 (读取自身二进制)
+allow landd system_file:file execute;
+allow landd system_file:file read;
+
+# 进程信号
+allow landd appdomain:signal sigusr1;
+allow landd self:capability { sys_resource dac_override };
+
+# init 阶段
+allow landd init:unix_stream_socket connectto;

@@ -1,0 +1,19 @@
+/target/
+**/*.rs.bk
+
+# Android / Gradle
+.gradle/
+local.properties
+*.apk
+*.aab
+*.hprof
+.idea/
+*.iml
+build/
+
+# Magisk ZIP
+*.zip
+
+# OS
+.DS_Store
+Thumbs.db

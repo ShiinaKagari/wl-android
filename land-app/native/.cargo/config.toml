@@ -1,0 +1,4 @@
+[target.aarch64-linux-android]
+# Android NDK linker (set ANDROID_NDK_HOME to your NDK path)
+linker = "aarch64-linux-android21-clang"
+# For cargo-ndk, this is handled automatically

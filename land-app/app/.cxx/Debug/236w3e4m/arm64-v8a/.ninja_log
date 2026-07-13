@@ -1,0 +1,5 @@
+# ninja log v5
+0	46	1783779262876163137	CMakeFiles/land-bridge.dir/bridge.cpp.o	a3614856c8046a77
+4	83	1783906048295072705	/home/kagari/Projects/wl-android/land-app/app/build/intermediates/cxx/Debug/236w3e4m/obj/arm64-v8a/libland-bridge.so	36fb11503c0cd7fc
+0	36	1783906165369269799	CMakeFiles/land-bridge.dir/bridge.cpp.o	a3614856c8046a77
+36	47	1783906165382269632	/home/kagari/Projects/wl-android/land-app/app/build/intermediates/cxx/Debug/236w3e4m/obj/arm64-v8a/libland-bridge.so	2e8f67fdd565427c

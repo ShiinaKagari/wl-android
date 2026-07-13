@@ -1,0 +1,7 @@
+id=wl-android-daemon
+name=wl-android Daemon
+version=0.1.0
+versionCode=1
+author=wl-android
+description=Creates /dev/socket/land.sock and runs landd daemon for wl-android frame forwarding. Install land-app APK separately.
+minMagiskVersion=24000
