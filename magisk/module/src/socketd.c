@@ -10,32 +10,34 @@
 #include <sys/stat.h>
 #include <errno.h>
 
-#define SOCKET_PATH "/dev/socket/land.sock"
 #define BUF_SIZE (4 * 1024 * 1024)
 
 static int running = 1;
 static void handle_signal(int s) { running = 0; }
 
 int main(void) {
+    const char *socket_path = getenv("LAND_SOCKET");
+    if (!socket_path) socket_path = "/dev/socket/land.sock";
+
     signal(SIGINT, handle_signal);
     signal(SIGTERM, handle_signal);
     signal(SIGPIPE, SIG_IGN);
 
-    unlink(SOCKET_PATH);
+    unlink(socket_path);
 
     int listen_fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (listen_fd < 0) { perror("socket"); return 1; }
 
     struct sockaddr_un addr = { .sun_family = AF_UNIX };
-    strncpy(addr.sun_path, SOCKET_PATH, sizeof(addr.sun_path) - 1);
+    strncpy(addr.sun_path, socket_path, sizeof(addr.sun_path) - 1);
 
     if (bind(listen_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         perror("bind"); close(listen_fd); return 1;
     }
-    chmod(SOCKET_PATH, 0666);
+    chmod(socket_path, 0666);
     listen(listen_fd, 3);
 
-    fprintf(stderr, "[socketd] listening on %s\n", SOCKET_PATH);
+    fprintf(stderr, "[socketd] listening on %s\n", socket_path);
 
     int fds[2] = { -1, -1 };
     int count = 0;
@@ -49,7 +51,6 @@ int main(void) {
     close(listen_fd);
     if (count < 2) { for (int i = 0; i < count; i++) close(fds[i]); return 1; }
 
-    // 堆分配缓冲区 (8MB 放栈上会 stack overflow)
     char *buf0 = malloc(BUF_SIZE), *buf1 = malloc(BUF_SIZE);
     if (!buf0 || !buf1) { free(buf0); free(buf1); return 1; }
 
@@ -75,6 +76,6 @@ int main(void) {
 
     free(buf0); free(buf1);
     for (int i = 0; i < 2; i++) close(fds[i]);
-    unlink(SOCKET_PATH);
+    unlink(socket_path);
     return 0;
 }
