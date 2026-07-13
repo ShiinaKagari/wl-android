@@ -15,7 +15,6 @@
 #include <wayland-server-core.h>
 #include <wlr/backend.h>
 #include <wlr/backend/headless.h>
-#include <wlr/interfaces/wlr_buffer.h>
 #include <wlr/render/wlr_renderer.h>
 #include <wlr/types/wlr_compositor.h>
 #include <wlr/types/wlr_data_device.h>
@@ -24,7 +23,7 @@
 #include <wlr/types/wlr_xdg_shell.h>
 #include <wlr/util/log.h>
 
-/* ===== socket 直连 (无 landd) ===== */
+/* ===== socket — 直连 (无 landd) ===== */
 
 static int sock_fd = -1;
 
@@ -44,10 +43,9 @@ struct land_hdr { uint32_t magic, type, len; };
 struct land_frm { uint32_t w, h, fmt, stride; uint64_t serial; };
 
 static void send_frame(struct wlr_dmabuf_attributes *a, int dmafd, uint64_t serial) {
-	if (sock_fd < 0) {
-		sock_fd = connect_sock();
-		if (sock_fd < 0) return;
-	}
+	if (sock_fd < 0) sock_fd = connect_sock();
+	if (sock_fd < 0) return;
+
 	struct land_hdr h = { .magic = 0x4C414E00, .type = 0x4C414E01, .len = sizeof(struct land_frm) };
 	struct land_frm f = { .w = a->width, .h = a->height, .fmt = a->format,
 	                      .stride = a->stride[0], .serial = serial };
@@ -62,38 +60,53 @@ static void send_frame(struct wlr_dmabuf_attributes *a, int dmafd, uint64_t seri
 	if (sendmsg(sock_fd, &msg, MSG_NOSIGNAL) < 0) { close(sock_fd); sock_fd = -1; }
 }
 
-/* ===== surface tracking ===== */
+/* ===== surface commit → DMA-BUF → socket ===== */
 
 static uint64_t g_serial = 1;
 
 static void on_commit(struct wl_listener *l, void *data) {
-	struct wlr_surface *s = wl_container_of(l, s, commit);
-	(void)data;
+	struct wlr_surface *s = data;
+	(void)l;
 	if (!s->buffer) return;
 	struct wlr_buffer *buf = wlr_buffer_lock(s->buffer);
 	if (!buf) return;
+
 	struct wlr_dmabuf_attributes dmabuf = {0};
-	if (!wlr_buffer_get_dmabuf(buf, &dmabuf)) { wlr_buffer_unlock(buf); return; }
+	if (!wlr_buffer_get_dmabuf(buf, &dmabuf))
+		{ wlr_buffer_unlock(buf); return; }
+
 	int fd = fcntl(dmabuf.fd[0], F_DUPFD_CLOEXEC, 0);
 	if (fd < 0) { wlr_buffer_unlock(buf); return; }
+
 	send_frame(&dmabuf, fd, __atomic_fetch_add(&g_serial, 1, __ATOMIC_RELAXED));
 	close(fd);
 	wlr_buffer_unlock(buf);
 }
 
-/* ===== xdg-shell ===== */
+/* ===== xdg-shell 跟踪 ===== */
+
+#define MAX_SURFACES 64
+static struct wl_listener commit_listeners[MAX_SURFACES];
+static int listener_count = 0;
 
 static void on_xdg_map(struct wl_listener *l, void *data) {
-	struct wlr_xdg_surface *xdg = wl_container_of(l, xdg, map);
-	(void)data;
-	wl_signal_add(&xdg->surface->events.commit, &(struct wl_listener){.notify=on_commit});
+	struct wlr_xdg_surface *xdg = data;
+	(void)l;
+	if (listener_count >= MAX_SURFACES) return;
+	commit_listeners[listener_count].notify = on_commit;
+	wl_signal_add(&xdg->surface->events.commit, &commit_listeners[listener_count]);
+	listener_count++;
 }
 
 static void on_new_xdg(struct wl_listener *l, void *data) {
 	struct wlr_xdg_surface *xdg = data;
 	(void)l;
 	if (xdg->role != WLR_XDG_SURFACE_ROLE_TOPLEVEL) return;
-	wl_signal_add(&xdg->surface->events.map, &(struct wl_listener){.notify=on_xdg_map});
+
+	struct wl_listener *map_l = calloc(1, sizeof(struct wl_listener));
+	if (!map_l) return;
+	map_l->notify = on_xdg_map;
+	wl_signal_add(&xdg->surface->events.map, map_l);
 }
 
 /* ===== main ===== */
