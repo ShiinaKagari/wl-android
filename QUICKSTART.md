@@ -44,4 +44,4 @@ WAYLAND_DISPLAY=wl-android-0 kwin_wayland --xwayland --exit-with-session startpl
 | 环境 | 默认 | 覆盖 |
 |------|------|------|
 | 容器 | `/run/land.sock` | `$LAND_SOCKET` |
-| 安卓 | `/dev/socket/land.sock` | — |
+| 安卓 | `/data/local/tmp/land.sock` | — |

@@ -1,8 +1,9 @@
 # wl-android SELinux 策略
-# 允许 untrusted_app 连接 socket_device 类型的 Unix 套接字
-allow untrusted_app socket_device:sock_file write;
-allow untrusted_app socket_device:unix_stream_socket connectto;
+# 允许 untrusted_app 连接 socketd 创建的 Unix 套接字
+# socket 文件位于 /data/local/tmp/ (shell_data_file 上下文)
+allow untrusted_app shell_data_file:sock_file write;
+allow untrusted_app shell_data_file:unix_stream_socket connectto;
 
-# 允许 socketd (ksu 域) 管理 socket
-allow ksu socket_device:sock_file create_file_perms;
-allow ksu socket_device:dir { search write add_name };
+# 允许 socketd (ksu 域) 管理 socket 文件
+allow ksu shell_data_file:sock_file create_file_perms;
+allow ksu shell_data_file:dir { search write add_name };

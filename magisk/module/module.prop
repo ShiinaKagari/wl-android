@@ -3,5 +3,5 @@ name=wl-android Socket Daemon
 version=0.1.0
 versionCode=1
 author=wl-android
-description=Manages /dev/socket/land.sock lifecycle. socketd creates and maintains the socket, forwards frames between compositor and land-app.
+description=Manages land.sock at /data/local/tmp/. socketd creates/maintains the socket, forwards frames between compositor and land-app.
 minMagiskVersion=24000

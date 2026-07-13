@@ -14,7 +14,7 @@
 1. **零拷贝**：所有路径禁止 CPU 触碰像素数据（DMA-BUF fd 传递）
 2. **SAFETY 注释**：所有 `unsafe` 块必须有 `// SAFETY:` 注释说明前提条件
 3. **RAII fd 管理**：必须使用 `std::os::unix::io::OwnedFd` 或等价 RAII 包装管理 fd
-4. **Socket 位置**：`/dev/socket/land.sock`（tmpfs），权限 0666，可通过 `LAND_SOCKET` 环境变量覆盖
+4. **Socket 位置**：`/data/local/tmp/land.sock`（tmpfs），权限 0666，可通过 `LAND_SOCKET` 环境变量覆盖
 5. **fd dup**：跨进程传递的 DMA-BUF fd 必须 `dup()` 后使用
 
 ## 安全边界
@@ -42,7 +42,7 @@
 
 ## 容器修改清单（允许的）
 
-1. 创建 `/dev/socket/` 目录（tmpfs bind mount）
+1. 在容器内创建 `/run/` 目录，通过 `-B /data/local/tmp/land.sock:/run/land.sock` bind mount
 2. 安装 land `.deb` 包
 3. 设置 `LAND_SOCKET` 环境变量（可选，默认值自动生效）
 4. 加载 `libland_wlroots.so` 作为 wlroots 渲染器

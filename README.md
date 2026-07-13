@@ -11,7 +11,7 @@
   wl-android-compositor (headless wlroots)
     ↓ DMA-BUF fd → sendmsg(SCM_RIGHTS)
     ↓ /run/land.sock 或 LAND_SOCKET 环境变量
-    ↓ (bind mount → /dev/socket/land.sock)
+    ↓ (bind mount → /data/local/tmp/land.sock)
 宿主机 (Android)
   socketd (Magisk 保活) → 转发 fd
     ↓
@@ -90,7 +90,7 @@ WAYLAND_DISPLAY=wl-android-0 your-app
 | 环境 | 默认路径 | 覆盖 |
 |------|---------|------|
 | 容器 (Linux) | `/run/land.sock` | `$LAND_SOCKET` |
-| 安卓 (Android) | `/dev/socket/land.sock` | — |
+| 安卓 (Android) | `/data/local/tmp/land.sock` | — |
 
 ---
 

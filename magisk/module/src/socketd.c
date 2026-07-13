@@ -17,7 +17,7 @@ static void handle_signal(int s) { running = 0; }
 
 int main(void) {
     const char *socket_path = getenv("LAND_SOCKET");
-    if (!socket_path) socket_path = "/dev/socket/land.sock";
+    if (!socket_path) socket_path = "/data/local/tmp/land.sock";
 
     signal(SIGINT, handle_signal);
     signal(SIGTERM, handle_signal);

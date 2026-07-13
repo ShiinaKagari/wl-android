@@ -50,7 +50,7 @@ pub fn default_socket_path() -> std::path::PathBuf {
     }
     #[cfg(target_os = "android")]
     {
-        return std::path::PathBuf::from("/dev/socket/land.sock");
+        return std::path::PathBuf::from("/data/local/tmp/land.sock");
     }
     #[cfg(not(target_os = "android"))]
     {

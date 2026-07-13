@@ -11,7 +11,7 @@ Container (Droidspaces)
   wl-android-compositor (headless wlroots)
     ↓ DMA-BUF fd → sendmsg(SCM_RIGHTS)
     ↓ /run/land.sock or $LAND_SOCKET
-    ↓ (bind mount → /dev/socket/land.sock)
+    ↓ (bind mount → /data/local/tmp/land.sock)
 Android Host
   socketd (Magisk daemon) → forward fd
     ↓
@@ -86,7 +86,7 @@ WAYLAND_DISPLAY=wl-android-0 your-app
 | Environment | Default | Override |
 |-------------|---------|----------|
 | Container (Linux) | `/run/land.sock` | `$LAND_SOCKET` |
-| Android | `/dev/socket/land.sock` | — |
+| Android | `/data/local/tmp/land.sock` | — |
 
 ---
 

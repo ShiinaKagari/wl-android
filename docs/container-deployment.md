@@ -37,5 +37,5 @@ WAYLAND_DISPLAY=wl-android-0 your-app
 
 ```bash
 ls -la /run/land.sock   # 容器内 socket
-ls -la /dev/socket/land.sock  # 宿主机 socket (bind mount)
+ls -la /data/local/tmp/land.sock  # 宿主机 socket (bind mount)
 ```
