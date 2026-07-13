@@ -1,27 +1,30 @@
 /**
  * wl-android-compositor: 无头嵌套 wlroots 合成器
  *
- * 类似 Gamescope 的嵌套合成器，但不渲染到本地屏幕。
- * 将每个 surface commit 的 DMA-BUF fd 通过 libland_wlroots.so 转发到 Android。
- *
- * 使用方式:
- *   WAYLAND_DISPLAY=wl-android-0 <app>   # 在该 socket 下运行应用
+ * 仅有的容器侧组件。不依赖插件，直接通过 wlroots API 提取 DMA-BUF fd。
+ * 所有 Wayland 客户端连到它的 socket，每帧 DMA-BUF fd 通过 SCM_RIGHTS
+ * 转发到 landd → land-app → Android 屏幕。
  *
  * 构建:
  *   gcc main.c -o wl-android-compositor \
- *       $(pkg-config --cflags --libs wlroots wayland-server libdrm) \
+ *       $(pkg-config --cflags --libs wlroots wayland-server) \
  *       -ldl -lpthread -lm
+ *
+ * 运行:
+ *   wl-android-compositor
+ *   WAYLAND_DISPLAY=wl-android-0 your-app
  */
 
 #define _GNU_SOURCE
-#include <assert.h>
-#include <dlfcn.h>
-#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <signal.h>
 #include <time.h>
+#include <errno.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 
 #include <wayland-server-core.h>
 #include <wlr/backend.h>
@@ -29,81 +32,142 @@
 #include <wlr/types/wlr_compositor.h>
 #include <wlr/types/wlr_data_device.h>
 #include <wlr/types/wlr_output.h>
-#include <wlr/types/wlr_output_layout.h>
 #include <wlr/types/wlr_scene.h>
 #include <wlr/types/wlr_subcompositor.h>
 #include <wlr/types/wlr_xdg_shell.h>
 #include <wlr/util/log.h>
 
 /* ================================================================
- * land 插件
+ * landd 通信
  * ================================================================ */
-static void *(*land_create)(struct wlr_renderer *, struct wl_display *) = NULL;
-static void  (*land_destroy)(void *)                                     = NULL;
-static bool  (*land_buffer_submit)(void *, struct wlr_buffer *)          = NULL;
-static void *land_backend = NULL;
 
-static bool load_land_plugin(void) {
-    void *h = dlopen("libland_wlroots.so", RTLD_NOW | RTLD_GLOBAL);
-    if (!h) {
-        fprintf(stderr, "[land] dlopen failed: %s\n", dlerror());
-        return false;
+static int landd_fd = -1;
+
+static int connect_landd(void) {
+    const char *path = getenv("LAND_SOCKET");
+    if (!path) path = "/dev/socket/land.sock";
+
+    struct sockaddr_un addr = { .sun_family = AF_UNIX };
+    strncpy(addr.sun_path, path, sizeof(addr.sun_path) - 1);
+
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+
+    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        close(fd);
+        return -1;
     }
-    land_create       = dlsym(h, "land_wlroots_renderer_create");
-    land_destroy      = dlsym(h, "land_wlroots_renderer_destroy");
-    land_buffer_submit = dlsym(h, "land_wlroots_buffer_submit");
-    if (!land_create || !land_destroy || !land_buffer_submit) {
-        fprintf(stderr, "[land] missing symbols\n");
-        return false;
-    }
-    fprintf(stderr, "[land] plugin loaded\n");
-    return true;
+    return fd;
+}
+
+struct __attribute__((packed)) land_header {
+    uint32_t magic;
+    uint32_t msg_type;
+    uint32_t length;
+};
+
+struct __attribute__((packed)) land_frame {
+    uint32_t width;
+    uint32_t height;
+    uint32_t format;
+    uint32_t stride;
+    uint64_t serial;
+};
+
+#define LAND_MAGIC   0x4C414E00
+#define MSG_FRAME    0x4C414E01
+#define MSG_TOUCH    0x4C414E02
+
+static int send_frame(int fd, struct wlr_dmabuf_attributes *attr, int dmabuf_fd, uint64_t serial) {
+    struct land_header hdr = {
+        .magic = LAND_MAGIC,
+        .msg_type = MSG_FRAME,
+        .length = sizeof(struct land_frame),
+    };
+    struct land_frame frame = {
+        .width = (uint32_t)attr->width,
+        .height = (uint32_t)attr->height,
+        .format = attr->format,
+        .stride = (uint32_t)attr->stride[0],
+        .serial = serial,
+    };
+
+    struct iovec iov[] = {
+        { .iov_base = &hdr, .iov_len = sizeof(hdr) },
+        { .iov_base = &frame, .iov_len = sizeof(frame) },
+    };
+
+    char cmsg_buf[CMSG_SPACE(sizeof(int))];
+    struct msghdr msg = { .msg_iov = iov, .msg_iovlen = 2 };
+    msg.msg_control = cmsg_buf;
+    msg.msg_controllen = sizeof(cmsg_buf);
+
+    struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
+    cmsg->cmsg_level = SOL_SOCKET;
+    cmsg->cmsg_type = SCM_RIGHTS;
+    cmsg->cmsg_len = CMSG_LEN(sizeof(int));
+    memcpy(CMSG_DATA(cmsg), &dmabuf_fd, sizeof(int));
+
+    return sendmsg(fd, &msg, MSG_NOSIGNAL);
 }
 
 /* ================================================================
- * Surface 跟踪
+ * Surface 跟踪 + DMA-BUF 转发
  * ================================================================ */
+
+static uint64_t frame_serial = 1;
+
+static void handle_surface_commit(struct wl_listener *listener, void *data);
+
 struct tracked_surface {
     struct wlr_surface *wlr_surface;
     struct wl_listener commit;
     struct wl_listener destroy;
-    struct wl_list link;        // compositor.surfaces
+    struct wl_list link;
 };
-
-static void surface_commit_handler(struct wl_listener *listener, void *data) {
-    struct tracked_surface *ts = wl_container_of(listener, ts, commit);
-    (void)data;
-
-    if (!land_backend || !land_buffer_submit)
-        return;
-
-    struct wlr_buffer *buffer = wlr_surface_get_buffer(ts->wlr_surface);
-    if (!buffer)
-        return;
-
-    bool ok = land_buffer_submit(land_backend, buffer);
-    if (!ok)
-        fprintf(stderr, "[land] buffer submit failed\n");
-
-    wlr_buffer_unlock(buffer);
-}
 
 static void surface_destroy_handler(struct wl_listener *listener, void *data) {
     struct tracked_surface *ts = wl_container_of(listener, ts, destroy);
     (void)data;
-
     wl_list_remove(&ts->commit.link);
     wl_list_remove(&ts->destroy.link);
     wl_list_remove(&ts->link);
     free(ts);
 }
 
+static void handle_surface_commit(struct wl_listener *listener, void *data) {
+    struct tracked_surface *ts = wl_container_of(listener, ts, commit);
+    (void)data;
+
+    if (landd_fd < 0) return;
+
+    struct wlr_buffer *buffer = wlr_surface_get_buffer(ts->wlr_surface);
+    if (!buffer) return;
+
+    struct wlr_dmabuf_attributes dmabuf = {0};
+    if (!wlr_buffer_get_dmabuf(buffer, &dmabuf)) {
+        wlr_buffer_unlock(buffer);
+        return;  // SHM buffer, skip
+    }
+
+    // dup fd 后转发
+    int dup_fd = fcntl(dmabuf.fd[0], F_DUPFD_CLOEXEC, 0);
+    if (dup_fd < 0) {
+        wlr_buffer_unlock(buffer);
+        return;
+    }
+
+    uint64_t serial = __atomic_fetch_add(&frame_serial, 1, __ATOMIC_RELAXED);
+    send_frame(landd_fd, &dmabuf, dup_fd, serial);
+    close(dup_fd);
+    wlr_buffer_unlock(buffer);
+}
+
 static struct tracked_surface *track_surface(struct wlr_surface *surface) {
     struct tracked_surface *ts = calloc(1, sizeof(*ts));
     if (!ts) return NULL;
-
     ts->wlr_surface = surface;
-    ts->commit.notify = surface_commit_handler;
+    ts->commit.notify = handle_surface_commit;
     ts->destroy.notify = surface_destroy_handler;
     wl_signal_add(&surface->events.commit, &ts->commit);
     wl_signal_add(&surface->events.destroy, &ts->destroy);
@@ -111,176 +175,113 @@ static struct tracked_surface *track_surface(struct wlr_surface *surface) {
 }
 
 /* ================================================================
- * xdg-shell: 每个新 surface → 自动跟踪
+ * xdg-shell
  * ================================================================ */
+
 static void handle_xdg_surface_map(struct wl_listener *listener, void *data);
-static void handle_xdg_surface_unmap(struct wl_listener *listener, void *data);
 static void handle_xdg_surface_destroy(struct wl_listener *listener, void *data);
 
-struct xdg_surface_data {
+struct xdg_data {
     struct wlr_xdg_surface *xdg_surface;
     struct wl_listener map;
-    struct wl_listener unmap;
-    struct wl_listener destroy_map;
+    struct wl_listener destroy;
 };
 
 static void handle_new_xdg_surface(struct wl_listener *listener, void *data) {
-    struct wlr_xdg_surface *xdg_surface = data;
-
-    if (xdg_surface->role != WLR_XDG_SURFACE_ROLE_TOPLEVEL &&
-        xdg_surface->role != WLR_XDG_SURFACE_ROLE_POPUP)
+    struct wlr_xdg_surface *xdg = data;
+    if (xdg->role != WLR_XDG_SURFACE_ROLE_TOPLEVEL &&
+        xdg->role != WLR_XDG_SURFACE_ROLE_POPUP)
         return;
 
-    struct xdg_surface_data *sd = calloc(1, sizeof(*sd));
+    struct xdg_data *sd = calloc(1, sizeof(*sd));
     if (!sd) return;
-    sd->xdg_surface = xdg_surface;
+    sd->xdg_surface = xdg;
     sd->map.notify = handle_xdg_surface_map;
-    sd->unmap.notify = handle_xdg_surface_unmap;
-    sd->destroy_map.notify = handle_xdg_surface_destroy;
-    wl_signal_add(&xdg_surface->events.map, &sd->map);
-    wl_signal_add(&xdg_surface->events.unmap, &sd->unmap);
-    wl_signal_add(&xdg_surface->events.destroy, &sd->destroy_map);
+    sd->destroy.notify = handle_xdg_surface_destroy;
+    wl_signal_add(&xdg->events.map, &sd->map);
+    wl_signal_add(&xdg->events.destroy, &sd->destroy);
 }
 
 static void handle_xdg_surface_map(struct wl_listener *listener, void *data) {
-    struct xdg_surface_data *sd = wl_container_of(listener, sd, map);
+    struct xdg_data *sd = wl_container_of(listener, sd, map);
     (void)data;
-
-    struct wlr_xdg_surface *xdg = sd->xdg_surface;
-    struct wlr_surface *surface = xdg->surface;
-
-    fprintf(stderr, "[xdg] map: title=\"%s\" %dx%d\n",
-            xdg->toplevel ? xdg->toplevel->title : "(popup)",
-            surface->current.width, surface->current.height);
-
-    // 为该 surface 建立 commit 跟踪
-    track_surface(surface);
-}
-
-static void handle_xdg_surface_unmap(struct wl_listener *listener, void *data) {
-    struct xdg_surface_data *sd = wl_container_of(listener, sd, unmap);
-    (void)data;
-    fprintf(stderr, "[xdg] unmap\n");
+    track_surface(sd->xdg_surface->surface);
 }
 
 static void handle_xdg_surface_destroy(struct wl_listener *listener, void *data) {
-    struct xdg_surface_data *sd = wl_container_of(listener, sd, destroy_map);
+    struct xdg_data *sd = wl_container_of(listener, sd, destroy);
     (void)data;
     wl_list_remove(&sd->map.link);
-    wl_list_remove(&sd->unmap.link);
-    wl_list_remove(&sd->destroy_map.link);
+    wl_list_remove(&sd->destroy.link);
     free(sd);
 }
 
 /* ================================================================
- * 合成器状态
+ * 合成器
  * ================================================================ */
+
 struct compositor_state {
     struct wl_display *display;
     struct wlr_backend *backend;
     struct wlr_renderer *renderer;
     struct wlr_compositor *compositor;
     struct wlr_xdg_shell *xdg_shell;
-
     struct wl_listener new_xdg_surface;
-    struct wl_list surfaces;     // tracked_surface.link
-
     struct wl_listener new_output;
 };
 
 static struct compositor_state state;
 static int running = 1;
+static void handle_signal(int signo) { running = 0; }
 
-static void handle_signal(int signo) {
-    running = 0;
-}
-
-/* ================================================================
- * Output 创建 (仅日志，无渲染)
- * ================================================================ */
 static void handle_new_output(struct wl_listener *listener, void *data) {
     struct wlr_output *output = data;
-    fprintf(stderr, "[output] %s (headless)\n", output->name);
     wlr_output_enable(output, true);
-    wlr_output_set_custom_mode(output, 1920, 1080, 0); // 虚拟分辨率
+    wlr_output_set_custom_mode(output, 1920, 1080, 0);
     wlr_output_commit(output);
 }
 
-/* ================================================================
- * 初始化
- * ================================================================ */
 static bool init_compositor(void) {
     state.display = wl_display_create();
-    if (!state.display) {
-        fprintf(stderr, "wl_display_create failed\n");
-        return false;
-    }
+    if (!state.display) return false;
 
-    // 无头后端 (headless) — 不连接任何物理输出或嵌套 Wayland socket
     state.backend = wlr_headless_backend_create(state.display);
-    if (!state.backend) {
-        fprintf(stderr, "wlr_headless_backend_create failed\n");
-        return false;
-    }
+    if (!state.backend) return false;
 
-    // 渲染器 — 仅 wlr_compositor 内部管理 buffer 用。
-    // 不参与 DMA-BUF 转发路径，不影响像素数据。
     state.renderer = wlr_renderer_autocreate(state.display);
-    if (!state.renderer) {
-        fprintf(stderr, "wlr_renderer_autocreate failed\n");
-        return false;
-    }
+    if (!state.renderer) return false;
     wlr_renderer_init_wl_display(state.renderer, state.display);
 
-    // 核心协议
     state.compositor = wlr_compositor_create(state.display, state.renderer);
     wlr_subcompositor_create(state.display);
     wlr_data_device_manager_create(state.display);
 
-    // xdg-shell (窗口管理)
     state.xdg_shell = wlr_xdg_shell_create(state.display, 5);
     state.new_xdg_surface.notify = handle_new_xdg_surface;
     wl_signal_add(&state.xdg_shell->events.new_surface, &state.new_xdg_surface);
 
-    // Output hook
     state.new_output.notify = handle_new_output;
     wl_signal_add(&state.backend->events.new_output, &state.new_output);
 
-    // 加载 land 插件
-    if (load_land_plugin()) {
-        land_backend = land_create(state.renderer, state.display);
-        if (land_backend)
-            fprintf(stderr, "[land] backend ready\n");
-        else
-            fprintf(stderr, "[land] create failed (socket unreachable?)\n");
-    }
+    if (!wlr_backend_start(state.backend)) return false;
 
-    wl_list_init(&state.surfaces);
-
-    // 启动后端 (会触发 new_output)
-    if (!wlr_backend_start(state.backend)) {
-        fprintf(stderr, "wlr_backend_start failed\n");
-        return false;
-    }
-
-    // Wayland socket
     const char *socket = wl_display_add_socket_auto(state.display);
-    if (!socket) {
-        fprintf(stderr, "failed to add Wayland socket\n");
-        return false;
-    }
+    if (!socket) return false;
     setenv("WAYLAND_DISPLAY", socket, 0);
     fprintf(stderr, "[compositor] WAYLAND_DISPLAY=%s\n", socket);
+
+    // 连接 landd
+    landd_fd = connect_landd();
+    if (landd_fd < 0)
+        fprintf(stderr, "[compositor] landd not reachable (deferring)\n");
+    else
+        fprintf(stderr, "[compositor] connected to landd\n");
 
     return true;
 }
 
-/* ================================================================
- * main
- * ================================================================ */
 int main(int argc, char *argv[]) {
     wlr_log_init(WLR_DEBUG, NULL);
-
     signal(SIGINT, handle_signal);
     signal(SIGTERM, handle_signal);
 
@@ -292,22 +293,15 @@ int main(int argc, char *argv[]) {
     fprintf(stderr, "[compositor] running\n");
 
     while (running) {
-        // Dispatch Wayland events (client requests, etc.)
         if (wl_event_loop_dispatch(wl_display_get_event_loop(state.display), 100) < 0)
             break;
         wl_display_flush_clients(state.display);
     }
 
-    fprintf(stderr, "[compositor] shutting down\n");
-
-    // cleanup
-    if (land_backend && land_destroy)
-        land_destroy(land_backend);
-
+    if (landd_fd >= 0) close(landd_fd);
     wl_display_destroy_clients(state.display);
     wlr_backend_destroy(state.backend);
     wlr_renderer_destroy(state.renderer);
     wl_display_destroy(state.display);
-
     return 0;
 }
