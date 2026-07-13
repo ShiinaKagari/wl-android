@@ -26,10 +26,11 @@
 
 ## 架构边界
 
-1. 三组件模型固定：land（插件）→ landd（守护）→ land-app（App）
-2. 容器 ↔ 宿主机通信仅通过 bind mount 的 socket 文件
-3. 不替换系统库，不修改系统配置文件
-4. landd 常驻内存，不受 App 生命周期影响
+1. 容器侧唯一组件：`wl-android-compositor`（嵌套 wlroots 合成器）
+2. Android 侧：socketd（Magisk 保活）+ land-app（APK）
+3. 容器 ↔ 宿主机通信仅通过 bind mount 的 socket 文件
+4. 不替换系统库，不修改系统配置文件
+5. socketd 常驻内存，管理 socket 生命周期
 
 ## 部署边界
 
