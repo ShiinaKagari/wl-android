@@ -20,6 +20,9 @@ kotlin/
 # Output
 output/
 
+# JNI libs (built from cargo ndk)
+jniLibs/
+
 # IDE
 .vscode/
 .idea/

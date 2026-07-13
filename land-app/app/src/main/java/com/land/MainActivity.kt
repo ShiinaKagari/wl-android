@@ -10,13 +10,7 @@ import androidx.appcompat.app.AppCompatActivity
 class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, Choreographer.FrameCallback {
 
     private lateinit var surfaceView: SurfaceView
-    private var initialized = false
-    private var surfaceReady = false
-    private var pendingFd: Int? = null
-    private var pendingWidth: Int = 0
-    private var pendingHeight: Int = 0
     private var choreographer: Choreographer? = null
-    private var framePending = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -27,67 +21,30 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, Choreographer.
         surfaceView.setOnTouchListener { _, event -> TouchForwarder.onTouch(event) }
 
         choreographer = Choreographer.getInstance()
+        choreographer?.postFrameCallback(this)
 
         nativeInit()
-        initialized = true
     }
 
     override fun surfaceCreated(holder: SurfaceHolder) {
-        val surface = holder.surface
-        val width = surfaceView.width
-        val height = surfaceView.height
-        nativeSetSurface(surface, width, height)
-        surfaceReady = true
-
-        pendingFd?.let { fd ->
-            queueFrame(fd, pendingWidth, pendingHeight)
-            pendingFd = null
-        }
+        nativeSetSurface(holder.surface, surfaceView.width, surfaceView.height)
     }
 
     override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
         nativeSetSurface(holder.surface, width, height)
     }
 
-    override fun surfaceDestroyed(holder: SurfaceHolder) {
-        surfaceReady = false
-    }
+    override fun surfaceDestroyed(holder: SurfaceHolder) {}
 
     override fun onDestroy() {
         super.onDestroy()
-        initialized = false
         nativeDestroy()
     }
 
-    /** 由 native 层调用: 有新的 DMA-BUF 帧到达 */
-    fun onFrameReceived(fd: Int, width: Int, height: Int) {
-        if (surfaceReady) {
-            queueFrame(fd, width, height)
-        } else {
-            pendingFd = fd
-            pendingWidth = width
-            pendingHeight = height
-        }
-    }
-
-    /** 将帧加入渲染队列，等待下一个 vsync */
-    private fun queueFrame(fd: Int, width: Int, height: Int) {
-        pendingFd = fd
-        pendingWidth = width
-        pendingHeight = height
-        if (!framePending) {
-            framePending = true
-            choreographer?.postFrameCallback(this)
-        }
-    }
-
-    /** Choreographer vsync 回调：在 vsync 时刻渲染帧 */
+    /** Choreographer vsync 回调：取出最新帧并渲染 */
     override fun doFrame(frameTimeNanos: Long) {
-        framePending = false
-        pendingFd?.let { fd ->
-            nativeRenderFrame(fd, pendingWidth, pendingHeight)
-            pendingFd = null
-        }
+        nativeRenderFrame()
+        choreographer?.postFrameCallback(this)
     }
 
     @dalvik.annotation.optimization.FastNative
@@ -96,8 +53,8 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, Choreographer.
     @dalvik.annotation.optimization.FastNative
     private external fun nativeSetSurface(surface: android.view.Surface, width: Int, height: Int)
 
-    @dalvik.annotation.optimization.FastNative
-    private external fun nativeRenderFrame(fd: Int, width: Int, height: Int)
+    @dalvik.annotation.optimization.CriticalNative
+    private external fun nativeRenderFrame()
 
     @dalvik.annotation.optimization.FastNative
     private external fun nativeDestroy()

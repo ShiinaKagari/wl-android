@@ -148,14 +148,6 @@ dependencies = [
  "ash",
  "jni",
  "land-common",
- "log",
-]
-
-[[package]]
-name = "landd"
-version = "0.1.0"
-dependencies = [
- "land-common",
  "libc",
  "log",
 ]

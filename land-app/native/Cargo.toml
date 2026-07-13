@@ -12,6 +12,7 @@ land-common = { path = "../../crates/land-common" }
 ash = "0.38"
 log = "0.4"
 android_logger = "0.14"
+libc = "0.2"
 
 [dependencies.jni]
 version = "0.21"
