@@ -21,9 +21,9 @@ pub extern "system" fn Java_com_land_MainActivity_nativeInit(
             .with_tag("land-native"),
     );
 
-    // 启动 socket server 线程
-    if let Err(e) = socket::start_server() {
-        log::error!("[land-native] server start failed: {}", e);
+    // 连接 socketd
+    if let Err(e) = socket::start() {
+        log::error!("[land-native] socket start failed: {}", e);
         return 0;
     }
 

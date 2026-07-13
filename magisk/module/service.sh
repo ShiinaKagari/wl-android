@@ -1,5 +1,11 @@
 #!/system/bin/sh
-# 开机创建 /dev/socket/ (tmpfs) — land-app 启动后在此创建 land.sock
-mkdir -p /dev/socket 2>/dev/null
-chmod 0755 /dev/socket
-log -t "wl-android" "/dev/socket ready"
+# 启动 socketd — 创建并管理 /dev/socket/land.sock
+MODDIR=${0%/*}
+SOCKETD="$MODDIR/bin/socketd"
+while :; do
+    if [ -f "$SOCKETD" ]; then
+        chmod 0755 "$SOCKETD"
+        "$SOCKETD"
+    fi
+    sleep 2
+done

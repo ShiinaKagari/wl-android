@@ -1,7 +1,5 @@
 #!/system/bin/sh
-ui_print "- wl-android Socket Infrastructure"
-ui_print "- Creates /dev/socket/ directory on boot"
-ui_print "- Applies SELinux rules for socket access"
+ui_print "- wl-android Socket Daemon"
+ui_print "- Manages /dev/socket/land.sock lifecycle"
 ui_print ""
-ui_print "- land-app creates the socket on launch."
-ui_print "- No daemon included."
+set_perm_recursive $MODPATH/bin 0 0 0755 0755

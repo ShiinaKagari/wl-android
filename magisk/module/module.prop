@@ -1,7 +1,7 @@
-id=wl-android-socket
-name=wl-android Socket
+id=wl-android-socketd
+name=wl-android Socket Daemon
 version=0.1.0
 versionCode=1
 author=wl-android
-description=Creates /dev/socket/ directory and SELinux rules for wl-android. The socket is created by land-app on launch. Install land-app APK separately.
+description=Manages /dev/socket/land.sock lifecycle. socketd creates and maintains the socket, forwards frames between compositor and land-app.
 minMagiskVersion=24000
