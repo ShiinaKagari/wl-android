@@ -37,7 +37,7 @@ static int app_fd = -1;
 
 static int connect_app(void) {
     const char *path = getenv("LAND_SOCKET");
-    if (!path) path = "/dev/socket/land.sock";
+    if (!path) path = "/run/land.sock";
 
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) return -1;

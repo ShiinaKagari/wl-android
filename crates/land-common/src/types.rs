@@ -42,11 +42,20 @@ impl fmt::Display for DrmFormat {
 
 /// Unix Socket 路径。
 ///
-/// 默认 `/dev/socket/land.sock`，可通过 `LAND_SOCKET` 环境变量覆盖。
+/// 容器内: `$LAND_SOCKET` 环境变量，或 `/run/land.sock`
+/// 安卓端: `/dev/socket/land.sock` (Magisk tmpfs)
 pub fn default_socket_path() -> std::path::PathBuf {
-    std::env::var("LAND_SOCKET")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| std::path::PathBuf::from("/dev/socket/land.sock"))
+    if let Ok(path) = std::env::var("LAND_SOCKET") {
+        return std::path::PathBuf::from(path);
+    }
+    #[cfg(target_os = "android")]
+    {
+        return std::path::PathBuf::from("/dev/socket/land.sock");
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        std::path::PathBuf::from("/run/land.sock")
+    }
 }
 
 #[cfg(test)]
@@ -76,6 +85,8 @@ mod tests {
     #[test]
     fn default_socket_fallback() {
         unsafe { std::env::remove_var("LAND_SOCKET") };
-        assert_eq!(default_socket_path(), std::path::PathBuf::from("/dev/socket/land.sock"));
+        let p = default_socket_path();
+        // 安卓端 /dev/socket/land.sock, 容器 /run/land.sock
+        assert!(p.to_string_lossy().ends_with("land.sock"));
     }
 }
