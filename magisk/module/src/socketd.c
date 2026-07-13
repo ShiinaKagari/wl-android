@@ -11,7 +11,6 @@
 #include <errno.h>
 
 #define SOCKET_PATH "/dev/socket/land.sock"
-#define MAX_CLIENTS 2
 #define BUF_SIZE (4 * 1024 * 1024)
 
 static int running = 1;
@@ -38,24 +37,22 @@ int main(void) {
 
     fprintf(stderr, "[socketd] listening on %s\n", SOCKET_PATH);
 
-    int fds[MAX_CLIENTS] = { -1, -1 };
+    int fds[2] = { -1, -1 };
     int count = 0;
-
-    while (running && count < MAX_CLIENTS) {
+    while (running && count < 2) {
         struct pollfd pfd = { .fd = listen_fd, .events = POLLIN };
         if (poll(&pfd, 1, 1000) <= 0) continue;
         int client = accept(listen_fd, NULL, NULL);
         if (client < 0) continue;
         fds[count++] = client;
     }
-
     close(listen_fd);
-    if (count < MAX_CLIENTS) {
-        for (int i = 0; i < count; i++) close(fds[i]);
-        return 1;
-    }
+    if (count < 2) { for (int i = 0; i < count; i++) close(fds[i]); return 1; }
 
-    char buf1[BUF_SIZE], buf2[BUF_SIZE];
+    // 堆分配缓冲区 (8MB 放栈上会 stack overflow)
+    char *buf0 = malloc(BUF_SIZE), *buf1 = malloc(BUF_SIZE);
+    if (!buf0 || !buf1) { free(buf0); free(buf1); return 1; }
+
     struct pollfd pfds[2] = {
         { .fd = fds[0], .events = POLLIN },
         { .fd = fds[1], .events = POLLIN },
@@ -65,19 +62,19 @@ int main(void) {
         int ret = poll(pfds, 2, 1000);
         if (ret <= 0) continue;
         for (int i = 0; i < 2; i++) {
-            if (pfds[i].revents & POLLIN) {
-                int src = fds[i], dst = fds[1 - i];
-                char *buf = (i == 0) ? buf1 : buf2;
-                ssize_t n = read(src, buf, BUF_SIZE);
-                if (n <= 0) { running = 0; break; }
-                struct iovec iov = { .iov_base = buf, .iov_len = (size_t)n };
-                struct msghdr msg = { .msg_iov = &iov, .msg_iovlen = 1 };
-                sendmsg(dst, &msg, MSG_NOSIGNAL);
-            }
+            if (!(pfds[i].revents & POLLIN)) continue;
+            int src = fds[i], dst = fds[1 - i];
+            char *buf = (i == 0) ? buf0 : buf1;
+            ssize_t n = read(src, buf, BUF_SIZE);
+            if (n <= 0) { running = 0; break; }
+            struct iovec iov = { .iov_base = buf, .iov_len = (size_t)n };
+            struct msghdr msg = { .msg_iov = &iov, .msg_iovlen = 1 };
+            sendmsg(dst, &msg, MSG_NOSIGNAL);
         }
     }
 
-    for (int i = 0; i < MAX_CLIENTS; i++) close(fds[i]);
+    free(buf0); free(buf1);
+    for (int i = 0; i < 2; i++) close(fds[i]);
     unlink(SOCKET_PATH);
     return 0;
 }

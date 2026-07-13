@@ -4,8 +4,8 @@ mod vulkan;
 use std::os::fd::AsRawFd;
 use std::sync::Mutex;
 
-use jni::objects::JClass;
-use jni::sys::{jboolean, JNI_TRUE};
+use jni::objects::{JClass, JObject};
+use jni::sys::{jboolean, jfloat, jint, JNI_TRUE};
 use jni::JNIEnv;
 
 static RENDERER: Mutex<Option<vulkan::VulkanRenderer>> = Mutex::new(None);
