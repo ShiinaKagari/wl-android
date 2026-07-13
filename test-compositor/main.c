@@ -68,7 +68,7 @@ static void on_commit(struct wl_listener *l, void *data) {
 	struct wlr_surface *s = data;
 	(void)l;
 	if (!s->buffer) return;
-	struct wlr_buffer *buf = wlr_buffer_lock(s->buffer);
+	struct wlr_buffer *buf = wlr_buffer_lock((struct wlr_buffer *)s->buffer);
 	if (!buf) return;
 
 	struct wlr_dmabuf_attributes dmabuf = {0};
