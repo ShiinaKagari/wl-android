@@ -1,13 +1,5 @@
 # 容器侧部署指南
 
-## 不依赖 DRM/GPU
-
-`wl-android-compositor` 使用 `wlr_headless_backend`，**不走 DRM/KMS，不需要 GPU**。
-即使在 KGSL（Qualcomm 私有 GPU 驱动）上也能运行。
-
-渲染器仅为 wlroots 内部 buffer 管理服务，**不参与 DMA-BUF 转发路径**。
-DMA-BUF fd 通过 `wlr_buffer_get_dmabuf()` 直接提取，零拷贝，CPU 不触碰像素。
-
 ## 前置条件
 
 Droidspaces 需将宿主机的 socket 目录 bind mount 进容器：

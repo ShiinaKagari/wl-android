@@ -121,37 +121,16 @@ export WAYLAND_DISPLAY=wl-android-0
 
 ## 合成器集成
 
-### wlroots (原生插件)
-
-直接加载 `libland_wlroots.so`，在 surface commit 时 inline 提取 DMA-BUF fd。
-
-```c
-#include <dlfcn.h>
-void *land = dlopen("libland_wlroots.so", RTLD_NOW);
-void *backend = land_create(renderer, display);
-// 在 surface commit 回调中:
-land_buffer_submit(backend, buffer);
-```
-
-### wlroots 嵌套合成器 (通用方案)
-
 运行 `test-compositor/wl-android-compositor`，所有 Wayland 客户端连到该 socket：
 
 ```bash
 wl-android-compositor &
-WAYLAND_DISPLAY=wl-android-0 gnome-shell --nested &
-WAYLAND_DISPLAY=wl-android-0 kwin_wayland --xwayland startplasma-wayland &
 WAYLAND_DISPLAY=wl-android-0 your-app &
 ```
 
-### 延迟对比
+### 延迟
 
-| 方式 | 延迟 | 说明 |
-|------|------|------|
-| wlroots 原生插件 | < 500µs | 合成器直接加载 `.so` |
-| 嵌套合成器 | < 3ms | 类似 Gamescope |
-| GNOME Nested | < 5ms | `gnome-shell --nested` |
-| KWin Nested | < 5ms | `kwin_wayland KWaylandBackend` |
+端到端零拷贝，< 3ms。
 
 ---
 

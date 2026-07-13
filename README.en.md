@@ -121,37 +121,16 @@ export WAYLAND_DISPLAY=wl-android-0
 
 ## Compositor Integration
 
-### wlroots (Native Plugin)
-
-Load `libland_wlroots.so` directly; extracts DMA-BUF fd inline on surface commit.
-
-```c
-#include <dlfcn.h>
-void *land = dlopen("libland_wlroots.so", RTLD_NOW);
-void *backend = land_create(renderer, display);
-// On surface commit callback:
-land_buffer_submit(backend, buffer);
-```
-
-### Nested wlroots Compositor (Universal)
-
 Run `test-compositor/wl-android-compositor`; Wayland clients connect to its socket:
 
 ```bash
 wl-android-compositor &
-WAYLAND_DISPLAY=wl-android-0 gnome-shell --nested &
-WAYLAND_DISPLAY=wl-android-0 kwin_wayland --xwayland startplasma-wayland &
 WAYLAND_DISPLAY=wl-android-0 your-app &
 ```
 
-### Latency Comparison
+### Latency
 
-| Method | Latency | Notes |
-|--------|---------|-------|
-| wlroots native plugin | < 500µs | Plugin loaded directly by compositor |
-| Nested compositor | < 3ms | Gamescope-like approach |
-| GNOME Nested | < 5ms | `gnome-shell --nested` |
-| KWin Nested | < 5ms | `kwin_wayland KWaylandBackend` |
+End-to-end zero copy, < 3ms.
 
 ---
 
