@@ -96,22 +96,6 @@ wl-android-gnome45
 | 触摸输入未映射 | GNOME Shell 不接收 wl-android-compositor 的 wl_seat 事件 | 需在 compositor 中实现 input forwarding |
 | systemd/logind 缺失 | 容器内通常无 systemd | 用 `dbus-run-session` 替代 |
 
-## 可选: 不使用嵌套（Portal 方案）
-
-如果嵌套模式不稳定，改用 land-portal（延迟更高但无需 wlroots）:
-
-```bash
-# 容器内需安装 pipewire
-apt install pipewire pipewire-pulse wireplumber
-
-# 启动 GNOME 45 普通(非嵌套) session
-export XDG_SESSION_TYPE=wayland
-gnome-session &
-
-# 启动 land-portal
-cargo run --release -p land-portal
-```
-
 ## 参考
 
 - [Mutter nested mode](https://wiki.gnome.org/Projects/Mutter/Nested)

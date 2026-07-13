@@ -3,6 +3,7 @@
 
 # Android / Gradle
 .gradle/
+.gradle
 local.properties
 *.apk
 *.aab
@@ -10,9 +11,20 @@ local.properties
 .idea/
 *.iml
 build/
+.cxx/
+kotlin/
 
 # Magisk ZIP
 *.zip
+
+# Output
+output/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
 
 # OS
 .DS_Store

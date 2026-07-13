@@ -1,3 +1,0 @@
-/home/kagari/Projects/wl-android/land-app/app/.cxx/RelWithDebInfo/3m6m5j3b/arm64-v8a/CMakeFiles/land-bridge.dir
-/home/kagari/Projects/wl-android/land-app/app/.cxx/RelWithDebInfo/3m6m5j3b/arm64-v8a/CMakeFiles/edit_cache.dir
-/home/kagari/Projects/wl-android/land-app/app/.cxx/RelWithDebInfo/3m6m5j3b/arm64-v8a/CMakeFiles/rebuild_cache.dir

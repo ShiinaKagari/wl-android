@@ -14,7 +14,7 @@ fi
 
 # 2. 克隆仓库
 if [ ! -d wl-android ]; then
-    git clone https://github.com/wl-android/wl-android
+    git clone https://github.com/ShiinaKagari/wl-android
 fi
 cd wl-android
 
