@@ -19,6 +19,7 @@
 #include <wlr/types/wlr_compositor.h>
 #include <wlr/types/wlr_data_device.h>
 #include <wlr/types/wlr_output.h>
+#include <wlr/types/wlr_single_pixel_buffer_v1.h>
 #include <wlr/types/wlr_subcompositor.h>
 #include <wlr/types/wlr_xdg_shell.h>
 #include <wlr/util/log.h>
@@ -125,9 +126,10 @@ int main(void) {
 	struct wlr_renderer *rend = wlr_renderer_autocreate(be);
 	wlr_renderer_init_wl_display(rend, disp);
 
-	wlr_compositor_create(disp, 6, rend);
-	wlr_subcompositor_create(disp);
-	wlr_data_device_manager_create(disp);
+    wlr_compositor_create(disp, 6, rend);
+    wlr_subcompositor_create(disp);
+    wlr_data_device_manager_create(disp);
+    wlr_single_pixel_buffer_manager_v1_create(disp);
 
 	struct wlr_xdg_shell *xdg = wlr_xdg_shell_create(disp, 6);
 	struct wl_listener xdg_l = { .notify = on_new_xdg };
