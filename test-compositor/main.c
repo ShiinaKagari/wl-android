@@ -37,11 +37,14 @@ static int connect_sock(void) {
 	const char *path = getenv("LAND_SOCKET");
 	if (!path) path = "/run/land.sock";
 	int fd = socket(AF_UNIX, SOCK_STREAM, 0);
-	if (fd < 0) return -1;
+	if (fd < 0) { fprintf(stderr, "[land] socket() failed: %m\n"); return -1; }
 	struct sockaddr_un addr = { .sun_family = AF_UNIX };
 	strncpy(addr.sun_path, path, sizeof(addr.sun_path) - 1);
-	if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0)
-		{ close(fd); return -1; }
+	if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+		fprintf(stderr, "[land] connect(%s) failed: %m\n", path);
+		close(fd); return -1;
+	}
+	fprintf(stderr, "[land] connected to %s\n", path);
 	return fd;
 }
 
