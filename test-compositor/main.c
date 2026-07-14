@@ -50,7 +50,7 @@ struct land_frm { uint32_t w, h, fmt, stride; uint64_t serial; };
 
 static void send_frame(struct wlr_dmabuf_attributes *a, int dmafd, uint64_t serial) {
 	if (sock_fd < 0) sock_fd = connect_sock();
-	if (sock_fd < 0) return;
+	if (sock_fd < 0) { fprintf(stderr, "[land] send_frame: no connection\n"); return; }
 	struct land_hdr h = { .magic = 0x4C414E00, .type = 0x4C414E01, .len = sizeof(struct land_frm) };
 	struct land_frm f = { .w = a->width, .h = a->height, .fmt = a->format,
 	                      .stride = a->stride[0], .serial = serial };
@@ -62,7 +62,9 @@ static void send_frame(struct wlr_dmabuf_attributes *a, int dmafd, uint64_t seri
 	cp->cmsg_level = SOL_SOCKET; cp->cmsg_type = SCM_RIGHTS;
 	cp->cmsg_len = CMSG_LEN(sizeof(int));
 	memcpy(CMSG_DATA(cp), &dmafd, sizeof(int));
-	if (sendmsg(sock_fd, &msg, MSG_NOSIGNAL) < 0) { close(sock_fd); sock_fd = -1; }
+	int sent = sendmsg(sock_fd, &msg, MSG_NOSIGNAL);
+	if (sent < 0) { fprintf(stderr, "[land] sendmsg failed: %m\n"); close(sock_fd); sock_fd = -1; }
+	else { fprintf(stderr, "[land] frame sent (%d bytes)\n", sent); }
 }
 
 /* ===== 测试帧生成 (DRM dumb buffer) ===== */
@@ -126,7 +128,7 @@ static int generate_test_frame(uint32_t *out_width, uint32_t *out_height, uint32
 	*out_height = create.height;
 	*out_stride = create.pitch;
 	*out_format = 0x34325258; // DRM_FORMAT_XRGB8888
-	fprintf(stderr, "[land] test frame: %dx%d stride=%d fd=%d\n", create.width, create.height, create.pitch, prime.fd);
+	fprintf(stderr, "[land] test frame created: %dx%d stride=%d fd=%d\n", create.width, create.height, create.pitch, prime.fd);
 	return prime.fd;
 }
 
