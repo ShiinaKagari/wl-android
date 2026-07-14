@@ -91,7 +91,7 @@ static void fill_gradient(void *map, int width, int height, int stride, int fram
 
 static int generate_test_frame(uint32_t *out_width, uint32_t *out_height, uint32_t *out_stride, uint32_t *out_format) {
 	int fd = open_drm();
-	if (fd < 0) return -1;
+	if (fd < 0) { fprintf(stderr, "[land] open_drm failed\n"); return -1; }
 
 	struct drm_mode_create_dumb create = {
 		.width = 640,
@@ -99,22 +99,21 @@ static int generate_test_frame(uint32_t *out_width, uint32_t *out_height, uint32
 		.bpp = 32,
 	};
 	int ret = ioctl(fd, DRM_IOCTL_MODE_CREATE_DUMB, &create);
-	if (ret < 0) return -1;
+	if (ret < 0) { perror("[land] CREATE_DUMB"); return -1; }
 
 	struct drm_prime_handle prime = {
 		.handle = create.handle,
 		.flags = DRM_CLOEXEC | O_RDWR,
 	};
 	ret = ioctl(fd, DRM_IOCTL_PRIME_HANDLE_TO_FD, &prime);
-	if (ret < 0) { close(create.handle); return -1; }
+	if (ret < 0) { perror("[land] PRIME_HANDLE_TO_FD"); close(create.handle); return -1; }
 
-	// Map and fill
 	struct drm_mode_map_dumb map_req = { .handle = create.handle };
 	ret = ioctl(fd, DRM_IOCTL_MODE_MAP_DUMB, &map_req);
-	if (ret < 0) { close(prime.fd); close(create.handle); return -1; }
+	if (ret < 0) { perror("[land] MAP_DUMB"); close(prime.fd); close(create.handle); return -1; }
 
 	void *map = mmap(NULL, create.size, PROT_WRITE, MAP_SHARED, fd, map_req.offset);
-	if (map == MAP_FAILED) { close(prime.fd); close(create.handle); return -1; }
+	if (map == MAP_FAILED) { perror("[land] mmap"); close(prime.fd); close(create.handle); return -1; }
 
 	static int frame_count = 0;
 	fill_gradient(map, create.width, create.height, create.pitch, frame_count++);
@@ -127,6 +126,7 @@ static int generate_test_frame(uint32_t *out_width, uint32_t *out_height, uint32
 	*out_height = create.height;
 	*out_stride = create.pitch;
 	*out_format = 0x34325258; // DRM_FORMAT_XRGB8888
+	fprintf(stderr, "[land] test frame: %dx%d stride=%d fd=%d\n", create.width, create.height, create.pitch, prime.fd);
 	return prime.fd;
 }
 
