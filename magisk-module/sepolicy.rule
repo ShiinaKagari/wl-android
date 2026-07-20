@@ -1,0 +1,11 @@
+# wl-android SELinux policy
+# Allows wl-android-app (untrusted_app domain) to connect to
+# the land.sock Unix socket created by wl-android inside the container.
+
+# Allow app to access the socket directory
+allow untrusted_app shell_data_file:dir search;
+allow untrusted_app shell_data_file:dir read;
+
+# Allow app to connect to the Unix stream socket
+allow untrusted_app shell_data_file:sock_file { read write connectto getattr };
+allow untrusted_app self:unix_stream_socket { create connect getattr read write };

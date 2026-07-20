@@ -1,0 +1,14 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/wl-android-common",
+    "crates/wl-android",
+]
+exclude = ["m0/"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96.1"
+license = "MIT"
+repository = "https://github.com/user/wl-android"

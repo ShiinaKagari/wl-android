@@ -1,0 +1,14 @@
+[package]
+name = "wl-android-common"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+zerocopy = { version = "0.8", features = ["derive"] }
+
+[dev-dependencies]
+insta = "1"
+proptest = "1"
+nix = { version = "0.29", features = ["fs", "ioctl"] }

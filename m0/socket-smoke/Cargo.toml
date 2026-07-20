@@ -1,0 +1,19 @@
+[package]
+name = "m0-socket-smoke"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96.1"
+
+[[bin]]
+name = "smoke-server"
+path = "src/bin/server.rs"
+
+[[bin]]
+name = "smoke-client"
+path = "src/bin/client.rs"
+
+[dependencies]
+nix = { version = "0.29", features = ["fs", "socket", "uio", "net"] }
+
+[profile.release]
+opt-level = 2

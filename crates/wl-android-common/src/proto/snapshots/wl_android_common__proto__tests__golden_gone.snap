@@ -1,0 +1,22 @@
+---
+source: crates/wl-android-common/src/proto/tests.rs
+expression: "&bytes"
+---
+[
+    66,
+    71,
+    79,
+    78,
+    1,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+]

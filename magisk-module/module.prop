@@ -1,0 +1,6 @@
+id=wl-android
+name=wl-android — Wayland desktop on Android
+version=v1
+versionCode=1
+author=wl-android team
+description=Minimal Magisk module to create the land.sock directory with correct SELinux context and permissions. Required for wl-android-app to connect to the container-side wl-android compositor.

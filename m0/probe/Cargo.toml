@@ -1,0 +1,17 @@
+[package]
+name = "m0-probe"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96.1"
+
+[[bin]]
+name = "m0-probe"
+path = "src/main.rs"
+
+[dependencies]
+ash = "0.38"
+libc = "0.2"
+
+[profile.release]
+opt-level = 2
+lto = true
