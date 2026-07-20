@@ -10,7 +10,7 @@ ash = "0.38.0"
 calloop = "0.14.4"
 drm-fourcc = "2.2.0"
 nix = { version = "0.31.3", features = ["socket", "uio", "fs"] }
-smithay = "0.7.0"
+smithay = { version = "0.7.0", default-features = false, features = ["wayland_frontend", "backend_vulkan", "desktop"] }
 thiserror = "2.0.19"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
