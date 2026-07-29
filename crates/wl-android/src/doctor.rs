@@ -8,7 +8,9 @@ pub fn run() {
     let wayland_display = std::env::var("WAYLAND_DISPLAY").unwrap_or_else(|_| "land-0".into());
     let xdg_runtime = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into());
     let land_socket = std::env::var("LAND_SOCKET")
-        .unwrap_or_else(|_| "/run/wl-android/land.sock".into());
+        .unwrap_or_else(|_| {
+            format!("{xdg_runtime}/wl-android/land.sock")
+        });
 
     println!("Environment:");
     println!("  WAYLAND_DISPLAY  = {wayland_display}");
@@ -32,8 +34,7 @@ pub fn run() {
             println!("✅ Land socket directory exists: {dir:?}");
         } else {
             println!("❌ Land socket directory missing: {dir:?}");
-            println!("   Droidspaces bind mount needed:");
-            println!("   /data/local/tmp/wl-android → /run/wl-android");
+            println!("   Ensure LAND_SOCKET points to a writable path");
         }
     }
 

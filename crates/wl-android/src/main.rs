@@ -47,8 +47,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     let wayland_display =
         std::env::var("WAYLAND_DISPLAY").unwrap_or_else(|_| "land-0".into());
+    let xdg_runtime =
+        std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into());
+    let wayland_socket_path = format!("{xdg_runtime}/{wayland_display}");
+
+    // Default land socket in user space (not /run)
     let land_socket_path =
-        std::env::var("LAND_SOCKET").unwrap_or_else(|_| "/run/wl-android/land.sock".into());
+        std::env::var("LAND_SOCKET").unwrap_or_else(|_| {
+            format!("{xdg_runtime}/wl-android/land.sock")
+        });
+
+    // Clean stale sockets from previous runs
+    for stray in &[
+        &wayland_socket_path,
+        &format!("{wayland_socket_path}.lock"),
+        &land_socket_path,
+    ] {
+        std::fs::remove_file(stray).ok();
+    }
+
+    // Ensure land socket parent dir exists
+    if let Some(parent) = std::path::Path::new(&land_socket_path).parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+
+    info!(wayland = %wayland_socket_path, land = %land_socket_path, "starting wl-android");
 
     let mut event_loop: EventLoop<WlState> =
         EventLoop::try_new().expect("create event loop");
@@ -183,6 +206,11 @@ fn run_server() -> Result<(), Box<dyn std::error::Error>> {
             state.app_session = None;
         }
     })?;
+
+    // Cleanup on exit
+    info!("shutting down, cleaning sockets");
+    std::fs::remove_file(&wayland_socket_path).ok();
+    std::fs::remove_file(&land_socket_path).ok();
 
     Ok(())
 }
