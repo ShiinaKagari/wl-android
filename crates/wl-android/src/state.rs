@@ -106,8 +106,7 @@ impl WlState {
         unsafe {
             let display: &mut Display<Self> = &mut (*self_ptr).display;
             match display.dispatch_clients(&mut *self_ptr) {
-                Ok(0) => tracing::trace!("dispatch: 0 clients"),
-                Ok(n) => tracing::debug!(n, "dispatch: processed"),
+                Ok(n) => tracing::debug!(n, "wayland dispatch done"),
                 Err(e) => tracing::error!(err = %e, "dispatch error"),
             }
         }

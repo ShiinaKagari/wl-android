@@ -83,10 +83,13 @@ fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     event_loop
         .handle()
         .insert_source(wayland_socket, move |stream, _, state| {
-            match state.display.handle().insert_client(stream, Arc::new(())) {
-                Ok(_) => info!("Wayland client connected"),
-                Err(e) => error!(err = %e, "failed to insert wayland client"),
-            }
+            let client = match state.display.handle().insert_client(stream, Arc::new(())) {
+                Ok(c) => c,
+                Err(e) => { error!(err = %e, "failed to insert wayland client"); return; }
+            };
+            info!(id = ?client.id(), "Wayland client connected");
+            // Dispatch immediately to send initial globals to the new client
+            state.dispatch_wayland();
         })?;
 
     info!("listening on wayland socket {wayland_display}");
