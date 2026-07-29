@@ -83,7 +83,7 @@ impl WlState {
         let presentation_state = PresentationState::new::<Self>(&dh, 1); // CLOCK_MONOTONIC
 
         let mut seat_state = SeatState::new();
-        let mut seat = seat_state.new_seat("seat-0");
+        let mut seat = seat_state.new_wl_seat(&dh, "seat-0");
         let _touch = seat.add_touch();
 
         let w = 3392;
