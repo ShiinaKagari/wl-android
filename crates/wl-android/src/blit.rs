@@ -50,15 +50,9 @@ impl BlitEngine {
             .engine_version(0)
             .api_version(vk::API_VERSION_1_3);
 
-        let instance_extensions = [
-            vk::KHR_EXTERNAL_MEMORY_CAPABILITIES_NAME,
-            vk::KHR_EXTERNAL_SEMAPHORE_CAPABILITIES_NAME,
-            vk::KHR_EXTERNAL_FENCE_CAPABILITIES_NAME,
-        ];
-
-        let ext_names: Vec<CString> = instance_extensions
-            .iter().map(|e| CString::new(e.to_bytes()).unwrap()).collect();
-        let ext_ptrs: Vec<_> = ext_names.iter().map(|e| e.as_ptr()).collect();
+        let instance_extensions: [&CStr; 0] = [];
+        let ext_names: Vec<CString> = Vec::new();
+        let ext_ptrs: Vec<_> = vec![];
 
         let create_info = vk::InstanceCreateInfo::default()
             .application_info(&app_info)
