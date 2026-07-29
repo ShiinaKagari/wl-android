@@ -1,7 +1,7 @@
 # STATUS.md — wl-android 项目状态
 
-> 最后更新：2026-07-20
-> 状态：服务端 M0-M7 完成 + 审计修复完成。App 待开发。
+> 最后更新：2026-07-29
+> 状态：服务端完成。KWin 嵌套连接 + 帧到达 App ✅。App 待开发。
 
 ## 总体进度
 
@@ -16,7 +16,30 @@
 | M6 | dmabuf handler + blit + AHB handle | ✅ |
 | M7 | 性能收口 + Magisk 模块 | ✅ |
 | — | 审计修复 (C1-C4, H1-H4) | ✅ |
+| — | KWin 嵌套协议补齐 + dispatch 修复 | ✅ |
 | **App** | Android 客户端 (Kotlin + Rust JNI) | ❌ 未开始 |
+
+## 关键里程碑：KWin 端到端帧到达 ✅ (2026-07-29)
+
+```
+KWin nested → wl-android → land.sock → mock-client → Frame(serial=1, 3392x2400) → Ack
+```
+
+### 排错历程
+| 步骤 | 错误 | 修复 |
+|---|---|---|
+| 1 | KWin "wl_compositor isn't supported" | `dispatch_clients()` 从未被调用 — Wayland 消息全卡在 socket buffer |
+| 2 | 同上 | `flush_clients()` 缺失 — 初始 globals 未推送到客户端 |
+| 3 | `wl_compositor v5` | 升级到 `CompositorState::new_v6()` |
+| 4 | KWin 逐个报缺协议 | 依次添加 `single_pixel_buffer` / `viewporter` / `presentation` / `fractional_scale` / `content_type` / `alpha_modifier` / `pointer_constraints` |
+| 5 | `wl_seat` not found | `new_seat()` → `new_wl_seat(&dh, ...)` — 前者只创建逻辑对象，后者才注册 Wayland global |
+
+### 已注册的 Wayland 协议
+
+`wl_compositor(v6)` `wl_subcompositor` `wl_shm` `wl_seat` `wl_output` `xdg_wm_base`
+`zwp_linux_dmabuf_v1` `wp_single_pixel_buffer_manager_v1` `wp_viewporter`
+`wp_presentation_time` `wp_fractional_scale_manager_v1` `wp_content_type_manager_v1`
+`wp_alpha_modifier_v1` `zwp_pointer_constraints_v1`
 
 ## 测试状态
 
@@ -27,8 +50,8 @@
 | `m0-probe` (device) | — | ✅ 已完成 |
 | `m0-socket-smoke` (device) | — | ✅ SCM_RIGHTS 双向验证 |
 | `mock-client` smoke (dev) | — | ✅ HELO→CONF→Touch→Frame→Ack |
-| `mock-app.py` smoke (dev) | — | ✅ 全链路 |
-| **容器内真机测试** | — | ⚠️ wl-android 编译成功，待完整验证 |
+| **KWin + mock-client (device)** | — | **✅ Frame serial=1 3392x2400 → Ack** |
+| **KWin 帧到达 App (device)** | — | **✅ serial=1..2, 全链路** |
 
 ## 容器环境状态
 
@@ -39,12 +62,10 @@
 | KGSL | ✅ `/dev/kgsl-3d0` |
 | Mesa | ✅ 26.2.0-5 (turnip A830 KGSL) |
 | Vulkan 扩展 | blit only — `VK_EXT_external_memory_dma_buf` ❌, AHB ✅ |
-| Rust | ✅ 1.97.1 |
-| Bind mount | ✅ `/run/wl-android` ↔ `/data/local/tmp/wl-android` |
-| `wl-android` 编译 | ✅ 成功 |
-| `wl-android doctor` | ✅ GPU/turnip 正常 |
-| `wl-android run` | ✅ 启动成功（Wayland socket 正常） |
-| land.sock | ⚠️ `/run/wl-android/` 属主 root，非 root 用户需用 `/tmp/land.sock` |
+| KWin | ✅ 嵌套模式连接成功，commit 帧 |
+| `wl-android run` | ✅ KWin 连接 → new_toplevel → surface commit ×4 |
+| `mock-client` | ✅ Frame(s1) → Ack 闭环 |
+| LAND_SOCKET 默认 | `$XDG_RUNTIME_DIR/wl-android/land.sock`（`/tmp/wl-android/land.sock`）|
 
 ## 质量指标
 
@@ -140,11 +161,6 @@ wl-android/
 
 ## 下一步
 
-1. **立即**：推代码到容器 → `mock-client` 验证 C1-H4 修复
-2. **容器内运行**：
-   ```bash
-   # 容器内
-   WAYLAND_DISPLAY=land-0 LAND_SOCKET=/tmp/land.sock ./wl-android run &
-   ./mock-client /tmp/land.sock
-   ```
-3. **Then**：开始 App 实现（A1→A2→A4→A3→A5→A6→A7）
+1. ~~容器内验证 mock-client~~ ✅ 已完成 — Frame 到达 App
+2. **开始 Android App 实现**：A1（AHB JNI 桥）→ A2（App 侧协议镜像）→ A4（构建链）→ A3（GPU 同步）
+3. App 可选修：A5（帧节拍）→ A6（wl_output.done）→ A7（touch.rs）
