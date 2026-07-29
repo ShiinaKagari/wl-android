@@ -132,20 +132,14 @@ extern "system" fn Java_com_wl_android_NativeBridge_nativeInit(
 #[unsafe(no_mangle)]
 #[unsafe(no_mangle)]
 extern "system" fn Java_com_wl_android_NativeBridge_nativeSetSurface(
-    mut env: JNIEnv,
-    _class: JClass,
+    _env: jni::sys::JNIEnv,
+    _class: jni::sys::jclass,
     handle: jlong,
-    surface: jobject,
+    surface: jni::sys::jobject,
 ) {
+    // CRITICAL: Use raw jni-sys types, not jni crate wrappers.
+    // jni::JNIEnv as a value parameter crashes in extern "system" on aarch64.
     log::info!("nativeSetSurface handle={handle} surface={}", !surface.is_null());
-    if !surface.is_null() {
-        let s = unsafe { JObject::from_raw(surface) };
-        if let Err(e) = crate::jni_bridge::fill_surface_blue(&mut env, &s) {
-            log::error!("fill_surface_blue: {e}");
-        } else {
-            log::info!("fill_surface_blue: OK");
-        }
-    }
 }
 
 #[unsafe(no_mangle)]
