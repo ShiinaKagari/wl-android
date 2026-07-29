@@ -22,6 +22,12 @@ class MainActivity : Activity() {
             holder.addCallback(surfaceCallback)
         }
         setContentView(surfaceView)
+
+        touchForwarder = TouchForwarder { id, x, y, phase, timeMs ->
+            if (nativeHandle != 0L) {
+                NativeBridge.nativeOnTouch(nativeHandle, id, x, y, phase, timeMs)
+            }
+        }
         surfaceView.setOnTouchListener { _, event ->
             touchForwarder.handle(event)
             true
@@ -35,29 +41,24 @@ class MainActivity : Activity() {
             }
         }
 
-        touchForwarder = TouchForwarder { id, x, y, phase, timeMs ->
-            if (nativeHandle != 0L) {
-                NativeBridge.nativeOnTouch(nativeHandle, id, x, y, phase, timeMs)
-            }
-        }
+        // Connect once, keep alive across lifecycle
+        nativeHandle = NativeBridge.nativeInit(socketPath)
     }
 
     override fun onResume() {
         super.onResume()
         collector.start()
-        nativeHandle = NativeBridge.nativeInit(socketPath)
-
-        if (surfaceView.holder.surface.isValid) {
-            NativeBridge.nativeSetSurface(nativeHandle, surfaceView.holder.surface)
-        }
     }
 
     override fun onPause() {
         collector.stop()
-        NativeBridge.nativeSetSurface(nativeHandle, null)
+        super.onPause()
+    }
+
+    override fun onDestroy() {
         NativeBridge.nativeDestroy(nativeHandle)
         nativeHandle = 0
-        super.onPause()
+        super.onDestroy()
     }
 
     private val surfaceCallback = object : SurfaceHolder.Callback {
@@ -68,12 +69,13 @@ class MainActivity : Activity() {
         }
 
         override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
-            // re-emit config on surface change (rotation)
             collector.emit()
         }
 
         override fun surfaceDestroyed(holder: SurfaceHolder) {
-            NativeBridge.nativeSetSurface(nativeHandle, null)
+            if (nativeHandle != 0L) {
+                NativeBridge.nativeSetSurface(nativeHandle, null)
+            }
         }
     }
 }
