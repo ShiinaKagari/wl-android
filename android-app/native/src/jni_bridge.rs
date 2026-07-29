@@ -5,21 +5,18 @@
 use std::sync::Mutex;
 use std::ptr::null_mut;
 
-static SURFACE: Mutex<Option<jni::sys::jobject>> = Mutex::new(None);
-static JNI_ENV: Mutex<Option<*mut std::ffi::c_void>> = Mutex::new(None);
+static SURFACE: Mutex<Option<usize>> = Mutex::new(None);
+static JNI_ENV: Mutex<Option<usize>> = Mutex::new(None);
 
-/// Store surface + env for later rendering from session thread.
 pub fn set_surface(env: *mut std::ffi::c_void, surface: jni::sys::jobject) {
-    *SURFACE.lock().unwrap() = if surface.is_null() { None } else { Some(surface) };
-    *JNI_ENV.lock().unwrap() = Some(env);
+    *SURFACE.lock().unwrap() = if surface.is_null() { None } else { Some(surface as usize) };
+    *JNI_ENV.lock().unwrap() = Some(env as usize);
 }
 
-/// Render a test pattern via ANativeWindow. Called from session thread on frame arrival.
-/// Returns Err if no surface available or lock fails.
 #[cfg(target_os = "android")]
 pub fn render_frame(serial: u64) -> Result<(), String> {
-    let surface = *SURFACE.lock().unwrap();
-    let env = *JNI_ENV.lock().unwrap();
+    let surface = SURFACE.lock().unwrap().map(|s| s as jni::sys::jobject);
+    let env = JNI_ENV.lock().unwrap().map(|e| e as *mut std::ffi::c_void);
     let (surface, env) = match (surface, env) {
         (Some(s), Some(e)) => (s, e),
         _ => return Err("no surface".into()),
