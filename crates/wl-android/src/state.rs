@@ -52,7 +52,7 @@ impl WlState {
         let display = Display::new()?;
         let dh = display.handle();
 
-        let compositor_state = CompositorState::new::<Self>(&dh);
+        let compositor_state = CompositorState::new_v6::<Self>(&dh);
         let shm_state = ShmState::new::<Self>(&dh, vec![]);
         let xdg_shell_state = XdgShellState::new::<Self>(&dh);
         let output_state = OutputManagerState::new_with_xdg_output::<Self>(&dh);
