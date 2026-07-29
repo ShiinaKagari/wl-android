@@ -24,6 +24,7 @@ use smithay::wayland::single_pixel_buffer::SinglePixelBufferState;
 use smithay::wayland::viewporter::ViewporterState;
 use smithay::wayland::content_type::ContentTypeState;
 use smithay::wayland::alpha_modifier::AlphaModifierState;
+use smithay::wayland::pointer_constraints::{PointerConstraintsHandler, PointerConstraintsState};
 use smithay::wayland::fractional_scale::FractionalScaleManagerState;
 use smithay::wayland::fractional_scale::FractionalScaleHandler;
 use smithay::wayland::presentation::PresentationState;
@@ -45,6 +46,7 @@ pub struct WlState {
     pub viewporter_state: ViewporterState,
     pub content_type_state: ContentTypeState,
     pub alpha_modifier_state: AlphaModifierState,
+    pub pointer_constraints_state: PointerConstraintsState,
     pub fractional_scale_state: FractionalScaleManagerState,
     pub presentation_state: PresentationState,
     pub xdg_shell_state: XdgShellState,
@@ -87,6 +89,7 @@ impl WlState {
         let viewporter_state = ViewporterState::new::<Self>(&dh);
         let content_type_state = ContentTypeState::new::<Self>(&dh);
         let alpha_modifier_state = AlphaModifierState::new::<Self>(&dh);
+        let pointer_constraints_state = PointerConstraintsState::new::<Self>(&dh);
         let fractional_scale_state = FractionalScaleManagerState::new::<Self>(&dh);
         let presentation_state = PresentationState::new::<Self>(&dh, 1); // CLOCK_MONOTONIC
 
@@ -118,7 +121,7 @@ impl WlState {
 
         Ok(Self {
             display, compositor_state, shm_state, dmabuf_state, single_pixel_buffer_state,
-            viewporter_state, content_type_state, alpha_modifier_state,
+            viewporter_state, content_type_state, alpha_modifier_state, pointer_constraints_state,
             fractional_scale_state, presentation_state,
             xdg_shell_state, output_state, frame_router, blit_engine,
             app_session: None, land_listener: None,
@@ -295,4 +298,12 @@ delegate_alpha_modifier!(WlState);
 delegate_fractional_scale!(WlState);
 
 impl FractionalScaleHandler for WlState {}
+
+impl PointerConstraintsHandler for WlState {
+    fn new_constraint(&mut self, _surface: &WlSurface, _pointer: &smithay::input::pointer::PointerHandle<Self>) {}
+    fn cursor_position_hint(&mut self, _surface: &WlSurface, _pointer: &smithay::input::pointer::PointerHandle<Self>, _pos: smithay::utils::Point<f64, smithay::utils::Logical>) {}
+}
+
+use smithay::delegate_pointer_constraints;
+delegate_pointer_constraints!(WlState);
 delegate_presentation!(WlState);
