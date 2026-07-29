@@ -118,6 +118,7 @@ extern "system" fn Java_com_wl_android_NativeBridge_nativeInit(
         state_clone.lock().unwrap().state = AppState::Handshake;
 
         let _ = AppSession::run_loop(read_stream, write_clone, move |serial, buffer_id, width, height| {
+            log::info!("FRAME: serial={serial} {width}x{height} buf={buffer_id}");
             if let Ok(mut inner) = state_clone.lock() {
                 inner.state = AppState::Active;
                 inner.frame_queue.push_back(FrameData { serial, buffer_id, width, height });
