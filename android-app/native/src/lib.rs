@@ -14,8 +14,6 @@ use jni::JNIEnv;
 use crate::session::AppSession;
 use crate::render::RenderState;
 
-// ── Types ──
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum AppState {
     Init = 0,
@@ -43,8 +41,6 @@ struct Inner {
 
 type StateRef = Arc<Mutex<Inner>>;
 
-// ── Global registry ──
-
 static STATE_MAP: std::sync::LazyLock<Mutex<Vec<(Handle, StateRef)>>> =
     std::sync::LazyLock::new(|| Mutex::new(Vec::new()));
 
@@ -66,8 +62,19 @@ fn remove(handle: Handle) {
     STATE_MAP.lock().unwrap().retain(|(id, _)| *id != handle);
 }
 
-// ── JNI ──
+#[cfg(target_os = "android")]
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn JNI_OnLoad(_vm: jni::JavaVM, _: *mut std::ffi::c_void) -> jni::sys::jint {
+    android_logger::init_once(
+        android_logger::Config::default()
+            .with_max_level(log::LevelFilter::Info)
+            .with_tag("land-native"),
+    );
+    log::info!("JNI_OnLoad: land_native loaded");
+    jni::sys::JNI_VERSION_1_6
+}
 
+#[unsafe(no_mangle)]
 #[unsafe(no_mangle)]
 extern "system" fn Java_com_wl_android_NativeBridge_nativeInit(
     mut env: JNIEnv,
@@ -78,11 +85,12 @@ extern "system" fn Java_com_wl_android_NativeBridge_nativeInit(
         Ok(s) => s.into(),
         Err(_) => return -1,
     };
+    log::info!("nativeInit: connecting to {path}");
 
     let (session, read_stream) = match AppSession::connect(&path) {
         Ok(pair) => pair,
         Err(e) => {
-            let _ = e;
+            log::error!("nativeInit: connect failed: {e}");
             let inner = Arc::new(Mutex::new(Inner {
                 session: None, render: RenderState::new(),
                 state: AppState::Error, frame_queue: VecDeque::new(),
@@ -100,10 +108,8 @@ extern "system" fn Java_com_wl_android_NativeBridge_nativeInit(
 
     let handle = register(state.clone());
 
-    // Spawn session thread for blocking recv
     let state_clone = state.clone();
     thread::spawn(move || {
-        // Take the write clone for the thread
         let write_clone = {
             let inner = state_clone.lock().unwrap();
             let ws = inner.session.as_ref().unwrap().write_stream.as_ref();
@@ -119,36 +125,28 @@ extern "system" fn Java_com_wl_android_NativeBridge_nativeInit(
         });
     });
 
+    log::info!("nativeInit: connected, handle={handle}");
     handle
 }
 
 #[unsafe(no_mangle)]
+#[unsafe(no_mangle)]
 extern "system" fn Java_com_wl_android_NativeBridge_nativeSetSurface(
-    _env: JNIEnv,
+    env: JNIEnv,
     _class: JClass,
     handle: jlong,
     surface: jobject,
 ) {
-    if let Some(state) = find(handle) {
-        let mut inner = state.lock().unwrap();
-        if surface.is_null() {
-            // Surface destroyed — release swapchain (M6b)
-        } else {
-            // Surface created — ANativeWindow_fromSurface → Vulkan swapchain (M6b)
-            let _ = &surface;
-        }
-    }
+    log::info!("nativeSetSurface handle={handle} surface={}", !surface.is_null());
+    // ANativeWindow → color fill test would go here
+    let _ = env; let _ = surface;
 }
 
 #[unsafe(no_mangle)]
+#[unsafe(no_mangle)]
 extern "system" fn Java_com_wl_android_NativeBridge_nativeOnConfig(
-    _env: JNIEnv,
-    _class: JClass,
-    handle: jlong,
-    w: jint,
-    h: jint,
-    refresh_millihz: jint,
-    dpi: jint,
+    _env: JNIEnv, _class: JClass, handle: jlong,
+    w: jint, h: jint, refresh_millihz: jint, dpi: jint,
 ) {
     if let Some(state) = find(handle) {
         let mut inner = state.lock().unwrap();
@@ -159,15 +157,10 @@ extern "system" fn Java_com_wl_android_NativeBridge_nativeOnConfig(
 }
 
 #[unsafe(no_mangle)]
+#[unsafe(no_mangle)]
 extern "system" fn Java_com_wl_android_NativeBridge_nativeOnTouch(
-    _env: JNIEnv,
-    _class: JClass,
-    handle: jlong,
-    touch_id: jint,
-    x: jfloat,
-    y: jfloat,
-    phase: jint,
-    time_ms: jint,
+    _env: JNIEnv, _class: JClass, handle: jlong,
+    touch_id: jint, x: jfloat, y: jfloat, phase: jint, time_ms: jint,
 ) {
     if let Some(state) = find(handle) {
         let mut inner = state.lock().unwrap();
@@ -181,10 +174,9 @@ extern "system" fn Java_com_wl_android_NativeBridge_nativeOnTouch(
 }
 
 #[unsafe(no_mangle)]
+#[unsafe(no_mangle)]
 extern "system" fn Java_com_wl_android_NativeBridge_nativeGetState(
-    _env: JNIEnv,
-    _class: JClass,
-    handle: jlong,
+    _env: JNIEnv, _class: JClass, handle: jlong,
 ) -> jint {
     find(handle)
         .map(|s| s.lock().unwrap().state as jint)
@@ -192,10 +184,9 @@ extern "system" fn Java_com_wl_android_NativeBridge_nativeGetState(
 }
 
 #[unsafe(no_mangle)]
+#[unsafe(no_mangle)]
 extern "system" fn Java_com_wl_android_NativeBridge_nativeGetSocketFd(
-    _env: JNIEnv,
-    _class: JClass,
-    handle: jlong,
+    _env: JNIEnv, _class: JClass, handle: jlong,
 ) -> jint {
     find(handle)
         .and_then(|s| {
@@ -206,10 +197,10 @@ extern "system" fn Java_com_wl_android_NativeBridge_nativeGetSocketFd(
 }
 
 #[unsafe(no_mangle)]
+#[unsafe(no_mangle)]
 extern "system" fn Java_com_wl_android_NativeBridge_nativeDestroy(
-    _env: JNIEnv,
-    _class: JClass,
-    handle: jlong,
+    _env: JNIEnv, _class: JClass, handle: jlong,
 ) {
+    log::info!("nativeDestroy handle={handle}");
     remove(handle);
 }
