@@ -5,7 +5,7 @@ use smithay::backend::allocator::Buffer;
 use tracing::{debug, error, warn};
 use drm_fourcc::DrmFourcc;
 use std::os::fd::OwnedFd;
-use std::os::fd::{AsRawFd as _, FromRawFd as _};
+use std::os::fd::AsRawFd as _;
 
 use crate::state::WlState;
 
@@ -71,7 +71,12 @@ impl DmabufHandler for WlState {
 
         // Dup the first plane's fd (Dmabuf retains ownership)
         let raw_fd = handles[0].as_raw_fd();
-        let fd = unsafe { OwnedFd::from_raw_fd(libc::dup(raw_fd)) };
+        let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(raw_fd) };
+        let Ok(fd) = borrowed.try_clone_to_owned() else {
+            error!("failed to dup dmabuf fd");
+            notifier.failed();
+            return;
+        };
 
         // Import into blit engine
         let format = dmabuf.format();

@@ -57,7 +57,7 @@ impl BlitEngine {
         ];
 
         let ext_names: Vec<CString> = instance_extensions
-            .iter().map(|e| e.to_owned()).collect();
+            .iter().map(|e| CString::new(e.to_bytes()).unwrap()).collect();
         let ext_ptrs: Vec<_> = ext_names.iter().map(|e| e.as_ptr()).collect();
 
         let create_info = vk::InstanceCreateInfo::default()
@@ -95,7 +95,7 @@ impl BlitEngine {
         ];
 
         let dev_ext_names: Vec<CString> = device_extensions
-            .iter().map(|e| e.to_owned()).collect();
+            .iter().map(|e| CString::new(e.to_bytes()).unwrap()).collect();
         let dev_ext_ptrs: Vec<_> = dev_ext_names.iter().map(|e| e.as_ptr()).collect();
 
         let device_info = vk::DeviceCreateInfo::default()
