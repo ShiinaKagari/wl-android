@@ -83,8 +83,9 @@ fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     event_loop
         .handle()
         .insert_source(wayland_socket, move |stream, _, state| {
-            if let Err(e) = state.display.handle().insert_client(stream, Arc::new(())) {
-                error!(err = %e, "failed to insert wayland client");
+            match state.display.handle().insert_client(stream, Arc::new(())) {
+                Ok(_) => info!("Wayland client connected"),
+                Err(e) => error!(err = %e, "failed to insert wayland client"),
             }
         })?;
 
