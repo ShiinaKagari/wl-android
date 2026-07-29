@@ -1,6 +1,7 @@
 use std::os::unix::net::UnixListener;
 
 use smithay::delegate_compositor;
+use smithay::delegate_content_type;
 use smithay::delegate_fractional_scale;
 use smithay::delegate_output;
 use smithay::delegate_presentation;
@@ -9,6 +10,7 @@ use smithay::delegate_shm;
 use smithay::delegate_single_pixel_buffer;
 use smithay::delegate_viewporter;
 use smithay::delegate_xdg_shell;
+use smithay::delegate_alpha_modifier;
 use smithay::input::{Seat, SeatHandler, SeatState};
 use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
@@ -20,6 +22,8 @@ use smithay::wayland::shell::xdg::{ToplevelSurface, XdgShellHandler, XdgShellSta
 use smithay::wayland::shm::{ShmHandler, ShmState};
 use smithay::wayland::single_pixel_buffer::SinglePixelBufferState;
 use smithay::wayland::viewporter::ViewporterState;
+use smithay::wayland::content_type::ContentTypeState;
+use smithay::wayland::alpha_modifier::AlphaModifierState;
 use smithay::wayland::fractional_scale::FractionalScaleManagerState;
 use smithay::wayland::fractional_scale::FractionalScaleHandler;
 use smithay::wayland::presentation::PresentationState;
@@ -39,6 +43,8 @@ pub struct WlState {
     pub dmabuf_state: DmabufState,
     pub single_pixel_buffer_state: SinglePixelBufferState,
     pub viewporter_state: ViewporterState,
+    pub content_type_state: ContentTypeState,
+    pub alpha_modifier_state: AlphaModifierState,
     pub fractional_scale_state: FractionalScaleManagerState,
     pub presentation_state: PresentationState,
     pub xdg_shell_state: XdgShellState,
@@ -79,6 +85,8 @@ impl WlState {
 
         let single_pixel_buffer_state = SinglePixelBufferState::new::<Self>(&dh);
         let viewporter_state = ViewporterState::new::<Self>(&dh);
+        let content_type_state = ContentTypeState::new::<Self>(&dh);
+        let alpha_modifier_state = AlphaModifierState::new::<Self>(&dh);
         let fractional_scale_state = FractionalScaleManagerState::new::<Self>(&dh);
         let presentation_state = PresentationState::new::<Self>(&dh, 1); // CLOCK_MONOTONIC
 
@@ -110,7 +118,8 @@ impl WlState {
 
         Ok(Self {
             display, compositor_state, shm_state, dmabuf_state, single_pixel_buffer_state,
-            viewporter_state, fractional_scale_state, presentation_state,
+            viewporter_state, content_type_state, alpha_modifier_state,
+            fractional_scale_state, presentation_state,
             xdg_shell_state, output_state, frame_router, blit_engine,
             app_session: None, land_listener: None,
             screen_width: w, screen_height: h, refresh_millihz: refresh, dpi,
@@ -281,6 +290,8 @@ delegate_output!(WlState);
 
 delegate_single_pixel_buffer!(WlState);
 delegate_viewporter!(WlState);
+delegate_content_type!(WlState);
+delegate_alpha_modifier!(WlState);
 delegate_fractional_scale!(WlState);
 
 impl FractionalScaleHandler for WlState {}
