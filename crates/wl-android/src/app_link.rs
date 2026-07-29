@@ -71,11 +71,13 @@ impl AppSession {
 
                 // H-04: mode selection
                 if conf.app_caps & proto::APP_CAP_DIRECT_IMPORT != 0 {
-                    info!("mode: direct (App supports dma_buf import)");
+                    info!("mode: direct");
                     self.mode = SessionMode::Active;
                 } else if self.server_caps & proto::SERVER_CAP_BLIT != 0 {
-                    info!("mode: blit (waiting for slot registration)");
-                    self.mode = SessionMode::SlotRegistration;
+                    // v1: Skip SlotRegistration — go Active immediately.
+                    // TBUF registration will be handled asynchronously via recv_message.
+                    info!("mode: blit (active immediately)");
+                    self.mode = SessionMode::Active;
                 } else {
                     warn!("no available frame path");
                     return Err(io::Error::other("no available frame path"));
