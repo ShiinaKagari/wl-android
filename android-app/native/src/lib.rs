@@ -132,14 +132,18 @@ extern "system" fn Java_com_wl_android_NativeBridge_nativeInit(
 #[unsafe(no_mangle)]
 #[unsafe(no_mangle)]
 extern "system" fn Java_com_wl_android_NativeBridge_nativeSetSurface(
-    env: JNIEnv,
+    mut env: JNIEnv,
     _class: JClass,
     handle: jlong,
     surface: jobject,
 ) {
     log::info!("nativeSetSurface handle={handle} surface={}", !surface.is_null());
-    // ANativeWindow → color fill test would go here
-    let _ = env; let _ = surface;
+    if !surface.is_null() {
+        let s = unsafe { JObject::from_raw(surface) };
+        if let Err(e) = crate::jni_bridge::fill_surface_blue(&mut env, &s) {
+            log::error!("fill_surface_blue failed: {e}");
+        }
+    }
 }
 
 #[unsafe(no_mangle)]
