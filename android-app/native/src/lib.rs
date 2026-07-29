@@ -132,19 +132,14 @@ extern "system" fn Java_com_wl_android_NativeBridge_nativeInit(
 #[unsafe(no_mangle)]
 #[unsafe(no_mangle)]
 extern "system" fn Java_com_wl_android_NativeBridge_nativeSetSurface(
-    env: jni::sys::JNIEnv,
+    _env: jni::sys::JNIEnv,
     _class: jni::sys::jclass,
     handle: jlong,
     surface: jni::sys::jobject,
 ) {
-    let has_surface = !surface.is_null();
-    log::info!("nativeSetSurface handle={handle} surface={has_surface}");
-    if has_surface {
-        if let Err(e) = crate::jni_bridge::fill_surface_blue(env as *mut std::ffi::c_void, surface) {
-            log::error!("fill_surface_blue: {e}");
-        } else {
-            log::info!("fill_surface_blue: OK");
-        }
+    log::info!("nativeSetSurface handle={handle} surface={}", !surface.is_null());
+    // ANativeWindow rendering deferred to M6b (Vulkan swapchain)
+}
     }
 }
 
