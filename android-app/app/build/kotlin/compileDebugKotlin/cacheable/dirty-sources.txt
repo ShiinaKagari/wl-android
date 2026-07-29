@@ -1,0 +1,4 @@
+/home/kagari/Projects/wl-android/android-app/app/src/main/java/com/wl/android/MainActivity.kt
+/home/kagari/Projects/wl-android/android-app/app/src/main/java/com/wl/android/TouchForwarder.kt
+/home/kagari/Projects/wl-android/android-app/app/src/main/java/com/wl/android/ScreenInfoCollector.kt
+/home/kagari/Projects/wl-android/android-app/app/src/main/java/com/wl/android/NativeBridge.kt

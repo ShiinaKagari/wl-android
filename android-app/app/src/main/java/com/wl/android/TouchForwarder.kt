@@ -2,7 +2,11 @@ package com.wl.android
 
 import android.view.MotionEvent
 
-class TouchForwarder(private val onTouch: (Int, Float, Float, Int, Int) -> Unit) {
+class TouchForwarder(
+    private val onTouch: (Int, Float, Float, Int, Int) -> Unit
+) {
+    var screenWidth: Int = 3392
+    var screenHeight: Int = 2400
 
     companion object {
         const val TOUCH_DOWN = 0
@@ -19,11 +23,11 @@ class TouchForwarder(private val onTouch: (Int, Float, Float, Int, Int) -> Unit)
 
         for (i in 0 until pointerCount) {
             val id = event.getPointerId(i)
-            val x = if (event.xPrecision > 0) event.getX(i) / event.xPrecision else event.getX(i)
-            val y = if (event.yPrecision > 0) event.getY(i) / event.yPrecision else event.getY(i)
-            // Normalize to [0,1] using device resolution
-            val nx = x / event.device.width.toFloat()
-            val ny = y / event.device.height.toFloat()
+            val x = event.getX(i)
+            val y = event.getY(i)
+            // Normalize to [0,1] using screen dimensions
+            val nx = if (screenWidth > 0) (x / screenWidth.toFloat()).coerceIn(0f, 1f) else 0f
+            val ny = if (screenHeight > 0) (y / screenHeight.toFloat()).coerceIn(0f, 1f) else 0f
 
             val phase = when {
                 (actionMasked == MotionEvent.ACTION_DOWN || actionMasked == MotionEvent.ACTION_POINTER_DOWN)
@@ -33,7 +37,7 @@ class TouchForwarder(private val onTouch: (Int, Float, Float, Int, Int) -> Unit)
                 actionMasked == MotionEvent.ACTION_CANCEL -> TOUCH_CANCEL
                 else -> TOUCH_MOVE
             }
-            onTouch(id, nx.coerceIn(0f, 1f), ny.coerceIn(0f, 1f), phase, event.eventTime.toInt())
+            onTouch(id, nx, ny, phase, event.eventTime.toInt())
         }
         // T-02: frame sentinel after all pointers
         onTouch(0, 0f, 0f, TOUCH_FRAME, event.eventTime.toInt())

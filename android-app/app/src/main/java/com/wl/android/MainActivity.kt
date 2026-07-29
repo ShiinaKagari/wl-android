@@ -28,6 +28,8 @@ class MainActivity : Activity() {
         }
 
         collector = ScreenInfoCollector(this) { w, h, ref, dpi ->
+            touchForwarder.screenWidth = w
+            touchForwarder.screenHeight = h
             if (nativeHandle != 0L) {
                 NativeBridge.nativeOnConfig(nativeHandle, w, h, ref, dpi)
             }
