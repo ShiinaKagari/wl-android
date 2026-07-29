@@ -1,10 +1,13 @@
 use std::os::unix::net::UnixListener;
 
 use smithay::delegate_compositor;
+use smithay::delegate_fractional_scale;
 use smithay::delegate_output;
+use smithay::delegate_presentation;
 use smithay::delegate_seat;
 use smithay::delegate_shm;
 use smithay::delegate_single_pixel_buffer;
+use smithay::delegate_viewporter;
 use smithay::delegate_xdg_shell;
 use smithay::input::{Seat, SeatHandler, SeatState};
 use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
@@ -16,6 +19,10 @@ use smithay::wayland::output::OutputManagerState;
 use smithay::wayland::shell::xdg::{ToplevelSurface, XdgShellHandler, XdgShellState};
 use smithay::wayland::shm::{ShmHandler, ShmState};
 use smithay::wayland::single_pixel_buffer::SinglePixelBufferState;
+use smithay::wayland::viewporter::ViewporterState;
+use smithay::wayland::fractional_scale::FractionalScaleManagerState;
+use smithay::wayland::fractional_scale::FractionalScaleHandler;
+use smithay::wayland::presentation::PresentationState;
 use tracing::info;
 use wayland_protocols::xdg::shell::server::xdg_toplevel;
 
@@ -31,6 +38,9 @@ pub struct WlState {
     pub shm_state: ShmState,
     pub dmabuf_state: DmabufState,
     pub single_pixel_buffer_state: SinglePixelBufferState,
+    pub viewporter_state: ViewporterState,
+    pub fractional_scale_state: FractionalScaleManagerState,
+    pub presentation_state: PresentationState,
     pub xdg_shell_state: XdgShellState,
     #[allow(dead_code)]
     pub output_state: OutputManagerState,
@@ -68,6 +78,9 @@ impl WlState {
             dmabuf_state.create_global_with_default_feedback::<Self>(&dh, &dmabuf_feedback);
 
         let single_pixel_buffer_state = SinglePixelBufferState::new::<Self>(&dh);
+        let viewporter_state = ViewporterState::new::<Self>(&dh);
+        let fractional_scale_state = FractionalScaleManagerState::new::<Self>(&dh);
+        let presentation_state = PresentationState::new::<Self>(&dh, 1); // CLOCK_MONOTONIC
 
         let mut seat_state = SeatState::new();
         let mut seat = seat_state.new_seat("seat-0");
@@ -97,6 +110,7 @@ impl WlState {
 
         Ok(Self {
             display, compositor_state, shm_state, dmabuf_state, single_pixel_buffer_state,
+            viewporter_state, fractional_scale_state, presentation_state,
             xdg_shell_state, output_state, frame_router, blit_engine,
             app_session: None, land_listener: None,
             screen_width: w, screen_height: h, refresh_millihz: refresh, dpi,
@@ -266,3 +280,8 @@ impl smithay::wayland::output::OutputHandler for WlState {}
 delegate_output!(WlState);
 
 delegate_single_pixel_buffer!(WlState);
+delegate_viewporter!(WlState);
+delegate_fractional_scale!(WlState);
+
+impl FractionalScaleHandler for WlState {}
+delegate_presentation!(WlState);
