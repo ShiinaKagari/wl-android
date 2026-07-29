@@ -18,4 +18,7 @@ ash = "0.38"
 ndk = "0.9"
 ndk-sys = "0.6"
 android_logger = "0.14"
-env_logger = "0.11"
+    env_logger = "0.11"
+
+[build-dependencies]
+cc = { version = "1", features = ["parallel"] }

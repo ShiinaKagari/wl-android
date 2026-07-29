@@ -118,6 +118,7 @@ extern "system" fn Java_com_wl_android_NativeBridge_nativeInit(
 
         let _ = AppSession::run_loop(read_stream, write_clone, move |serial, buffer_id, width, height| {
             log::info!("FRAME: serial={serial} {width}x{height} buf={buffer_id}");
+            let _ = crate::jni_bridge::render_frame(serial);
             if let Ok(mut inner) = state_clone.lock() {
                 inner.state = AppState::Active;
                 inner.frame_queue.push_back(FrameData { serial, buffer_id, width, height });
@@ -131,12 +132,13 @@ extern "system" fn Java_com_wl_android_NativeBridge_nativeInit(
 
 #[unsafe(no_mangle)]
 extern "system" fn Java_com_wl_android_NativeBridge_nativeSetSurface(
-    _env: jni::sys::JNIEnv,
+    env: jni::sys::JNIEnv,
     _class: jni::sys::jclass,
     handle: jlong,
     surface: jni::sys::jobject,
 ) {
     log::info!("nativeSetSurface handle={handle} surface={}", !surface.is_null());
+    crate::jni_bridge::set_surface(env as *mut std::ffi::c_void, surface);
 }
 
 #[unsafe(no_mangle)]
