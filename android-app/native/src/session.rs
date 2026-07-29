@@ -1,99 +1,110 @@
 use std::io::{self, Read, Write};
-use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
+use std::sync::Arc;
 
 use wl_android_common::proto;
 use wl_android_common::proto::Message;
 
 pub struct AppSession {
-    stream: UnixStream,
+    pub write_stream: Arc<UnixStream>,
     recv_buf: Vec<u8>,
 }
 
 impl AppSession {
-    pub fn connect(path: &str) -> io::Result<Self> {
+    /// Connect and return session. The read end is returned separately for
+    /// the dedicated recv thread; the write end is shared for JNI calls.
+    pub fn connect(path: &str) -> io::Result<(Self, UnixStream)> {
         let stream = UnixStream::connect(path)?;
         stream.set_nonblocking(false)?;
-        Ok(Self { stream, recv_buf: vec![0u8; 65536] })
+        let write_stream = Arc::new(stream.try_clone()?);
+        let read_stream = stream;
+        Ok((Self { write_stream, recv_buf: vec![0u8; 65536] }, read_stream))
     }
 
-    pub fn socket_fd(&self) -> jint_raw {
-        self.stream.as_raw_fd() as jint_raw
+    pub fn socket_fd(&self) -> std::os::raw::c_int {
+        use std::os::fd::AsRawFd;
+        self.write_stream.as_raw_fd() as std::os::raw::c_int
     }
 
-    // ── Protocol send ──
+    // ── Send (JNI-facing, shared via Arc) ──
 
-    pub fn send_message(&mut self, msg: &Message) -> io::Result<()> {
-        let data = proto::encode(msg);
+    fn write_msg(&self, data: &[u8]) -> io::Result<()> {
         let len = (data.len() as u32).to_le_bytes();
-        self.stream.write_all(&len)?;
-        self.stream.write_all(&data)?;
-        self.stream.flush()?;
-        Ok(())
+        let mut s = self.write_stream.as_ref();
+        s.write_all(&len)?;
+        s.write_all(data)?;
+        s.flush()
     }
 
-    pub fn send_config(&mut self, w: u32, h: u32, refresh_millihz: u32, dpi: u32) -> io::Result<()> {
+    pub fn send_message(&self, msg: &Message) -> io::Result<()> {
+        self.write_msg(&proto::encode(msg))
+    }
+
+    pub fn send_config(&self, w: u32, h: u32, refresh_millihz: u32, dpi: u32) -> io::Result<()> {
         let conf = proto::ConfigMessage::new(w, h, refresh_millihz, dpi, 0);
         self.send_message(&Message::Config(conf))
     }
 
-    // ── Protocol recv ──
-
-    pub fn recv_message(&mut self) -> io::Result<Message> {
-        let data = self.recv_raw()?;
-        proto::decode(&data, vec![])
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
+    pub fn send_tbuf(&self, slot: u32, w: u32, h: u32, fmt: u32, stride: u32) -> io::Result<()> {
+        let tb = proto::SlotBuffer::new(slot, w, h, fmt, stride);
+        self.send_message(&Message::Slot(tb))
     }
 
-    fn recv_raw(&mut self) -> io::Result<Vec<u8>> {
-        let mut len_buf = [0u8; 4];
-        self.stream.read_exact(&mut len_buf)?;
-        let msg_len = u32::from_le_bytes(len_buf) as usize;
+    // ── Recv (blocking, runs on dedicated thread) ──
 
-        if msg_len > self.recv_buf.len() {
-            self.recv_buf.resize(msg_len, 0);
-        }
-        self.stream.read_exact(&mut self.recv_buf[..msg_len])?;
-        Ok(self.recv_buf[..msg_len].to_vec())
-    }
+    pub fn run_loop(
+        read_stream: UnixStream,
+        write_stream: UnixStream,
+        on_frame: impl Fn(u64, u32, u32, u32),
+    ) -> io::Result<()> {
+        let mut buf = vec![0u8; 65536];
+        let mut rd = read_stream;
+        let mut wr = write_stream;
 
-    // ── Full protocol cycle ──
-
-    /// Do handshake: wait for HELO, send CONF, then enter frame+ack loop.
-    /// This blocks the calling thread — intended to run on a dedicated thread.
-    pub fn run_loop(&mut self, on_frame: impl Fn(u64, u32, u32, u32)) -> io::Result<()> {
         // 1. Receive HELO
-        let msg = self.recv_message()?;
+        let data = Self::recv_raw(&mut rd, &mut buf)?;
+        let msg = proto::decode(&data, vec![])
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
         if !matches!(msg, Message::Hello(_)) {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "expected HELO"));
         }
 
-        // 2. Send CONF (default values, caller will update via nativeOnConfig)
-        self.send_config(3392, 2400, 144000, 289)?;
+        // 2. Send CONF
+        let conf_data = proto::encode(&Message::Config(proto::ConfigMessage::new(3392, 2400, 144000, 289, 0)));
+        let len = (conf_data.len() as u32).to_le_bytes();
+        wr.write_all(&len)?;
+        wr.write_all(&conf_data)?;
+        wr.flush()?;
 
         // 3. Frame ← Ack loop
         loop {
-            let msg = self.recv_message()?;
+            let data = Self::recv_raw(&mut rd, &mut buf)?;
+            let msg = proto::decode(&data, vec![])
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
             match msg {
                 Message::Frame(fm, _) => {
                     on_frame(fm.serial, fm.buffer_id, fm.width, fm.height);
-                    // Send cumulative ack
                     let ack = proto::FrameAck::new(fm.serial);
-                    self.send_message(&Message::Ack(ack))?;
+                    let ack_data = proto::encode(&Message::Ack(ack));
+                    let alen = (ack_data.len() as u32).to_le_bytes();
+                    wr.write_all(&alen)?;
+                    wr.write_all(&ack_data)?;
+                    wr.flush()?;
                 }
-                Message::Config(conf) => {
-                    // Server sends config? Ignore in v1
-                    let _ = conf;
-                }
-                Message::Gone(gone) => {
-                    // Buffer destroyed by server
-                    let _ = gone.buffer_id;
-                }
-                Message::Hello(_) => {} // re-handshake? ignore
+                Message::Config(_) | Message::Hello(_) | Message::Gone(_) => {}
                 _ => {}
             }
         }
     }
-}
 
-type jint_raw = std::os::raw::c_int;
+    fn recv_raw(stream: &mut UnixStream, buf: &mut Vec<u8>) -> io::Result<Vec<u8>> {
+        let mut len_buf = [0u8; 4];
+        stream.read_exact(&mut len_buf)?;
+        let msg_len = u32::from_le_bytes(len_buf) as usize;
+        if msg_len > buf.len() {
+            buf.resize(msg_len, 0);
+        }
+        stream.read_exact(&mut buf[..msg_len])?;
+        Ok(buf[..msg_len].to_vec())
+    }
+}

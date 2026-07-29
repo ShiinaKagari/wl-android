@@ -3,17 +3,18 @@ mod render;
 mod ahb;
 mod jni_bridge;
 
-use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
+use std::thread;
 
-use jni::objects::{GlobalRef, JClass, JObject, JString, JValue};
+use jni::objects::{JClass, JString, JObject};
 use jni::sys::{jfloat, jint, jlong, jobject};
 use jni::JNIEnv;
 
 use crate::session::AppSession;
 use crate::render::RenderState;
 
-// ── Global state ──
+// ── Types ──
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum AppState {
@@ -23,75 +24,124 @@ pub enum AppState {
     Error = 3,
 }
 
-struct State {
+#[derive(Debug, Clone)]
+pub struct FrameData {
+    pub serial: u64,
+    pub buffer_id: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+type Handle = i64;
+
+struct Inner {
     session: Option<AppSession>,
     render: RenderState,
     state: AppState,
+    frame_queue: VecDeque<FrameData>,
 }
 
-static mut INSTANCES: Option<HashMap<i64, State>> = None;
-static mut NEXT_ID: i64 = 1;
+type StateRef = Arc<Mutex<Inner>>;
 
-fn instances() -> &'static mut HashMap<i64, State> {
-    unsafe {
-        if INSTANCES.is_none() {
-            INSTANCES = Some(HashMap::new());
-        }
-        INSTANCES.as_mut().unwrap()
-    }
+// ── Global registry ──
+
+static STATE_MAP: std::sync::LazyLock<Mutex<Vec<(Handle, StateRef)>>> =
+    std::sync::LazyLock::new(|| Mutex::new(Vec::new()));
+
+static NEXT_ID: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(1);
+
+fn register(state: StateRef) -> Handle {
+    let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    STATE_MAP.lock().unwrap().push((id, state));
+    id
 }
 
-fn next_id() -> i64 {
-    unsafe {
-        let id = NEXT_ID;
-        NEXT_ID += 1;
-        id
-    }
+fn find(handle: Handle) -> Option<StateRef> {
+    STATE_MAP.lock().unwrap().iter()
+        .find(|(id, _)| *id == handle)
+        .map(|(_, s)| s.clone())
 }
 
-// ── JNI functions ──
+fn remove(handle: Handle) {
+    STATE_MAP.lock().unwrap().retain(|(id, _)| *id != handle);
+}
 
-#[no_mangle]
-pub extern "system" fn Java_com_wl_android_NativeBridge_nativeInit(
+// ── JNI ──
+
+#[unsafe(no_mangle)]
+extern "system" fn Java_com_wl_android_NativeBridge_nativeInit(
     mut env: JNIEnv,
     _class: JClass,
     socket_path: JString,
 ) -> jlong {
-    let path: String = env.get_string(&socket_path).unwrap().into();
-    let session = match AppSession::connect(&path) {
-        Ok(s) => s,
+    let path: String = match env.get_string(&socket_path) {
+        Ok(s) => s.into(),
+        Err(_) => return -1,
+    };
+
+    let (session, read_stream) = match AppSession::connect(&path) {
+        Ok(pair) => pair,
         Err(e) => {
-            let id = next_id();
-            instances().insert(id, State {
-                session: None,
-                render: RenderState::new(),
-                state: AppState::Error,
-            });
-            return id;
+            let _ = e;
+            let inner = Arc::new(Mutex::new(Inner {
+                session: None, render: RenderState::new(),
+                state: AppState::Error, frame_queue: VecDeque::new(),
+            }));
+            return register(inner);
         }
     };
 
-    let id = next_id();
-    instances().insert(id, State {
+    let state = Arc::new(Mutex::new(Inner {
         session: Some(session),
         render: RenderState::new(),
         state: AppState::Init,
+        frame_queue: VecDeque::new(),
+    }));
+
+    let handle = register(state.clone());
+
+    // Spawn session thread for blocking recv
+    let state_clone = state.clone();
+    thread::spawn(move || {
+        // Take the write clone for the thread
+        let write_clone = {
+            let inner = state_clone.lock().unwrap();
+            let ws = inner.session.as_ref().unwrap().write_stream.as_ref();
+            ws.try_clone().expect("clone write stream")
+        };
+        state_clone.lock().unwrap().state = AppState::Handshake;
+
+        let _ = AppSession::run_loop(read_stream, write_clone, move |serial, buffer_id, width, height| {
+            if let Ok(mut inner) = state_clone.lock() {
+                inner.state = AppState::Active;
+                inner.frame_queue.push_back(FrameData { serial, buffer_id, width, height });
+            }
+        });
     });
-    id
+
+    handle
 }
 
-#[no_mangle]
-pub extern "system" fn Java_com_wl_android_NativeBridge_nativeSetSurface(
+#[unsafe(no_mangle)]
+extern "system" fn Java_com_wl_android_NativeBridge_nativeSetSurface(
     _env: JNIEnv,
     _class: JClass,
     handle: jlong,
     surface: jobject,
 ) {
-    // TODO: ANativeWindow_fromSurface for Vulkan swapchain
+    if let Some(state) = find(handle) {
+        let mut inner = state.lock().unwrap();
+        if surface.is_null() {
+            // Surface destroyed — release swapchain (M6b)
+        } else {
+            // Surface created — ANativeWindow_fromSurface → Vulkan swapchain (M6b)
+            let _ = &surface;
+        }
+    }
 }
 
-#[no_mangle]
-pub extern "system" fn Java_com_wl_android_NativeBridge_nativeOnConfig(
+#[unsafe(no_mangle)]
+extern "system" fn Java_com_wl_android_NativeBridge_nativeOnConfig(
     _env: JNIEnv,
     _class: JClass,
     handle: jlong,
@@ -100,15 +150,16 @@ pub extern "system" fn Java_com_wl_android_NativeBridge_nativeOnConfig(
     refresh_millihz: jint,
     dpi: jint,
 ) {
-    if let Some(state) = instances().get_mut(&handle) {
-        if let Some(ref mut session) = state.session {
+    if let Some(state) = find(handle) {
+        let mut inner = state.lock().unwrap();
+        if let Some(ref mut session) = inner.session {
             let _ = session.send_config(w as u32, h as u32, refresh_millihz as u32, dpi as u32);
         }
     }
 }
 
-#[no_mangle]
-pub extern "system" fn Java_com_wl_android_NativeBridge_nativeOnTouch(
+#[unsafe(no_mangle)]
+extern "system" fn Java_com_wl_android_NativeBridge_nativeOnTouch(
     _env: JNIEnv,
     _class: JClass,
     handle: jlong,
@@ -118,8 +169,9 @@ pub extern "system" fn Java_com_wl_android_NativeBridge_nativeOnTouch(
     phase: jint,
     time_ms: jint,
 ) {
-    if let Some(state) = instances().get_mut(&handle) {
-        if let Some(ref mut session) = state.session {
+    if let Some(state) = find(handle) {
+        let mut inner = state.lock().unwrap();
+        if let Some(ref mut session) = inner.session {
             let msg = wl_android_common::proto::TouchMessage::new(
                 touch_id, x, y, phase as u32, time_ms as u32,
             );
@@ -128,36 +180,36 @@ pub extern "system" fn Java_com_wl_android_NativeBridge_nativeOnTouch(
     }
 }
 
-#[no_mangle]
-pub extern "system" fn Java_com_wl_android_NativeBridge_nativeGetState(
+#[unsafe(no_mangle)]
+extern "system" fn Java_com_wl_android_NativeBridge_nativeGetState(
     _env: JNIEnv,
     _class: JClass,
     handle: jlong,
 ) -> jint {
-    instances()
-        .get(&handle)
-        .map(|s| s.state as jint)
+    find(handle)
+        .map(|s| s.lock().unwrap().state as jint)
         .unwrap_or(AppState::Error as jint)
 }
 
-#[no_mangle]
-pub extern "system" fn Java_com_wl_android_NativeBridge_nativeGetSocketFd(
+#[unsafe(no_mangle)]
+extern "system" fn Java_com_wl_android_NativeBridge_nativeGetSocketFd(
     _env: JNIEnv,
     _class: JClass,
     handle: jlong,
 ) -> jint {
-    instances()
-        .get(&handle)
-        .and_then(|s| s.session.as_ref())
-        .map(|s| s.socket_fd())
+    find(handle)
+        .and_then(|s| {
+            let inner = s.lock().unwrap();
+            inner.session.as_ref().map(|s| s.socket_fd())
+        })
         .unwrap_or(-1)
 }
 
-#[no_mangle]
-pub extern "system" fn Java_com_wl_android_NativeBridge_nativeDestroy(
+#[unsafe(no_mangle)]
+extern "system" fn Java_com_wl_android_NativeBridge_nativeDestroy(
     _env: JNIEnv,
     _class: JClass,
     handle: jlong,
 ) {
-    instances().remove(&handle);
+    remove(handle);
 }

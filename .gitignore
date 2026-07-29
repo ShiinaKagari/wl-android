@@ -1,4 +1,5 @@
 /target/
 m0/**/target/
+android-app/native/target/
 *.snap.new
 soak-results/
