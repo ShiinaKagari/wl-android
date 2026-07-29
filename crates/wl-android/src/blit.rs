@@ -1,10 +1,9 @@
 use std::collections::HashMap;
-use std::ffi::{CStr, CString};
-use std::os::fd::{OwnedFd, RawFd};
-use std::sync::Arc;
+use std::ffi::CString;
+use std::os::fd::OwnedFd;
 
 use ash::vk;
-use tracing::{error, info, warn};
+use tracing::info;
 
 pub struct BlitEngine {
     instance: Option<ash::Instance>,
@@ -58,7 +57,7 @@ impl BlitEngine {
         ];
 
         let ext_names: Vec<CString> = instance_extensions
-            .iter().map(|e| CString::from(CStr::from_ptr(*e))).collect();
+            .iter().map(|e| e.to_owned()).collect();
         let ext_ptrs: Vec<_> = ext_names.iter().map(|e| e.as_ptr()).collect();
 
         let create_info = vk::InstanceCreateInfo::default()
@@ -96,7 +95,7 @@ impl BlitEngine {
         ];
 
         let dev_ext_names: Vec<CString> = device_extensions
-            .iter().map(|e| CString::from(CStr::from_ptr(*e))).collect();
+            .iter().map(|e| e.to_owned()).collect();
         let dev_ext_ptrs: Vec<_> = dev_ext_names.iter().map(|e| e.as_ptr()).collect();
 
         let device_info = vk::DeviceCreateInfo::default()
@@ -183,7 +182,7 @@ impl BlitEngine {
 
         let mem_req = unsafe { device.get_image_memory_requirements(image) };
 
-        let import_info = vk::ImportMemoryFdInfoKHR::default()
+        let mut import_info = vk::ImportMemoryFdInfoKHR::default()
             .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT)
             .fd(raw_fd);
 
