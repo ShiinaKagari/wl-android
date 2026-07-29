@@ -1,10 +1,15 @@
-use jni::sys::{jobject, JNIEnv as RawJNIEnv};
+use jni::sys::jobject;
 
 /// Fill ANativeWindow from raw JNI pointers.
+/// `env` is the JNIEnv* (as passed by the JNI calling convention).
 #[cfg(target_os = "android")]
-pub fn fill_surface_blue(env: *mut RawJNIEnv, surface: jobject) -> Result<(), String> {
+pub fn fill_surface_blue(env: *mut std::ffi::c_void, surface: jobject) -> Result<(), String> {
+    // ANativeWindow_fromSurface expects JNIEnv* (pointer to JNIEnv).
+    // Our JNI binding receives env as the JNIEnv pointer value.
+    // Pass a pointer to this pointer.
+    let env_ptr: *mut std::ffi::c_void = env;
     let window = unsafe {
-        ndk_sys::ANativeWindow_fromSurface(env as *mut std::ffi::c_void, surface)
+        ndk_sys::ANativeWindow_fromSurface(&env_ptr as *const _ as *mut _, surface)
     };
     if window.is_null() {
         return Err("ANativeWindow_fromSurface returned null".into());
