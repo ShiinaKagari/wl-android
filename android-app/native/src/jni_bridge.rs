@@ -49,10 +49,15 @@ pub fn render_frame(serial: u64) -> Result<(), String> {
     let c = match serial % 4 {
         0 => 0xFF_0000FF, 1 => 0xFF_00FF00, 2 => 0xFF_FF0000, _ => 0xFF_00FFFF,
     };
-    let pixels = buf.width as usize * buf.height as usize;
+    // Only fill a 200x200 rect to keep render fast (<1ms)
+    let stride = buf.stride as usize;
     let bits = buf.bits as *mut u32;
-    for i in 0..pixels {
-        unsafe { *bits.add(i) = c; }
+    let max_h = buf.height.min(200) as usize;
+    let max_w = buf.width.min(200) as usize;
+    for y in 0..max_h {
+        for x in 0..max_w {
+            unsafe { *bits.add(y * stride + x) = c; }
+        }
     }
 
     unsafe { wl_unlock_and_post(window as _); }
