@@ -244,7 +244,18 @@ impl CompositorHandler for WlState {
                     }
                 }
                 crate::frame_router::RouterAction::FireCallback => {
-                    tracing::trace!("fire callback");
+                    // Send wl_callback.done — KWin needs this to keep rendering
+                    if let Some(ref tl) = self.toplevel {
+                        let time = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis() as u32;
+                        tl.with_pending_state(|state| {
+                            for cb in state.frame_callbacks.drain(..) {
+                                cb.done(time);
+                            }
+                        });
+                    }
                 }
                 _ => {}
             }
