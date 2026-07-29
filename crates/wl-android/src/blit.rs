@@ -40,28 +40,22 @@ impl BlitEngine {
         if self.initialized { return Ok(()); }
 
         let entry = unsafe { ash::Entry::load() }
-            .map_err(|e| format!("ash Entry::load: {e}"))?;
+            .map_err(|e| format!("Entry::load: {e}"))?;
+        info!("Vulkan entry loaded");
 
-        let app_name = CString::new("wl-android-blit").unwrap();
+        let app_name = CString::new("wl-android").unwrap();
         let app_info = vk::ApplicationInfo::default()
             .application_name(&app_name)
-            .application_version(0)
-            .engine_name(&app_name)
-            .engine_version(0)
             .api_version(vk::API_VERSION_1_3);
 
-        let instance_extensions: [&CStr; 0] = [];
-        let ext_names: Vec<CString> = Vec::new();
-        let ext_ptrs: Vec<_> = vec![];
-
         let create_info = vk::InstanceCreateInfo::default()
-            .application_info(&app_info)
-            .enabled_extension_names(&ext_ptrs);
+            .application_info(&app_info);
 
         let instance = unsafe {
             entry.create_instance(&create_info, None)
                 .map_err(|e| format!("create_instance: {e}"))?
         };
+        info!("Vulkan instance created");
 
         let pdevices = unsafe { instance.enumerate_physical_devices() }
             .map_err(|e| format!("enumerate devices: {e}"))?;
