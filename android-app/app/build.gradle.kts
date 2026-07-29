@@ -1,7 +1,6 @@
 plugins {
     id("com.android.application")
-    id("org.jetbrains.kotlin.android") version "2.0.21"
-    id("org.mozilla.rust-android-gradle.rust-android")
+    id("org.jetbrains.kotlin.android")
 }
 
 android {
@@ -32,19 +31,6 @@ android {
     }
 }
 
-cargo {
-    module = "../native"
-    libname = "land_native"
-    targets = listOf("arm64-v8a")
-    profile = "release"
-}
-
 dependencies {
     implementation("androidx.core:core-ktx:1.15.0")
-}
-
-tasks.whenTaskAdded {
-    if (name.startsWith("merge") && name.endsWith("JniLibFolders")) {
-        dependsOn("cargoBuild")
-    }
 }
