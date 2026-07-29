@@ -137,7 +137,6 @@ impl WlState {
         }
 
         Ok(state)
-        })
     }
 
     /// Dispatch pending Wayland client messages. Uses unsafe pointer split
