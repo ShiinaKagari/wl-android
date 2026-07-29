@@ -4,7 +4,7 @@ members = [
     "crates/wl-android-common",
     "crates/wl-android",
 ]
-exclude = ["m0/"]
+exclude = ["m0/", "android-app/native"]
 
 [workspace.package]
 version = "0.1.0"

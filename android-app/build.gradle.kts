@@ -1,0 +1,4 @@
+plugins {
+    id("com.android.application") version "8.7.0" apply false
+    id("org.mozilla.rust-android-gradle.rust-android") version "0.9.4" apply false
+}

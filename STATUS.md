@@ -17,7 +17,10 @@
 | M7 | 性能收口 + Magisk 模块 | ✅ |
 | — | 审计修复 (C1-C4, H1-H4) | ✅ |
 | — | KWin 嵌套协议补齐 + dispatch 修复 | ✅ |
-| **App** | Android 客户端 (Kotlin + Rust JNI) | ❌ 未开始 |
+| **App** | Android 客户端 (Kotlin + Rust JNI) | 🚧 骨架完成（lib.rs / session / render / ahb / Kotlin UI / Gradle） |
+|---|---|
+| **App M6b** | Vulkan blit 管线 + AHB 分配 | ❌ 待容器 turnip 环境就绪 |
+| **App 构建** | cargo-ndk + Gradle 集成 | 🚧 Gradle 配置完成，待验证交叉编译 |
 
 ## 关键里程碑：KWin 端到端帧到达 ✅ (2026-07-29)
 
@@ -100,6 +103,27 @@ wl-android/
 │           ├── ahb_handle.rs           # native_handle_t 解析 (GZ-001)
 │           ├── doctor.rs               # 诊断工具
 │           └── bin/mock-client.rs      # 容器内测试二进制
+├── android-app/
+│   ├── native/                         # Rust JNI cdylib (land_native.so)
+│   │   ├── Cargo.toml
+│   │   └── src/
+│   │       ├── lib.rs                  # JNI 入口 + 全局状态
+│   │       ├── session.rs              # land.sock 协议循环
+│   │       ├── render.rs               # ash Vulkan + ANativeWindow
+│   │       ├── ahb.rs                  # AHardwareBuffer slot 管理
+│   │       └── jni_bridge.rs           # JNI 类型转换
+│   ├── app/
+│   │   ├── build.gradle.kts            # rust-android-gradle 集成
+│   │   └── src/main/
+│   │       ├── java/com/wl/android/
+│   │       │   ├── MainActivity.kt     # SurfaceView + 生命周期
+│   │       │   ├── NativeBridge.kt     # JNI external fun 声明
+│   │       │   ├── ScreenInfoCollector.kt  # DisplayListener
+│   │       │   └── TouchForwarder.kt   # MotionEvent → TouchMessage
+│   │       └── AndroidManifest.xml
+│   ├── build.gradle.kts
+│   ├── settings.gradle.kts
+│   └── gradle.properties
 ├── m0/                                 # 探测件
 ├── magisk-module/                      # module.prop + service.sh + sepolicy.rule
 ├── milestones/                         # M2-M7 验证脚本 + 真机测试计划
