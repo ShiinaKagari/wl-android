@@ -75,7 +75,6 @@ pub unsafe extern "system" fn JNI_OnLoad(_vm: jni::JavaVM, _: *mut std::ffi::c_v
 }
 
 #[unsafe(no_mangle)]
-#[unsafe(no_mangle)]
 extern "system" fn Java_com_wl_android_NativeBridge_nativeInit(
     mut env: JNIEnv,
     _class: JClass,

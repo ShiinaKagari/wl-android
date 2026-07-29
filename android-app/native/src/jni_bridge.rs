@@ -1,40 +1,42 @@
-// Surface rendering helpers using raw ANativeWindow.
-// These functions are called from the session thread after nativeSetSurface
-// has stored the env + surface in static variables.
+// Surface rendering helpers.
+// nativeSetSurface (JNI thread) calls ANativeWindow_fromSurface and stores the pointer.
+// render_frame (session thread) uses the stored ANativeWindow* directly — no JNI needed.
 
 use std::sync::Mutex;
 use std::ptr::null_mut;
 
-static SURFACE: Mutex<Option<usize>> = Mutex::new(None);
-static JNI_ENV: Mutex<Option<usize>> = Mutex::new(None);
+type ANativeWindowPtr = *mut std::ffi::c_void;
+static WINDOW: Mutex<Option<ANativeWindowPtr>> = Mutex::new(None);
 
+/// Called from JNI thread when surface is created/destroyed.
 pub fn set_surface(env: *mut std::ffi::c_void, surface: jni::sys::jobject) {
-    *SURFACE.lock().unwrap() = if surface.is_null() { None } else { Some(surface as usize) };
-    *JNI_ENV.lock().unwrap() = Some(env as usize);
+    let mut w = WINDOW.lock().unwrap();
+    // Release old window
+    if let Some(old) = w.take() {
+        unsafe { ndk_sys::ANativeWindow_release(old as _); }
+    }
+    if !surface.is_null() {
+        let env_ptr: *mut std::ffi::c_void = env;
+        let window = unsafe {
+            ndk_sys::ANativeWindow_fromSurface(&env_ptr as *const _ as *mut _, surface)
+        };
+        if !window.is_null() {
+            *w = Some(window as _);
+        }
+    }
 }
 
+/// Called from session thread on frame arrival. Uses stored ANativeWindow* directly.
 #[cfg(target_os = "android")]
 pub fn render_frame(serial: u64) -> Result<(), String> {
-    let surface = SURFACE.lock().unwrap().map(|s| s as jni::sys::jobject);
-    let env = JNI_ENV.lock().unwrap().map(|e| e as *mut std::ffi::c_void);
-    let (surface, env) = match (surface, env) {
-        (Some(s), Some(e)) => (s, e),
-        _ => return Err("no surface".into()),
-    };
-
-    let env_ptr: *mut std::ffi::c_void = env;
-    let window = unsafe {
-        ndk_sys::ANativeWindow_fromSurface(&env_ptr as *const _ as *mut _, surface)
-    };
-    if window.is_null() { return Err("no window".into()); }
+    let guard = WINDOW.lock().unwrap();
+    let window = guard.ok_or("no window")?;
 
     let mut buf: ndk_sys::ANativeWindow_Buffer = unsafe { std::mem::zeroed() };
-    if unsafe { ndk_sys::ANativeWindow_lock(window, &mut buf, null_mut()) } != 0 {
-        unsafe { ndk_sys::ANativeWindow_release(window); }
+    if unsafe { ndk_sys::ANativeWindow_lock(window as _, &mut buf, null_mut()) } != 0 {
         return Err("lock failed".into());
     }
 
-    // Alternating color per serial
     let c = match serial % 4 {
         0 => 0xFF_0000FF, // blue
         1 => 0xFF_00FF00, // green
@@ -47,8 +49,7 @@ pub fn render_frame(serial: u64) -> Result<(), String> {
         unsafe { *bits.add(i) = c; }
     }
 
-    unsafe { ndk_sys::ANativeWindow_unlockAndPost(window); }
-    unsafe { ndk_sys::ANativeWindow_release(window); }
+    unsafe { ndk_sys::ANativeWindow_unlockAndPost(window as _); }
     Ok(())
 }
 
