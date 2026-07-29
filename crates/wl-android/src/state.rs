@@ -99,6 +99,18 @@ impl WlState {
         })
     }
 
+    /// Dispatch pending Wayland client messages. Uses unsafe pointer split
+    /// to work around Rust's borrow checker — safe in calloop's single-threaded context.
+    pub fn dispatch_wayland(&mut self) {
+        let self_ptr: *mut Self = self;
+        unsafe {
+            let display: &mut Display<Self> = &mut (*self_ptr).display;
+            if let Err(e) = display.dispatch_clients(&mut *self_ptr) {
+                tracing::error!(err = %e, "wayland dispatch error");
+            }
+        }
+    }
+
     pub fn handle_touch(&mut self, msg: &TouchMessage) {
         let touch_opt = self.seat.get_touch();
         if let Some(touch) = touch_opt {
