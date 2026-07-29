@@ -1,23 +1,28 @@
 // Surface rendering helpers.
-// nativeSetSurface (JNI thread) calls ANativeWindow_fromSurface and stores the pointer.
-// render_frame (session thread) uses the stored ANativeWindow* directly — no JNI needed.
+// Stores the ANativeWindow pointer from nativeSetSurface (JNI thread).
+// render_frame uses the stored pointer directly from the session thread.
+//
+// For the JNI env: we take &env (the JNI env pointer on the stack)
+// and cast to *mut JNIEnv which is what ANativeWindow_fromSurface expects.
 
 use std::sync::Mutex;
 use std::ptr::null_mut;
 
-type ANativeWindowPtr = usize;
-static WINDOW: Mutex<Option<ANativeWindowPtr>> = Mutex::new(None);
+static WINDOW: Mutex<Option<usize>> = Mutex::new(None);
 
-/// Called from JNI thread when surface is created/destroyed.
-pub fn set_surface(env: *mut std::ffi::c_void, surface: jni::sys::jobject) {
+pub fn set_surface(env: jni::sys::JNIEnv, surface: jni::sys::jobject) {
     let mut w = WINDOW.lock().unwrap();
     if let Some(old) = w.take() {
-        if old != 0 { unsafe { ndk_sys::ANativeWindow_release(old as _); } }
+        if old != 0 {
+            unsafe { ndk_sys::ANativeWindow_release(old as *mut ndk_sys::ANativeWindow); }
+        }
     }
     if !surface.is_null() {
-        let env_ptr: *mut std::ffi::c_void = env;
+        // ANativeWindow_fromSurface(env: *mut JNIEnv, surface: jobject)
+        // env on our stack → take its address → cast to *mut JNIEnv
+        let env_addr: *mut jni::sys::JNIEnv = &env as *const _ as *mut _;
         let window = unsafe {
-            ndk_sys::ANativeWindow_fromSurface(&env_ptr as *const _ as *mut _, surface)
+            ndk_sys::ANativeWindow_fromSurface(env_addr, surface)
         };
         if !window.is_null() {
             *w = Some(window as usize);
@@ -44,6 +49,7 @@ pub fn render_frame(serial: u64) -> Result<(), String> {
     for i in 0..pixels {
         unsafe { *bits.add(i) = c; }
     }
+
     unsafe { ndk_sys::ANativeWindow_unlockAndPost(window as _); }
     Ok(())
 }

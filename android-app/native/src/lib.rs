@@ -141,7 +141,7 @@ extern "system" fn Java_com_wl_android_NativeBridge_nativeSetSurface(
     surface: jni::sys::jobject,
 ) {
     log::info!("nativeSetSurface handle={handle} surface={}", !surface.is_null());
-    crate::jni_bridge::set_surface(env as *mut std::ffi::c_void, surface);
+    crate::jni_bridge::set_surface(env, surface);
 }
 
 #[unsafe(no_mangle)]
