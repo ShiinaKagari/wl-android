@@ -1,35 +1,59 @@
-use jni::sys::jobject;
+// Surface rendering helpers using raw ANativeWindow.
+// These functions are called from the session thread after nativeSetSurface
+// has stored the env + surface in static variables.
 
-/// Fill ANativeWindow from raw JNI pointers.
-/// `env` is the JNIEnv* (as passed by the JNI calling convention).
+use std::sync::Mutex;
+use std::ptr::null_mut;
+
+static SURFACE: Mutex<Option<jni::sys::jobject>> = Mutex::new(None);
+static JNI_ENV: Mutex<Option<*mut std::ffi::c_void>> = Mutex::new(None);
+
+/// Store surface + env for later rendering from session thread.
+pub fn set_surface(env: *mut std::ffi::c_void, surface: jni::sys::jobject) {
+    *SURFACE.lock().unwrap() = if surface.is_null() { None } else { Some(surface) };
+    *JNI_ENV.lock().unwrap() = Some(env);
+}
+
+/// Render a test pattern via ANativeWindow. Called from session thread on frame arrival.
+/// Returns Err if no surface available or lock fails.
 #[cfg(target_os = "android")]
-pub fn fill_surface_blue(env: *mut std::ffi::c_void, surface: jobject) -> Result<(), String> {
-    // ANativeWindow_fromSurface expects JNIEnv* (pointer to JNIEnv).
-    // Our JNI binding receives env as the JNIEnv pointer value.
-    // Pass a pointer to this pointer.
+pub fn render_frame(serial: u64) -> Result<(), String> {
+    let surface = *SURFACE.lock().unwrap();
+    let env = *JNI_ENV.lock().unwrap();
+    let (surface, env) = match (surface, env) {
+        (Some(s), Some(e)) => (s, e),
+        _ => return Err("no surface".into()),
+    };
+
     let env_ptr: *mut std::ffi::c_void = env;
     let window = unsafe {
         ndk_sys::ANativeWindow_fromSurface(&env_ptr as *const _ as *mut _, surface)
     };
-    if window.is_null() {
-        return Err("ANativeWindow_fromSurface returned null".into());
-    }
+    if window.is_null() { return Err("no window".into()); }
 
     let mut buf: ndk_sys::ANativeWindow_Buffer = unsafe { std::mem::zeroed() };
-    let rc = unsafe { ndk_sys::ANativeWindow_lock(window, &mut buf, std::ptr::null_mut()) };
-    if rc != 0 {
+    if unsafe { ndk_sys::ANativeWindow_lock(window, &mut buf, null_mut()) } != 0 {
         unsafe { ndk_sys::ANativeWindow_release(window); }
-        return Err(format!("ANativeWindow_lock failed: {rc}"));
+        return Err("lock failed".into());
     }
 
-    let color: u32 = 0xFF_0000FF; // B8G8R8A8 opaque blue
-    let pixel_count = buf.width as usize * buf.height as usize;
+    // Alternating color per serial
+    let c = match serial % 4 {
+        0 => 0xFF_0000FF, // blue
+        1 => 0xFF_00FF00, // green
+        2 => 0xFF_FF0000, // red
+        _ => 0xFF_00FFFF, // cyan
+    };
+    let pixels = buf.width as usize * buf.height as usize;
     let bits = buf.bits as *mut u32;
-    for i in 0..pixel_count {
-        unsafe { *bits.add(i) = color; }
+    for i in 0..pixels {
+        unsafe { *bits.add(i) = c; }
     }
 
     unsafe { ndk_sys::ANativeWindow_unlockAndPost(window); }
     unsafe { ndk_sys::ANativeWindow_release(window); }
     Ok(())
 }
+
+#[cfg(not(target_os = "android"))]
+pub fn render_frame(_serial: u64) -> Result<(), String> { Ok(()) }
