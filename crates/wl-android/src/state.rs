@@ -109,6 +109,9 @@ impl WlState {
                 Ok(n) => tracing::debug!(n, "wayland dispatch done"),
                 Err(e) => tracing::error!(err = %e, "dispatch error"),
             }
+            if let Err(e) = display.flush_clients() {
+                tracing::error!(err = %e, "flush error");
+            }
         }
     }
 
