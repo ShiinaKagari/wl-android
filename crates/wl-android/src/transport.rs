@@ -49,40 +49,12 @@ impl Transport {
     }
 
     pub fn recv(&mut self) -> io::Result<Option<Message>> {
-        use std::io::IoSliceMut;
-
-        let mut cmsg_space = nix::cmsg_space!([RawFd; 4]);
-
-        let (n_bytes, fds) = {
-            let mut iov = [IoSliceMut::new(&mut self.recv_buf)];
-            let recv_msg = match socket::recvmsg::<()>(
-                self.stream.as_raw_fd(),
-                &mut iov,
-                Some(&mut cmsg_space),
-                MsgFlags::MSG_DONTWAIT,
-            ) {
-                Ok(msg) => msg,
-                Err(nix::errno::Errno::EAGAIN) => return Ok(None),
-                Err(e) => return Err(e.into()),
-            };
-
-            let n = recv_msg.bytes;
-
-            let fds: Vec<OwnedFd> = match recv_msg.cmsgs() {
-                Ok(cmsgs) => cmsgs
-                    .flat_map(|cmsg| match cmsg {
-                        ControlMessageOwned::ScmRights(fds) => fds,
-                        _ => vec![],
-                    })
-                    .map(|fd| unsafe { OwnedFd::from_raw_fd(fd) })
-                    .collect(),
-                Err(_) => vec![],
-            };
-
-            (n, fds)
+        let (data, fds) = match self.recv_raw_inner(MsgFlags::MSG_DONTWAIT) {
+            Ok((d, f)) => (d, f),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(None),
+            Err(e) => return Err(e),
         };
 
-        let data = &self.recv_buf[..n_bytes];
         if data.is_empty() {
             return Ok(None);
         }
@@ -96,11 +68,72 @@ impl Transport {
         }
 
         let msg_body = &data[4..4 + msg_len];
-
         let msg = proto::decode(msg_body, fds)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
 
         Ok(Some(msg))
+    }
+
+    /// Receive raw bytes + fds without length prefix (for native_handle, P-13).
+    /// Returns None on EAGAIN.
+    pub fn recv_raw(&mut self) -> io::Result<Option<(Vec<u8>, Vec<OwnedFd>)>> {
+        match self.recv_raw_inner(MsgFlags::MSG_DONTWAIT) {
+            Ok((d, f)) => {
+                if d.is_empty() { Ok(None) } else { Ok(Some((d, f))) }
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Send raw bytes + fds (no length prefix). Used for native_handle forwarding.
+    #[allow(dead_code)]
+    pub fn send_raw(&mut self, data: &[u8], fds: &[RawFd]) -> io::Result<()> {
+        let iov = [std::io::IoSlice::new(data)];
+        let cmsgs = if !fds.is_empty() {
+            vec![ControlMessage::ScmRights(fds)]
+        } else {
+            vec![]
+        };
+        socket::sendmsg::<()>(
+            self.stream.as_raw_fd(),
+            &iov,
+            &cmsgs,
+            MsgFlags::empty(),
+            None,
+        )?;
+        Ok(())
+    }
+
+    fn recv_raw_inner(&mut self, flags: MsgFlags) -> io::Result<(Vec<u8>, Vec<OwnedFd>)> {
+        use std::io::IoSliceMut;
+        let mut cmsg_space = nix::cmsg_space!([RawFd; 4]);
+
+        let (n_bytes, fds) = {
+            let mut iov = [IoSliceMut::new(&mut self.recv_buf)];
+            let recv_msg = socket::recvmsg::<()>(
+                self.stream.as_raw_fd(),
+                &mut iov,
+                Some(&mut cmsg_space),
+                flags,
+            )?;
+
+            let n = recv_msg.bytes;
+            let fds: Vec<OwnedFd> = match recv_msg.cmsgs() {
+                Ok(cmsgs) => cmsgs
+                    .flat_map(|cmsg| match cmsg {
+                        ControlMessageOwned::ScmRights(fds) => fds,
+                        _ => vec![],
+                    })
+                    .map(|fd| unsafe { OwnedFd::from_raw_fd(fd) })
+                    .collect(),
+                Err(_) => vec![],
+            };
+            (n, fds)
+        };
+
+        let data = self.recv_buf[..n_bytes].to_vec();
+        Ok((data, fds))
     }
 }
 

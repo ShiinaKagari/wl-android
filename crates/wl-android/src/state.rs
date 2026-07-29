@@ -145,29 +145,50 @@ impl CompositorHandler for WlState {
         &self,
         _client: &'a smithay::reexports::wayland_server::Client,
     ) -> &'a CompositorClientState {
-        Box::leak(Box::new(CompositorClientState::default()))
+        // C3: Use thread-local static to avoid Box::leak — one per process is fine
+        // since we only have one client (KWin nested) in our use case.
+        use std::cell::RefCell;
+        thread_local! {
+            static STATE: RefCell<CompositorClientState> = RefCell::new(CompositorClientState::default());
+        }
+        // SAFETY: The returned reference must live as long as 'a.
+        // The thread_local lives for the process lifetime, satisfying 'a.
+        STATE.with(|s| {
+            let ptr = s.as_ptr() as *const CompositorClientState;
+            unsafe { &*ptr }
+        })
     }
 
-    fn commit(&mut self, _surface: &WlSurface) {
-        // Frame callback: dispatched via CompositorState post-commit hooks.
-        // Smithay handles wl_callback.done internally through the commit machinery.
+    fn commit(&mut self, surface: &WlSurface) {
+        tracing::info!("surface commit");
+
+        let buffer_id = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            surface.hash(&mut h);
+            h.finish() as u32
+        };
+        let has_fds = false;
 
         let actions = self.frame_router.handle(
             crate::frame_router::RouterEvent::Commit {
-                buffer_id: 0, has_fds: false, serial: 0,
+                buffer_id,
+                has_fds,
+                serial: 0,
             },
         );
         for action in actions {
             match action {
-                crate::frame_router::RouterAction::EnqueueFrame { buffer_id: _, serial } => {
+                crate::frame_router::RouterAction::EnqueueFrame { buffer_id: bid, serial, .. } => {
+                    tracing::info!(serial, bid, "sending frame to App");
                     if let Some(session) = &mut self.app_session {
                         let _ = session.send_frame(
-                            serial, 1, self.screen_width, self.screen_height,
+                            serial, bid, self.screen_width, self.screen_height,
                         );
                     }
                 }
                 crate::frame_router::RouterAction::FireCallback => {
-                    // Real frame callback dispatched, no need to duplicate
+                    tracing::trace!("fire callback");
                 }
                 _ => {}
             }
@@ -188,6 +209,7 @@ impl XdgShellHandler for WlState {
     fn xdg_shell_state(&mut self) -> &mut XdgShellState { &mut self.xdg_shell_state }
 
     fn new_toplevel(&mut self, surface: ToplevelSurface) {
+        tracing::info!("new toplevel created");
         surface.with_pending_state(|state| {
             state.size = Some((self.screen_width as i32, self.screen_height as i32).into());
             state.states.set(xdg_toplevel::State::Fullscreen);

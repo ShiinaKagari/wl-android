@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use tracing::debug;
 
 #[allow(dead_code)]
@@ -20,8 +22,9 @@ pub enum RouterEvent {
 #[allow(dead_code)]
 #[derive(Debug, PartialEq, Eq)]
 pub enum RouterAction {
-    /// Enqueue a frame for sending to App.
-    EnqueueFrame { buffer_id: u32, serial: u64 },
+    /// Enqueue a frame for sending to App. `has_fds` indicates whether this
+    /// is the first appearance of this buffer_id in the session (P-10).
+    EnqueueFrame { buffer_id: u32, serial: u64, has_fds: bool },
     /// Release a wl_buffer.
     ReleaseBuffer { buffer_id: u32 },
     /// Fire a frame callback.
@@ -34,11 +37,14 @@ pub enum RouterAction {
 
 pub struct FrameRouter {
     serial: u64,
-    pending_frame: Option<u64>,  // serial of frame waiting to be sent (latest-wins, F-05)
+    pending_frame: Option<(u64, u32)>,  // (serial, buffer_id)
     in_flight: Vec<u64>,         // serials of unacked frames (F-04)
     app_connected: bool,
     compositor_connected: bool,
     max_in_flight: usize,
+    /// Registered buffer_ids in current session (P-10).
+    /// Contains buffer_ids that have already been sent with fds.
+    registered: HashMap<u32, ()>,
 }
 
 impl FrameRouter {
@@ -50,20 +56,22 @@ impl FrameRouter {
             app_connected: false,
             compositor_connected: false,
             max_in_flight: 2, // F-04
+            registered: HashMap::new(),
         }
     }
 
-    pub fn handle(&mut self, event: RouterEvent) -> Vec<RouterAction> {
+pub fn handle(&mut self, event: RouterEvent) -> Vec<RouterAction> {
         let mut actions = Vec::new();
 
         match event {
             RouterEvent::AppConnected => {
                 self.app_connected = true;
-                debug!("app connected");
+                self.registered.clear();  // P-10: new session, clear buffer_id registry
+                debug!("app connected, registry cleared");
             }
             RouterEvent::AppLost => {
                 self.app_connected = false;
-                // F-06: headless drain — auto-ack all outstanding frames
+                self.registered.clear();
                 let serials: Vec<_> = self.in_flight.drain(..).collect();
                 for _ in &serials {
                     actions.push(RouterAction::ReleaseBuffer { buffer_id: 0 });
@@ -71,7 +79,6 @@ impl FrameRouter {
                 if self.pending_frame.take().is_some() {
                     actions.push(RouterAction::FireCallback);
                 }
-                // Fire callbacks for each released frame to unblock compositor
                 for _ in 0..serials.len() {
                     actions.push(RouterAction::FireCallback);
                 }
@@ -87,31 +94,35 @@ impl FrameRouter {
                 self.compositor_connected = true;
 
                 // F-05: latest-wins — replace pending frame
-                if let Some(old_serial) = self.pending_frame.take() {
-                    debug!(old_serial, "latest-wins: replacing pending frame");
-                    // Old pending buffer is released immediately (never sent)
+                if let Some((_old_serial, _)) = self.pending_frame.take() {
+                    debug!("latest-wins: replacing pending frame");
                     actions.push(RouterAction::FireCallback);
                 }
 
                 if self.app_connected {
+                    let is_first = !self.registered.contains_key(&buffer_id);
+                    if is_first {
+                        self.registered.insert(buffer_id, ());
+                    }
+
                     // Check in-flight window
                     if self.in_flight.len() < self.max_in_flight {
-                        // Send immediately
                         self.in_flight.push(serial);
-                        actions.push(RouterAction::EnqueueFrame { buffer_id, serial });
+                        actions.push(RouterAction::EnqueueFrame {
+                            buffer_id,
+                            serial,
+                            has_fds: is_first,  // P-10: carry fds on first appearance
+                        });
+                    } else {
+                        debug!(serial, "backpressure: holding frame (in_flight={})", self.in_flight.len());
+                        self.pending_frame = Some((serial, buffer_id));
+                    }
                 } else {
-                    // F-04: backpressure — hold as pending, fire callback to not stall
-                    debug!(serial, "backpressure: holding frame (in_flight={})", self.in_flight.len());
-                    self.pending_frame = Some(serial);
-                }
-                } else {
-                    // F-06: headless drain — discard, fire callback to unblock compositor
                     debug!(serial, "headless drain: discarding frame");
                     actions.push(RouterAction::FireCallback);
                 }
             }
             RouterEvent::AppAck { serial: ack_serial } => {
-                // F-11: cumulative ack
                 let old_len = self.in_flight.len();
                 self.in_flight.retain(|s| *s > ack_serial);
                 let released = old_len - self.in_flight.len();
@@ -119,30 +130,35 @@ impl FrameRouter {
                     actions.push(RouterAction::ReleaseBuffer { buffer_id: 0 });
                 }
 
-                // After ack, check if we can send pending
+                // After ack, flush pending if room
                 if self.in_flight.len() < self.max_in_flight
-                    && let Some(_serial) = self.pending_frame.take()
+                    && let Some((_serial, buffer_id)) = self.pending_frame.take()
                 {
                     self.serial += 1;
                     let new_serial = self.serial;
+                    let is_first = !self.registered.contains_key(&buffer_id);
+                    if is_first {
+                        self.registered.insert(buffer_id, ());
+                    }
                     self.in_flight.push(new_serial);
-                    actions.push(RouterAction::EnqueueFrame { buffer_id: 0, serial: new_serial });
+                    actions.push(RouterAction::EnqueueFrame {
+                        buffer_id,
+                        serial: new_serial,
+                        has_fds: is_first,
+                    });
                     debug!(new_serial, "unblocking pending frame after ack");
                 }
 
-                // Fire callback if a slot freed up
                 if released > 0 {
                     actions.push(RouterAction::FireCallback);
                 }
             }
             RouterEvent::Tick => {
-                // Tick triggers frame callback if we have room
                 if self.app_connected && self.in_flight.len() < self.max_in_flight {
                     if self.pending_frame.is_none() {
                         actions.push(RouterAction::FireCallback);
                     }
                 } else if !self.app_connected {
-                    // Headless drain: always fire callback
                     actions.push(RouterAction::FireCallback);
                 }
             }

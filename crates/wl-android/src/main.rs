@@ -8,6 +8,8 @@ use tracing::{error, info, warn};
 use crate::app_link::{AppSession, SessionMode};
 use crate::state::WlState;
 use crate::transport::Transport;
+use wl_android_common::proto;
+use wl_android_common::proto::Message;
 
 mod ahb_handle;
 mod app_link;
@@ -78,6 +80,7 @@ fn run_server() -> Result<(), Box<dyn std::error::Error>> {
 
     event_loop.run(Some(Duration::from_millis(16)), &mut state, |state| {
         // ── Accept new App connections ──
+        let mut connect_actions = Vec::new();
         if let Some(ref listener) = state.land_listener {
             loop {
                 match listener.accept() {
@@ -85,7 +88,7 @@ fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                         info!("App connected");
                         if let Ok(transport) = Transport::new(stream) {
                             state.app_session = Some(AppSession::new(transport));
-                            state.frame_router.handle(
+                            connect_actions = state.frame_router.handle(
                                 crate::frame_router::RouterEvent::AppConnected,
                             );
                         }
@@ -98,27 +101,54 @@ fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
+        dispatch_router_actions(state, &connect_actions);
 
         // ── Poll app session ──
         let lost = if let Some(session) = &mut state.app_session {
             match session.mode() {
                 SessionMode::Handshake => match session.do_handshake() {
-                    Ok(true) => { info!("handshake complete"); false }
+                    Ok(true) => {
+                        info!("handshake complete, mode={:?}", session.mode());
+                        false
+                    }
                     Ok(false) => false,
                     Err(e) => {
                         warn!(err = %e, "handshake failed");
                         true
                     }
                 },
+                SessionMode::SlotRegistration => {
+                    // Wait for TBUF slot messages
+                    match session.recv_message() {
+                        Ok(Some(Message::Slot(_))) => {
+                            // Already counted in recv_message
+                            info!(count = session.slot_count(), "slot registered");
+                            // Check if all slots are registered
+                            if session.slot_count() >= proto::SLOT_COUNT as u32 {
+                                info!("all slots registered, activating");
+                                session.activate();
+                            }
+                            false
+                        }
+                        Ok(None) => false,
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => false,
+                        Err(e) => {
+                            warn!(err = %e, "slot registration read error");
+                            true
+                        }
+                        _ => false,
+                    }
+                }
                 SessionMode::Active => {
                     match session.recv_message() {
                         Ok(Some(msg)) => match msg {
                             wl_android_common::proto::Message::Ack(ack) => {
-                                state.frame_router.handle(
+                                let actions = state.frame_router.handle(
                                     crate::frame_router::RouterEvent::AppAck {
                                         serial: ack.serial,
                                     },
                                 );
+                                dispatch_router_actions(state, &actions);
                                 false
                             }
                             wl_android_common::proto::Message::Touch(tm) => {
@@ -127,10 +157,8 @@ fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                             }
                             wl_android_common::proto::Message::Config(conf) => {
                                 state.apply_config(
-                                    conf.width,
-                                    conf.height,
-                                    conf.refresh_millihz,
-                                    conf.dpi,
+                                    conf.width, conf.height,
+                                    conf.refresh_millihz, conf.dpi,
                                 );
                                 false
                             }
@@ -148,10 +176,43 @@ fn run_server() -> Result<(), Box<dyn std::error::Error>> {
             false
         };
         if lost {
-            state.frame_router.handle(crate::frame_router::RouterEvent::AppLost);
+            let actions = state.frame_router.handle(
+                crate::frame_router::RouterEvent::AppLost,
+            );
+            dispatch_router_actions(state, &actions);
             state.app_session = None;
         }
     })?;
 
     Ok(())
+}
+
+fn dispatch_router_actions(
+    state: &mut WlState,
+    actions: &[crate::frame_router::RouterAction],
+) {
+    use crate::frame_router::RouterAction;
+    for action in actions {
+        match action {
+            RouterAction::EnqueueFrame { buffer_id: bid, serial, .. } => {
+                if let Some(session) = &mut state.app_session {
+                    let _ = session.send_frame(*serial, *bid, state.screen_width, state.screen_height);
+                }
+            }
+            RouterAction::ReleaseBuffer { .. } => {
+                // wl_buffer.release handled by CompositorState
+                tracing::trace!("release buffer");
+            }
+            RouterAction::FireCallback => {
+                // Frame callback dispatched via CompositorState
+                tracing::trace!("frame callback");
+            }
+            RouterAction::Gone { buffer_id } => {
+                if let Some(session) = &mut state.app_session {
+                    let _ = session.send_gone(*buffer_id);
+                }
+            }
+            _ => {}
+        }
+    }
 }

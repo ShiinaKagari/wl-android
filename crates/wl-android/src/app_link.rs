@@ -1,10 +1,10 @@
 use std::io;
 use std::os::unix::net::UnixListener;
 
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::transport::Transport;
-use wl_android_common::proto::{self, HelloMessage, Message};
+use wl_android_common::proto::{self, HelloMessage, Message, PROTOCOL_VERSION};
 
 // ── Listener ──
 
@@ -30,17 +30,21 @@ pub struct AppSession {
     transport: Transport,
     mode: SessionMode,
     sent_helo: bool,
+    slot_count: u32,
+    server_caps: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SessionMode {
     Handshake,
+    /// Waiting for TBUF slot registrations (blit mode only, H-04)
+    SlotRegistration,
     Active,
 }
 
 impl AppSession {
     pub fn new(transport: Transport) -> Self {
-        Self { transport, mode: SessionMode::Handshake, sent_helo: false }
+        Self { transport, mode: SessionMode::Handshake, sent_helo: false, slot_count: 0, server_caps: 0 }
     }
 
     pub fn mode(&self) -> SessionMode {
@@ -50,18 +54,35 @@ impl AppSession {
     pub fn do_handshake(&mut self) -> io::Result<bool> {
         if !self.sent_helo {
             let helo = HelloMessage::default();
+            self.server_caps = helo.server_caps;
             self.transport.send(&Message::Hello(helo))?;
-            info!("sent HELO");
+            info!("sent HELO (v{} caps={:#x})", PROTOCOL_VERSION, self.server_caps);
             self.sent_helo = true;
         }
 
         match self.transport.recv() {
             Ok(Some(Message::Config(conf))) => {
+                // H-03: version check
+                if conf.protocol_version != PROTOCOL_VERSION {
+                    warn!(got = conf.protocol_version, expected = PROTOCOL_VERSION, "protocol version mismatch");
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "protocol version mismatch"));
+                }
                 info!(w = conf.width, h = conf.height, "received CONF");
-                self.mode = SessionMode::Active;
+
+                // H-04: mode selection
+                if conf.app_caps & proto::APP_CAP_DIRECT_IMPORT != 0 {
+                    info!("mode: direct (App supports dma_buf import)");
+                    self.mode = SessionMode::Active;
+                } else if self.server_caps & proto::SERVER_CAP_BLIT != 0 {
+                    info!("mode: blit (waiting for slot registration)");
+                    self.mode = SessionMode::SlotRegistration;
+                } else {
+                    warn!("no available frame path");
+                    return Err(io::Error::other("no available frame path"));
+                }
                 Ok(true)
             }
-            Ok(None) => Ok(false), // EAGAIN, try again later
+            Ok(None) => Ok(false),
             Ok(Some(other)) => {
                 warn!(?other, "unexpected during handshake");
                 Err(io::Error::new(io::ErrorKind::InvalidData, "expected CONF"))
@@ -112,13 +133,42 @@ impl AppSession {
     }
 
     /// Receive any message from the App (non-blocking).
+    /// For SlotBuffer messages, also receives the following native_handle (P-13).
     pub fn recv_message(&mut self) -> io::Result<Option<Message>> {
         match self.transport.recv() {
+            Ok(Some(Message::Slot(slot))) => {
+                self.slot_count += 1;
+                info!(slot = slot.slot, count = self.slot_count, "slot registered");
+                // Recv the native_handle that follows (P-13)
+                if let Ok(Some((_data, fds))) = self.transport.recv_raw() {
+                    if let Some(handle) = crate::ahb_handle::parse_native_handle(&_data, fds) {
+                        debug!(slot = slot.slot, num_fds = handle.num_fds, "native_handle parsed");
+                        // TODO M6b: import fds into Vulkan for blit
+                        let _ = handle.fds;
+                    } else {
+                        warn!(slot = slot.slot, "failed to parse native_handle");
+                    }
+                }
+                Ok(Some(Message::Slot(slot)))
+            }
             Ok(Some(msg)) => Ok(Some(msg)),
             Ok(None) => Ok(None),
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(None),
             Err(e) => Err(e),
         }
+    }
+
+    pub fn slot_count(&self) -> u32 {
+        self.slot_count
+    }
+
+    pub fn activate(&mut self) {
+        self.mode = SessionMode::Active;
+    }
+
+    pub fn send_gone(&mut self, buffer_id: u32) -> io::Result<()> {
+        let gone = proto::BufferGone::new(buffer_id);
+        self.transport.send(&Message::Gone(gone))
     }
 }
 

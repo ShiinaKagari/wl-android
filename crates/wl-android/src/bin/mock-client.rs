@@ -5,7 +5,7 @@
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use wl_android_common::proto;
-use wl_android_common::proto::{HelloMessage, ConfigMessage, FrameAck, Message};
+use wl_android_common::proto::{ConfigMessage, FrameAck, Message};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let socket_path = std::env::args()
