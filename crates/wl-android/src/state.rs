@@ -4,6 +4,7 @@ use smithay::delegate_compositor;
 use smithay::delegate_output;
 use smithay::delegate_seat;
 use smithay::delegate_shm;
+use smithay::delegate_single_pixel_buffer;
 use smithay::delegate_xdg_shell;
 use smithay::input::{Seat, SeatHandler, SeatState};
 use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
@@ -263,3 +264,5 @@ delegate_seat!(WlState);
 
 impl smithay::wayland::output::OutputHandler for WlState {}
 delegate_output!(WlState);
+
+delegate_single_pixel_buffer!(WlState);
