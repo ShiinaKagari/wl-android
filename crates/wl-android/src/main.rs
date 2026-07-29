@@ -102,6 +102,14 @@ fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     event_loop.run(Some(Duration::from_millis(16)), &mut state, |state| {
+        // Dispatch pending Wayland client messages
+        // SAFETY: caller is single-threaded calloop event loop
+        let display_ptr = &mut state.display as *mut smithay::reexports::wayland_server::Display<WlState>;
+        let state_ptr = state as *mut WlState;
+        if let Err(e) = unsafe { &mut *display_ptr }.dispatch_clients(unsafe { &mut *state_ptr }) {
+            error!(err = %e, "wayland dispatch error");
+        }
+
         // ── Accept new App connections ──
         let mut connect_actions = Vec::new();
         if let Some(ref listener) = state.land_listener {
