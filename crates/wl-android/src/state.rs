@@ -53,6 +53,7 @@ pub struct WlState {
     #[allow(dead_code)]
     pub output_state: OutputManagerState,
     pub frame_router: FrameRouter,
+    pub blit_image_handles: Vec<u64>,
     #[allow(dead_code)]
     pub blit_engine: BlitEngine,
     pub app_session: Option<AppSession>,
@@ -124,6 +125,7 @@ impl WlState {
             viewporter_state, content_type_state, alpha_modifier_state, pointer_constraints_state,
             fractional_scale_state, presentation_state,
             xdg_shell_state, output_state, frame_router, blit_engine,
+            blit_image_handles: Vec::new(),
             app_session: None, land_listener: None,
             screen_width: w, screen_height: h, refresh_millihz: refresh, dpi,
             output, toplevel: None, seat_state, seat, touch_injector,
