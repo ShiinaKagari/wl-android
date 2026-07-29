@@ -130,7 +130,6 @@ extern "system" fn Java_com_wl_android_NativeBridge_nativeInit(
 }
 
 #[unsafe(no_mangle)]
-#[unsafe(no_mangle)]
 extern "system" fn Java_com_wl_android_NativeBridge_nativeSetSurface(
     _env: jni::sys::JNIEnv,
     _class: jni::sys::jclass,
@@ -138,12 +137,8 @@ extern "system" fn Java_com_wl_android_NativeBridge_nativeSetSurface(
     surface: jni::sys::jobject,
 ) {
     log::info!("nativeSetSurface handle={handle} surface={}", !surface.is_null());
-    // ANativeWindow rendering deferred to M6b (Vulkan swapchain)
-}
-    }
 }
 
-#[unsafe(no_mangle)]
 #[unsafe(no_mangle)]
 extern "system" fn Java_com_wl_android_NativeBridge_nativeOnConfig(
     _env: JNIEnv, _class: JClass, handle: jlong,
