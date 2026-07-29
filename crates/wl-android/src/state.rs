@@ -14,6 +14,7 @@ use smithay::wayland::dmabuf::DmabufState;
 use smithay::wayland::output::OutputManagerState;
 use smithay::wayland::shell::xdg::{ToplevelSurface, XdgShellHandler, XdgShellState};
 use smithay::wayland::shm::{ShmHandler, ShmState};
+use smithay::wayland::single_pixel_buffer::SinglePixelBufferState;
 use tracing::info;
 use wayland_protocols::xdg::shell::server::xdg_toplevel;
 
@@ -28,6 +29,7 @@ pub struct WlState {
     pub compositor_state: CompositorState,
     pub shm_state: ShmState,
     pub dmabuf_state: DmabufState,
+    pub single_pixel_buffer_state: SinglePixelBufferState,
     pub xdg_shell_state: XdgShellState,
     #[allow(dead_code)]
     pub output_state: OutputManagerState,
@@ -64,6 +66,8 @@ impl WlState {
         let _dmabuf_global =
             dmabuf_state.create_global_with_default_feedback::<Self>(&dh, &dmabuf_feedback);
 
+        let single_pixel_buffer_state = SinglePixelBufferState::new::<Self>(&dh);
+
         let mut seat_state = SeatState::new();
         let mut seat = seat_state.new_seat("seat-0");
         let _touch = seat.add_touch();
@@ -91,7 +95,7 @@ impl WlState {
         let _global = output.create_global::<Self>(&dh);
 
         Ok(Self {
-            display, compositor_state, shm_state, dmabuf_state,
+            display, compositor_state, shm_state, dmabuf_state, single_pixel_buffer_state,
             xdg_shell_state, output_state, frame_router, blit_engine,
             app_session: None, land_listener: None,
             screen_width: w, screen_height: h, refresh_millihz: refresh, dpi,
