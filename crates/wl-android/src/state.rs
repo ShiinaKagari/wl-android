@@ -120,7 +120,7 @@ impl WlState {
         output.change_current_state(Some(mode), None, None, None);
         let _global = output.create_global::<Self>(&dh);
 
-        Ok(Self {
+        let mut state = Self {
             display, compositor_state, shm_state, dmabuf_state, single_pixel_buffer_state,
             viewporter_state, content_type_state, alpha_modifier_state, pointer_constraints_state,
             fractional_scale_state, presentation_state,
@@ -129,6 +129,14 @@ impl WlState {
             app_session: None, land_listener: None,
             screen_width: w, screen_height: h, refresh_millihz: refresh, dpi,
             output, toplevel: None, seat_state, seat, touch_injector,
+        };
+
+        // Initialize Vulkan blit engine (turnip) for dmabuf import
+        if let Err(e) = state.blit_engine.init() {
+            tracing::warn!(err = %e, "blit engine init failed — dmabuf blit not available");
+        }
+
+        Ok(state)
         })
     }
 
