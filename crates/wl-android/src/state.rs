@@ -29,7 +29,8 @@ use smithay::wayland::alpha_modifier::AlphaModifierState;
 use smithay::wayland::pointer_constraints::{PointerConstraintsHandler, PointerConstraintsState};
 use smithay::wayland::fractional_scale::FractionalScaleManagerState;
 use smithay::wayland::fractional_scale::FractionalScaleHandler;
-use smithay::wayland::presentation::PresentationState;
+use smithay::wayland::presentation::{PresentationState, PresentationFeedbackCachedState};
+use smithay::wayland::presentation::Refresh;
 use tracing::info;
 use wayland_protocols::xdg::shell::server::xdg_toplevel;
 
@@ -344,6 +345,9 @@ impl CompositorHandler for WlState {
         let now_ms = std::time::Instant::now()
             .duration_since(self.clock_epoch)
             .as_millis() as u32;
+        let period_ns = 1_000_000_000_000u64 / self.refresh_millihz as u64;
+        let refresh = Refresh::Fixed(std::time::Duration::from_nanos(period_ns));
+        let seq = self.frame_router.current_serial();
         compositor::with_states(surface, |states| {
             let mut guard = states.cached_state.get::<SurfaceAttributes>();
             let count = guard.current().frame_callbacks.len();
@@ -352,6 +356,22 @@ impl CompositorHandler for WlState {
             }
             if count > 0 {
                 tracing::info!(count, "dispatched frame callbacks");
+            }
+        });
+        compositor::with_states(surface, |states| {
+            let mut guard = states.cached_state.get::<PresentationFeedbackCachedState>();
+            let count = guard.current().callbacks.len();
+            for fb in guard.current().callbacks.drain(..) {
+                fb.presented(
+                    &self.output,
+                    std::time::Instant::now().duration_since(self.clock_epoch),
+                    refresh,
+                    seq,
+                    wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::Kind::Vsync,
+                );
+            }
+            if count > 0 {
+                tracing::info!(count, "dispatched presentation feedbacks");
             }
         });
     }

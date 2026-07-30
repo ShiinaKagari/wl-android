@@ -60,7 +60,11 @@ impl FrameRouter {
         }
     }
 
-pub fn handle(&mut self, event: RouterEvent) -> Vec<RouterAction> {
+    pub fn current_serial(&self) -> u64 {
+        self.serial
+    }
+
+    pub fn handle(&mut self, event: RouterEvent) -> Vec<RouterAction> {
         let mut actions = Vec::new();
 
         match event {
