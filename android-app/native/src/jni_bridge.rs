@@ -31,7 +31,7 @@ pub fn set_surface(env: *mut std::ffi::c_void, surface: jni::sys::jobject) {
     *w = Some(window as usize);
 }
 
-pub fn render_frame(serial: u64) -> Result<(), String> {
+pub fn render_frame(serial: u64, width: u32, height: u32, pixel_data: &[u8]) -> Result<(), String> {
     let guard = WINDOW.lock().unwrap();
     let window = match *guard {
         Some(w) if w != 0 => w,
@@ -46,21 +46,37 @@ pub fn render_frame(serial: u64) -> Result<(), String> {
         return Err("zero dimensions".into());
     }
 
-    let c = match serial % 4 {
-        0 => 0xFF_0000FF, 1 => 0xFF_00FF00, 2 => 0xFF_FF0000, _ => 0xFF_00FFFF,
-    };
-    // Only fill a 200x200 rect to keep render fast (<1ms)
-    let stride = buf.stride as usize;
-    let bits = buf.bits as *mut u32;
-    let max_h = buf.height.min(200) as usize;
-    let max_w = buf.width.min(200) as usize;
-    for y in 0..max_h {
-        for x in 0..max_w {
-            unsafe { *bits.add(y * stride + x) = c; }
+    if pixel_data.is_empty() {
+        let c = 0xFF_000000;
+        let stride = buf.stride as usize;
+        let bits = buf.bits as *mut u32;
+        let max_h = buf.height.min(50) as usize;
+        let max_w = buf.width.min(50) as usize;
+        for y in 0..max_h { for x in 0..max_w { unsafe { *bits.add(y*stride+x) = c; } } }
+    } else {
+        let dst_stride = buf.stride as usize;
+        let src_stride = (width as usize) * 4;
+        let dst_bits = buf.bits as *mut u8;
+        let copy_w = (buf.width as usize).min(width as usize);
+        let copy_h = (buf.height as usize).min(height as usize);
+        for y in 0..copy_h {
+            for x in 0..copy_w {
+                let src_off = y * src_stride + x * 4;
+                let dst_off = y * dst_stride * 4 + x * 4;
+                let b = pixel_data[src_off];     // BGRX: byte0=B
+                let g = pixel_data[src_off + 1]; // byte1=G
+                let r = pixel_data[src_off + 2]; // byte2=R
+                unsafe {
+                    *dst_bits.add(dst_off) = r;       // RGBA: byte0=R
+                    *dst_bits.add(dst_off + 1) = g;   // byte1=G
+                    *dst_bits.add(dst_off + 2) = b;   // byte2=B
+                    *dst_bits.add(dst_off + 3) = 0xFF; // byte3=A
+                }
+            }
         }
     }
 
     unsafe { wl_unlock_and_post(window as _); }
-    log::debug!("render_frame: serial={serial} {}x{}", buf.width, buf.height);
+    log::debug!("render_frame: serial={serial} {}x{}", width, height);
     Ok(())
 }

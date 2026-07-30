@@ -1,4 +1,5 @@
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
+use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 
@@ -55,14 +56,14 @@ impl AppSession {
     pub fn run_loop(
         read_stream: UnixStream,
         write_stream: UnixStream,
-        on_frame: impl Fn(u64, u32, u32, u32),
+        on_frame: impl Fn(u64, u32, u32, u32, &[u8]),
     ) -> io::Result<()> {
         let mut buf = vec![0u8; 65536];
         let mut rd = read_stream;
         let mut wr = write_stream;
 
         // 1. Receive HELO
-        let data = Self::recv_raw(&mut rd, &mut buf)?;
+        let (data, _fds) = Self::recv_raw_with_fds(&mut rd, &mut buf)?;
         let msg = proto::decode(&data, vec![])
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
         if !matches!(msg, Message::Hello(_)) {
@@ -78,12 +79,37 @@ impl AppSession {
 
         // 3. Frame ← Ack loop
         loop {
-            let data = Self::recv_raw(&mut rd, &mut buf)?;
-            let msg = proto::decode(&data, vec![])
+            let (data, fds) = Self::recv_raw_with_fds(&mut rd, &mut buf)?;
+            let msg = proto::decode(&data, fds)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
             match msg {
-                Message::Frame(fm, _) => {
-                    on_frame(fm.serial, fm.buffer_id, fm.width, fm.height);
+                Message::Frame(fm, fds) => {
+                    let size = fm.width as usize * fm.height as usize * 4;
+                    let pixel_data = if !fds.is_empty() {
+                        use std::os::fd::AsRawFd;
+                        let fd = &fds[0];
+                        let ptr = unsafe {
+                            libc::mmap(
+                                std::ptr::null_mut(),
+                                size,
+                                libc::PROT_READ,
+                                libc::MAP_SHARED,
+                                fd.as_raw_fd(),
+                                0,
+                            )
+                        };
+                        if ptr == libc::MAP_FAILED {
+                            Vec::new()
+                        } else {
+                            let slice = unsafe { std::slice::from_raw_parts(ptr as *const u8, size) };
+                            let v = slice.to_vec();
+                            unsafe { libc::munmap(ptr, size); }
+                            v
+                        }
+                    } else {
+                        Vec::new()
+                    };
+                    on_frame(fm.serial, fm.buffer_id, fm.width, fm.height, &pixel_data);
                     let ack = proto::FrameAck::new(fm.serial);
                     let ack_data = proto::encode(&Message::Ack(ack));
                     let alen = (ack_data.len() as u32).to_le_bytes();
@@ -97,14 +123,39 @@ impl AppSession {
         }
     }
 
-    fn recv_raw(stream: &mut UnixStream, buf: &mut Vec<u8>) -> io::Result<Vec<u8>> {
-        let mut len_buf = [0u8; 4];
-        stream.read_exact(&mut len_buf)?;
-        let msg_len = u32::from_le_bytes(len_buf) as usize;
-        if msg_len > buf.len() {
-            buf.resize(msg_len, 0);
+    fn recv_raw_with_fds(
+        stream: &mut UnixStream,
+        buf: &mut Vec<u8>,
+    ) -> io::Result<(Vec<u8>, Vec<OwnedFd>)> {
+        use std::os::fd::AsRawFd;
+        use std::io::IoSliceMut;
+
+        let mut cmsg_space = nix::cmsg_space!([std::os::fd::RawFd; 4]);
+        let n_bytes;
+        let fds: Vec<OwnedFd>;
+        {
+            let mut iov = [IoSliceMut::new(buf)];
+            let msg = nix::sys::socket::recvmsg::<()>(
+                stream.as_raw_fd(),
+                &mut iov,
+                Some(&mut cmsg_space),
+                nix::sys::socket::MsgFlags::empty(),
+            )?;
+            n_bytes = msg.bytes;
+            fds = msg
+                .cmsgs()
+                .map(|iter| {
+                    iter.flat_map(|c| match c {
+                        nix::sys::socket::ControlMessageOwned::ScmRights(fds) => fds,
+                        _ => vec![],
+                    })
+                    .map(|fd| unsafe { OwnedFd::from_raw_fd(fd) })
+                    .collect()
+                })
+                .unwrap_or_default();
         }
-        stream.read_exact(&mut buf[..msg_len])?;
-        Ok(buf[..msg_len].to_vec())
+
+        let data = buf[..n_bytes].to_vec();
+        Ok((data, fds))
     }
 }

@@ -94,28 +94,30 @@ impl AppSession {
     }
 
     pub fn send_frame(
-        &mut self, frame_serial: u64, buffer_id: u32, width: u32, height: u32,
+        &mut self, frame_serial: u64, buffer_id: u32, _screen_w: u32, _screen_h: u32,
+        buf_w: u32, buf_h: u32, pixel_fd: Option<std::os::fd::OwnedFd>,
     ) -> io::Result<()> {
         let mut fm = proto::FrameMessage {
             magic: proto::MAGIC_LAND,
             num_planes: 1,
             serial: frame_serial,
             modifier: 0,
-            width,
-            height,
+            width: buf_w,
+            height: buf_h,
             drm_format: proto::DRM_FORMAT_ABGR8888,
             flags: 0,
             buffer_id,
             _reserved: 0,
             planes: [
-                proto::PlaneDesc { offset: 0, stride: width * 4 },
+                proto::PlaneDesc { offset: 0, stride: buf_w * 4 },
                 proto::PlaneDesc { offset: 0, stride: 0 },
                 proto::PlaneDesc { offset: 0, stride: 0 },
                 proto::PlaneDesc { offset: 0, stride: 0 },
             ],
         };
-        fm.set_carries_fds(false);
-        self.transport.send(&Message::Frame(fm, vec![]))
+        let fds: Vec<std::os::fd::OwnedFd> = pixel_fd.into_iter().collect();
+        fm.set_carries_fds(!fds.is_empty());
+        self.transport.send(&Message::Frame(fm, fds))
     }
 
     #[allow(dead_code)]
@@ -279,7 +281,7 @@ mod tests {
         }
 
         // Send frame
-        session.send_frame(7, 1, 100, 100).unwrap();
+        session.send_frame(7, 1, 100, 100, 100, 100, None).unwrap();
 
         // Receive ack
         let ack = loop {

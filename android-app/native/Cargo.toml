@@ -12,6 +12,7 @@ wl-android-common = { path = "../../crates/wl-android-common" }
 jni = "0.21"
 libc = "0.2"
 log = "0.4"
+nix = { version = "0.31", features = ["socket", "uio"] }
 
 [target.'cfg(target_os = "android")'.dependencies]
 ash = "0.38"

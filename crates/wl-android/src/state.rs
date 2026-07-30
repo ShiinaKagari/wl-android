@@ -1,3 +1,5 @@
+use std::num::NonZeroUsize;
+use std::os::fd::FromRawFd;
 use std::os::unix::net::UnixListener;
 
 use smithay::delegate_compositor;
@@ -15,11 +17,11 @@ use smithay::input::{Seat, SeatHandler, SeatState};
 use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::Display;
-use smithay::wayland::compositor::{CompositorClientState, CompositorHandler, CompositorState};
+use smithay::wayland::compositor::{self, BufferAssignment, CompositorClientState, CompositorHandler, CompositorState, SurfaceAttributes};
 use smithay::wayland::dmabuf::DmabufState;
 use smithay::wayland::output::OutputManagerState;
 use smithay::wayland::shell::xdg::{ToplevelSurface, XdgShellHandler, XdgShellState};
-use smithay::wayland::shm::{ShmHandler, ShmState};
+use smithay::wayland::shm::{self, ShmHandler, ShmState};
 use smithay::wayland::single_pixel_buffer::SinglePixelBufferState;
 use smithay::wayland::viewporter::ViewporterState;
 use smithay::wayland::content_type::ContentTypeState;
@@ -58,6 +60,7 @@ pub struct WlState {
     pub blit_engine: BlitEngine,
     pub app_session: Option<AppSession>,
     pub land_listener: Option<UnixListener>,
+    pub clock_epoch: std::time::Instant,
     pub screen_width: u32,
     pub screen_height: u32,
     pub refresh_millihz: u32,
@@ -127,6 +130,7 @@ impl WlState {
             xdg_shell_state, output_state, frame_router, blit_engine,
             blit_image_handles: Vec::new(),
             app_session: None, land_listener: None,
+            clock_epoch: std::time::Instant::now(),
             screen_width: w, screen_height: h, refresh_millihz: refresh, dpi,
             output, toplevel: None, seat_state, seat, touch_injector,
         };
@@ -226,6 +230,93 @@ impl CompositorHandler for WlState {
         };
         let has_fds = false;
 
+        let mut pixel_fd: Option<std::os::fd::OwnedFd> = None;
+        {
+            let extracted: Option<(u32, u32, Vec<u8>)> = 'extract: {
+                let parent_data = compositor::with_states(surface, |states| {
+                    let mut guard = states.cached_state.get::<SurfaceAttributes>();
+                    match &guard.current().buffer {
+                        Some(BufferAssignment::NewBuffer(wl_buffer)) => {
+                            shm::with_buffer_contents(wl_buffer, |ptr, _pool_len, data| {
+                                let stride = data.stride as usize;
+                                let height = data.height as usize;
+                                if height == 0 || stride == 0 { return None; }
+                                let offset = data.offset as usize;
+                                let mut vec = vec![0u8; height * stride];
+                                for y in 0..height {
+                                    let src = unsafe { ptr.add(offset + y * stride) };
+                                    let dst = unsafe { vec.as_mut_ptr().add(y * stride) };
+                                    unsafe { std::ptr::copy_nonoverlapping(src, dst, stride); }
+                                }
+                                Some((stride as u32 / 4, height as u32, vec))
+                            }).unwrap_or(None)
+                        }
+                        _ => None,
+                    }
+                });
+                if parent_data.is_some() { break 'extract parent_data; }
+                let children = compositor::get_children(surface);
+                for child in &children {
+                    let child_data = compositor::with_states(child, |states| {
+                        let mut guard = states.cached_state.get::<SurfaceAttributes>();
+                        match &guard.current().buffer {
+                            Some(BufferAssignment::NewBuffer(wl_buffer)) => {
+                                shm::with_buffer_contents(wl_buffer, |ptr, _pool_len, data| {
+                                    let stride = data.stride as usize;
+                                    let height = data.height as usize;
+                                    if height == 0 || stride == 0 { return None; }
+                                    let offset = data.offset as usize;
+                                    let mut vec = vec![0u8; height * stride];
+                                    for y in 0..height {
+                                        let src = unsafe { ptr.add(offset + y * stride) };
+                                        let dst = unsafe { vec.as_mut_ptr().add(y * stride) };
+                                        unsafe { std::ptr::copy_nonoverlapping(src, dst, stride); }
+                                    }
+                                    Some((stride as u32 / 4, height as u32, vec))
+                                }).unwrap_or(None)
+                            }
+                            _ => None,
+                        }
+                    });
+                    if child_data.is_some() { break 'extract child_data; }
+                }
+                None
+            };
+
+            if let Some((_bw, _bh, data)) = extracted {
+                let size = data.len();
+                match nix::sys::memfd::memfd_create(
+                    "wl-frame",
+                    nix::sys::memfd::MFdFlags::MFD_CLOEXEC | nix::sys::memfd::MFdFlags::MFD_ALLOW_SEALING,
+                ) {
+                    Ok(memfd) => {
+                        use std::os::fd::AsRawFd;
+                        if nix::unistd::ftruncate(&memfd, size as _).is_ok() {
+                            let ptr = unsafe {
+                                nix::sys::mman::mmap(
+                                    None,
+                                    NonZeroUsize::new(size).unwrap(),
+                                    nix::sys::mman::ProtFlags::PROT_READ | nix::sys::mman::ProtFlags::PROT_WRITE,
+                                    nix::sys::mman::MapFlags::MAP_SHARED,
+                                    &memfd,
+                                    0,
+                                )
+                            };
+                            if let Ok(ptr) = ptr {
+                                unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), ptr.as_ptr() as *mut u8, size); }
+                                unsafe { nix::sys::mman::munmap(ptr, size).ok(); }
+                                let raw = unsafe { libc::dup(memfd.as_raw_fd()) };
+                                if raw >= 0 {
+                                    pixel_fd = Some(unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) });
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => tracing::warn!(err = %e, "memfd_create failed"),
+                }
+            }
+        }
+
         let actions = self.frame_router.handle(
             crate::frame_router::RouterEvent::Commit {
                 buffer_id,
@@ -238,17 +329,31 @@ impl CompositorHandler for WlState {
                 crate::frame_router::RouterAction::EnqueueFrame { buffer_id: bid, serial, .. } => {
                     tracing::info!(serial, bid, "sending frame to App");
                     if let Some(session) = &mut self.app_session {
+                        let fd = pixel_fd.take();
                         let _ = session.send_frame(
                             serial, bid, self.screen_width, self.screen_height,
+                            self.screen_width, self.screen_height, fd,
                         );
                     }
                 }
-                crate::frame_router::RouterAction::FireCallback => {
-                    // Frame callbacks dispatched automatically by Smithay CompositorState
-                }
+                crate::frame_router::RouterAction::FireCallback => {}
                 _ => {}
             }
         }
+
+        let now_ms = std::time::Instant::now()
+            .duration_since(self.clock_epoch)
+            .as_millis() as u32;
+        compositor::with_states(surface, |states| {
+            let mut guard = states.cached_state.get::<SurfaceAttributes>();
+            let count = guard.current().frame_callbacks.len();
+            for cb in guard.current().frame_callbacks.drain(..) {
+                cb.done(now_ms);
+            }
+            if count > 0 {
+                tracing::info!(count, "dispatched frame callbacks");
+            }
+        });
     }
 }
 

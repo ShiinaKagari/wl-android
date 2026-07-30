@@ -231,7 +231,10 @@ fn dispatch_router_actions(
         match action {
             RouterAction::EnqueueFrame { buffer_id: bid, serial, .. } => {
                 if let Some(session) = &mut state.app_session {
-                    let _ = session.send_frame(*serial, *bid, state.screen_width, state.screen_height);
+                    let _ = session.send_frame(
+                        *serial, *bid, state.screen_width, state.screen_height,
+                        state.screen_width, state.screen_height, None,
+                    );
                 }
             }
             RouterAction::ReleaseBuffer { .. } => {
@@ -239,8 +242,18 @@ fn dispatch_router_actions(
                 tracing::trace!("release buffer");
             }
             RouterAction::FireCallback => {
-                // Frame callback dispatched via CompositorState
-                tracing::trace!("frame callback");
+                if let Some(ref tl) = state.toplevel {
+                    let surface = tl.wl_surface();
+                    let now_ms = std::time::Instant::now()
+                        .duration_since(state.clock_epoch)
+                        .as_millis() as u32;
+                    smithay::wayland::compositor::with_states(surface, |states| {
+                        let mut guard = states.cached_state.get::<smithay::wayland::compositor::SurfaceAttributes>();
+                        for cb in guard.current().frame_callbacks.drain(..) {
+                            cb.done(now_ms);
+                        }
+                    });
+                }
             }
             RouterAction::Gone { buffer_id } => {
                 if let Some(session) = &mut state.app_session {
