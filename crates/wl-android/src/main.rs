@@ -94,6 +94,10 @@ fn run_server() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("listening on wayland socket {wayland_display}");
 
+    // Ensure non-root clients (kagari) can connect
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&wayland_socket_path, std::fs::Permissions::from_mode(0o666)).ok();
+
     // Land socket — store listener in state for idle polling
     match app_link::create_listener(&land_socket_path) {
         Ok(listener) => {
