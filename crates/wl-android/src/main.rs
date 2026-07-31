@@ -121,6 +121,12 @@ fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                     Ok((stream, _)) => {
                         info!("App connected");
                         if let Ok(transport) = Transport::new(stream) {
+                            if state.app_session.is_some() {
+                                connect_actions = state.frame_router.handle(
+                                    crate::frame_router::RouterEvent::AppLost,
+                                );
+                                dispatch_router_actions(state, &connect_actions);
+                            }
                             state.app_session = Some(AppSession::new(transport));
                             connect_actions = state.frame_router.handle(
                                 crate::frame_router::RouterEvent::AppConnected,

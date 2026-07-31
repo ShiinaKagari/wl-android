@@ -71,7 +71,9 @@ impl FrameRouter {
             RouterEvent::AppConnected => {
                 self.app_connected = true;
                 self.registered.clear();  // P-10: new session, clear buffer_id registry
-                debug!("app connected, registry cleared");
+                self.in_flight.clear();
+                self.pending_frame = None;
+                debug!("app connected, registry and in_flight cleared");
             }
             RouterEvent::AppLost => {
                 self.app_connected = false;
