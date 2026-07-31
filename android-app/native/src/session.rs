@@ -1,4 +1,4 @@
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
@@ -142,31 +142,50 @@ impl AppSession {
         use std::io::IoSliceMut;
 
         let mut cmsg_space = nix::cmsg_space!([std::os::fd::RawFd; 4]);
-        let n_bytes;
-        let fds: Vec<OwnedFd>;
-        {
-            let mut iov = [IoSliceMut::new(buf)];
-            let msg = nix::sys::socket::recvmsg::<()>(
-                stream.as_raw_fd(),
-                &mut iov,
-                Some(&mut cmsg_space),
-                nix::sys::socket::MsgFlags::empty(),
-            )?;
-            n_bytes = msg.bytes;
-            fds = msg
-                .cmsgs()
-                .map(|iter| {
-                    iter.flat_map(|c| match c {
-                        nix::sys::socket::ControlMessageOwned::ScmRights(fds) => fds,
-                        _ => vec![],
-                    })
-                    .map(|fd| unsafe { OwnedFd::from_raw_fd(fd) })
-                    .collect()
+        let mut iov = [IoSliceMut::new(buf)];
+        let msg = nix::sys::socket::recvmsg::<()>(
+            stream.as_raw_fd(),
+            &mut iov,
+            Some(&mut cmsg_space),
+            nix::sys::socket::MsgFlags::empty(),
+        )?;
+
+        let n_bytes = msg.bytes;
+        let fds: Vec<OwnedFd> = msg
+            .cmsgs()
+            .map(|iter| {
+                iter.flat_map(|c| match c {
+                    nix::sys::socket::ControlMessageOwned::ScmRights(fds) => fds,
+                    _ => vec![],
                 })
-                .unwrap_or_default();
+                .map(|fd| unsafe { OwnedFd::from_raw_fd(fd) })
+                .collect()
+            })
+            .unwrap_or_default();
+
+        log::info!("recv_raw: {n_bytes} bytes, {} fds", fds.len());
+
+        if n_bytes < 4 {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "recv too short"));
+        }
+        let msg_len = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+        if msg_len + 4 > n_bytes {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "recv truncated"));
         }
 
-        let data = buf[..n_bytes].to_vec();
+        let data = buf[4..4 + msg_len].to_vec();
+        let fds: Vec<OwnedFd> = msg
+            .cmsgs()
+            .map(|iter| {
+                iter.flat_map(|c| match c {
+                    nix::sys::socket::ControlMessageOwned::ScmRights(fds) => fds,
+                    _ => vec![],
+                })
+                .map(|fd| unsafe { OwnedFd::from_raw_fd(fd) })
+                .collect()
+            })
+            .unwrap_or_default();
+
         Ok((data, fds))
     }
 }
