@@ -79,9 +79,20 @@ impl AppSession {
 
         // 3. Frame ← Ack loop
         loop {
-            let (data, fds) = Self::recv_raw_with_fds(&mut rd, &mut buf)?;
-            let msg = proto::decode(&data, fds)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+            let (data, fds) = match Self::recv_raw_with_fds(&mut rd, &mut buf) {
+                Ok(v) => v,
+                Err(e) => {
+                    log::error!("recv_raw_with_fds failed: {e}");
+                    return Err(e);
+                }
+            };
+            let msg = match proto::decode(&data, fds) {
+                Ok(m) => m,
+                Err(e) => {
+                    log::error!("proto::decode failed: {e}");
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, e.to_string()));
+                }
+            };
             match msg {
                 Message::Frame(fm, fds) => {
                     let size = fm.width as usize * fm.height as usize * 4;
