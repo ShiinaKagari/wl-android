@@ -7,8 +7,8 @@ use log;
 
 unsafe extern "C" {
     fn wl_get_native_window(env: *mut std::ffi::c_void, surface: jni::sys::jobject) -> *mut std::ffi::c_void;
-    fn wl_lock_window(window: *mut std::ffi::c_void, buf: *mut ndk_sys::ANativeWindow_Buffer);
-    fn wl_unlock_and_post(window: *mut std::ffi::c_void);
+    fn wl_lock_window(window: *mut std::ffi::c_void, buf: *mut ndk_sys::ANativeWindow_Buffer) -> std::ffi::c_int;
+    fn wl_unlock_and_post(window: *mut std::ffi::c_void) -> std::ffi::c_int;
 }
 
 static WINDOW: Mutex<Option<usize>> = Mutex::new(None);
@@ -40,8 +40,13 @@ pub fn render_frame(serial: u64, width: u32, height: u32, pixel_data: &[u8]) -> 
     drop(guard);
 
     let mut buf: ndk_sys::ANativeWindow_Buffer = unsafe { std::mem::zeroed() };
-    unsafe { wl_lock_window(window as _, &mut buf); }
+    let lock_result = unsafe { wl_lock_window(window as _, &mut buf) };
+    if lock_result != 0 {
+        log::error!("render_frame: ANativeWindow_lock failed with {}", lock_result);
+        return Err(format!("lock failed: {}", lock_result));
+    }
     if buf.width == 0 || buf.height == 0 {
+        unsafe { wl_unlock_and_post(window as _); }
         log::error!("render_frame: bad dimensions {}x{}", buf.width, buf.height);
         return Err("zero dimensions".into());
     }
