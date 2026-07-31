@@ -142,26 +142,27 @@ impl AppSession {
         use std::io::IoSliceMut;
 
         let mut cmsg_space = nix::cmsg_space!([std::os::fd::RawFd; 4]);
-        let mut iov = [IoSliceMut::new(buf)];
-        let msg = nix::sys::socket::recvmsg::<()>(
-            stream.as_raw_fd(),
-            &mut iov,
-            Some(&mut cmsg_space),
-            nix::sys::socket::MsgFlags::empty(),
-        )?;
-
-        let n_bytes = msg.bytes;
-        let fds: Vec<OwnedFd> = msg
-            .cmsgs()
-            .map(|iter| {
-                iter.flat_map(|c| match c {
-                    nix::sys::socket::ControlMessageOwned::ScmRights(fds) => fds,
-                    _ => vec![],
+        let (n_bytes, fds) = {
+            let mut iov = [IoSliceMut::new(buf)];
+            let msg = nix::sys::socket::recvmsg::<()>(
+                stream.as_raw_fd(),
+                &mut iov,
+                Some(&mut cmsg_space),
+                nix::sys::socket::MsgFlags::empty(),
+            )?;
+            let fds: Vec<OwnedFd> = msg
+                .cmsgs()
+                .map(|iter| {
+                    iter.flat_map(|c| match c {
+                        nix::sys::socket::ControlMessageOwned::ScmRights(fds) => fds,
+                        _ => vec![],
+                    })
+                    .map(|fd| unsafe { OwnedFd::from_raw_fd(fd) })
+                    .collect()
                 })
-                .map(|fd| unsafe { OwnedFd::from_raw_fd(fd) })
-                .collect()
-            })
-            .unwrap_or_default();
+                .unwrap_or_default();
+            (msg.bytes, fds)
+        };
 
         log::info!("recv_raw: {n_bytes} bytes, {} fds", fds.len());
 
@@ -174,18 +175,6 @@ impl AppSession {
         }
 
         let data = buf[4..4 + msg_len].to_vec();
-        let fds: Vec<OwnedFd> = msg
-            .cmsgs()
-            .map(|iter| {
-                iter.flat_map(|c| match c {
-                    nix::sys::socket::ControlMessageOwned::ScmRights(fds) => fds,
-                    _ => vec![],
-                })
-                .map(|fd| unsafe { OwnedFd::from_raw_fd(fd) })
-                .collect()
-            })
-            .unwrap_or_default();
-
         Ok((data, fds))
     }
 }
