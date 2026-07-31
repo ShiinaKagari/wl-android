@@ -7,7 +7,7 @@ import android.view.SurfaceView
 import android.view.MotionEvent
 import android.view.WindowManager
 
-class MainActivity : Activity() {
+class MainActivity : Activity(), SurfaceHolder.Callback {
     private lateinit var surfaceView: SurfaceView
     private lateinit var collector: ScreenInfoCollector
     private lateinit var touchForwarder: TouchForwarder
@@ -19,7 +19,7 @@ class MainActivity : Activity() {
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
         surfaceView = SurfaceView(this).apply {
-            holder.addCallback(surfaceCallback)
+            holder.addCallback(this@MainActivity)
         }
         setContentView(surfaceView)
 
@@ -55,27 +55,25 @@ class MainActivity : Activity() {
         super.onPause()
     }
 
-    override fun onDestroy() {
-        NativeBridge.nativeDestroy(nativeHandle)
-        nativeHandle = 0
-        super.onDestroy()
+    override fun surfaceCreated(holder: SurfaceHolder) {
+        if (nativeHandle != 0L) {
+            NativeBridge.nativeSetSurface(nativeHandle, holder.surface)
+        }
     }
 
-    private val surfaceCallback = object : SurfaceHolder.Callback {
-        override fun surfaceCreated(holder: SurfaceHolder) {
-            if (nativeHandle != 0L) {
-                NativeBridge.nativeSetSurface(nativeHandle, holder.surface)
-            }
-        }
+    override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
+        collector.emit()
+    }
 
-        override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
-            collector.emit()
+    override fun surfaceDestroyed(holder: SurfaceHolder) {
+        if (nativeHandle != 0L) {
+            NativeBridge.nativeSetSurface(nativeHandle, null)
         }
+    }
 
-        override fun surfaceDestroyed(holder: SurfaceHolder) {
-            if (nativeHandle != 0L) {
-                NativeBridge.nativeSetSurface(nativeHandle, null)
-            }
-        }
+    override fun onDestroy() {
+        super.onDestroy()
+        NativeBridge.nativeDestroy(nativeHandle)
+        nativeHandle = 0
     }
 }
