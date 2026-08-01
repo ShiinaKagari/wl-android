@@ -1,5 +1,6 @@
+use std::collections::HashMap;
 use std::num::NonZeroUsize;
-use std::os::fd::FromRawFd;
+use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::net::UnixListener;
 
 use smithay::delegate_compositor;
@@ -71,6 +72,7 @@ pub struct WlState {
     pub seat_state: SeatState<Self>,
     pub seat: Seat<Self>,
     pub touch_injector: TouchInjector,
+    pub pending_pixel_fds: HashMap<u64, OwnedFd>,
 }
 
 impl WlState {
@@ -134,6 +136,7 @@ impl WlState {
             clock_epoch: std::time::Instant::now(),
             screen_width: w, screen_height: h, refresh_millihz: refresh, dpi,
             output, toplevel: None, seat_state, seat, touch_injector,
+            pending_pixel_fds: HashMap::new(),
         };
 
         // Initialize Vulkan blit engine (turnip) for dmabuf import
@@ -325,6 +328,7 @@ impl CompositorHandler for WlState {
                 serial: 0,
             },
         );
+        let has_enqueue = actions.iter().any(|a| matches!(a, crate::frame_router::RouterAction::EnqueueFrame { .. }));
         for action in actions {
             match action {
                 crate::frame_router::RouterAction::EnqueueFrame { buffer_id: bid, serial, .. } => {
@@ -339,6 +343,13 @@ impl CompositorHandler for WlState {
                 }
                 crate::frame_router::RouterAction::FireCallback => {}
                 _ => {}
+            }
+        }
+        if !has_enqueue {
+            if let Some(fd) = pixel_fd.take() {
+                self.pending_pixel_fds.clear();
+                let serial = self.frame_router.current_serial();
+                self.pending_pixel_fds.insert(serial, fd);
             }
         }
 

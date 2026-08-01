@@ -38,7 +38,7 @@ pub enum RouterAction {
 pub struct FrameRouter {
     serial: u64,
     pending_frame: Option<(u64, u32)>,  // (serial, buffer_id)
-    in_flight: Vec<u64>,         // serials of unacked frames (F-04)
+    in_flight: Vec<(u64, u32)>,  // (serial, buffer_id) of unacked frames (F-04)
     app_connected: bool,
     compositor_connected: bool,
     max_in_flight: usize,
@@ -78,17 +78,17 @@ impl FrameRouter {
             RouterEvent::AppLost => {
                 self.app_connected = false;
                 self.registered.clear();
-                let serials: Vec<_> = self.in_flight.drain(..).collect();
-                for _ in &serials {
-                    actions.push(RouterAction::ReleaseBuffer { buffer_id: 0 });
+                let entries: Vec<_> = self.in_flight.drain(..).collect();
+                for &(_, buffer_id) in &entries {
+                    actions.push(RouterAction::ReleaseBuffer { buffer_id });
                 }
                 if self.pending_frame.take().is_some() {
                     actions.push(RouterAction::FireCallback);
                 }
-                for _ in 0..serials.len() {
+                for _ in 0..entries.len() {
                     actions.push(RouterAction::FireCallback);
                 }
-                debug!("app lost, drained {} frames", serials.len());
+                debug!("app lost, drained {} frames", entries.len());
             }
             RouterEvent::CompositorLost => {
                 self.compositor_connected = false;
@@ -113,7 +113,7 @@ impl FrameRouter {
 
                     // Check in-flight window
                     if self.in_flight.len() < self.max_in_flight {
-                        self.in_flight.push(serial);
+                        self.in_flight.push((serial, buffer_id));
                         actions.push(RouterAction::EnqueueFrame {
                             buffer_id,
                             serial,
@@ -130,7 +130,7 @@ impl FrameRouter {
             }
             RouterEvent::AppAck { serial: ack_serial } => {
                 let old_len = self.in_flight.len();
-                self.in_flight.retain(|s| *s > ack_serial);
+                self.in_flight.retain(|(s, _)| *s > ack_serial);
                 let released = old_len - self.in_flight.len();
                 for _ in 0..released {
                     actions.push(RouterAction::ReleaseBuffer { buffer_id: 0 });
@@ -146,7 +146,7 @@ impl FrameRouter {
                     if is_first {
                         self.registered.insert(buffer_id, ());
                     }
-                    self.in_flight.push(new_serial);
+                    self.in_flight.push((new_serial, buffer_id));
                     actions.push(RouterAction::EnqueueFrame {
                         buffer_id,
                         serial: new_serial,

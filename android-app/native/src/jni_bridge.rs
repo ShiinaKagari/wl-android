@@ -37,7 +37,6 @@ pub fn render_frame(serial: u64, width: u32, height: u32, pixel_data: &[u8]) -> 
         Some(w) if w != 0 => w,
         _ => { log::warn!("render_frame: no window"); return Err("no window".into()); }
     };
-    drop(guard);
 
     let mut buf: ndk_sys::ANativeWindow_Buffer = unsafe { std::mem::zeroed() };
     let lock_result = unsafe { wl_lock_window(window as _, &mut buf) };
