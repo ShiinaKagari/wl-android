@@ -241,8 +241,9 @@ fn dispatch_router_actions(
         match action {
             RouterAction::EnqueueFrame { buffer_id: bid, serial, .. } => {
                 if let Some(session) = &mut state.app_session {
-                    let fd = state.pending_pixel_fds.remove(serial)
-                        .or_else(|| state.pending_pixel_fds.drain().next().map(|(_, v)| v));
+                    // Unblocked pending frames have a different serial than when
+                    // the fd was stored, so we can't key-lookup.
+                    let fd = state.pending_pixel_fds.drain().next().map(|(_, v)| v);
                     let _ = session.send_frame(
                         *serial, *bid, state.screen_width, state.screen_height,
                         state.screen_width, state.screen_height, fd,

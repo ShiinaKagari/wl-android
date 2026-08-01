@@ -155,7 +155,6 @@ extern "system" fn Java_com_wl_android_NativeBridge_nativeOnConfig(
 }
 
 #[unsafe(no_mangle)]
-#[unsafe(no_mangle)]
 extern "system" fn Java_com_wl_android_NativeBridge_nativeOnTouch(
     _env: JNIEnv, _class: JClass, handle: jlong,
     touch_id: jint, x: jfloat, y: jfloat, phase: jint, time_ms: jint,
@@ -172,7 +171,6 @@ extern "system" fn Java_com_wl_android_NativeBridge_nativeOnTouch(
 }
 
 #[unsafe(no_mangle)]
-#[unsafe(no_mangle)]
 extern "system" fn Java_com_wl_android_NativeBridge_nativeGetState(
     _env: JNIEnv, _class: JClass, handle: jlong,
 ) -> jint {
@@ -181,7 +179,6 @@ extern "system" fn Java_com_wl_android_NativeBridge_nativeGetState(
         .unwrap_or(AppState::Error as jint)
 }
 
-#[unsafe(no_mangle)]
 #[unsafe(no_mangle)]
 extern "system" fn Java_com_wl_android_NativeBridge_nativeGetSocketFd(
     _env: JNIEnv, _class: JClass, handle: jlong,
@@ -194,7 +191,6 @@ extern "system" fn Java_com_wl_android_NativeBridge_nativeGetSocketFd(
         .unwrap_or(-1)
 }
 
-#[unsafe(no_mangle)]
 #[unsafe(no_mangle)]
 extern "system" fn Java_com_wl_android_NativeBridge_nativeDestroy(
     _env: JNIEnv, _class: JClass, handle: jlong,
