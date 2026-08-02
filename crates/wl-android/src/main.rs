@@ -115,7 +115,8 @@ fn run_server() -> Result<(), Box<dyn std::error::Error>> {
 
         // ── Accept new App connections ──
         let mut connect_actions = Vec::new();
-        if let Some(ref listener) = state.land_listener {
+        let mut listener_opt = state.land_listener.take();
+        if let Some(ref mut listener) = listener_opt {
             loop {
                 match listener.accept() {
                     Ok((stream, _)) => {
@@ -141,6 +142,7 @@ fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
+        state.land_listener = listener_opt;
         dispatch_router_actions(state, &connect_actions);
 
         // ── Poll app session ──
