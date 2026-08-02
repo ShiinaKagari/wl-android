@@ -407,6 +407,7 @@ impl XdgShellHandler for WlState {
             state.states.set(xdg_toplevel::State::Fullscreen);
         });
         surface.send_configure();
+        self.output.enter(surface.wl_surface());
         self.toplevel = Some(surface);
     }
 
