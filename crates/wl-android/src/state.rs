@@ -93,10 +93,9 @@ impl WlState {
         let frame_router = FrameRouter::new();
         let blit_engine = BlitEngine::new();
 
-        let mut dmabuf_state = DmabufState::new();
-        let dmabuf_feedback = crate::comp::dmabuf::build_default_feedback();
-        let _dmabuf_global =
-            dmabuf_state.create_global_with_default_feedback::<Self>(&dh, &dmabuf_feedback);
+        let dmabuf_state = DmabufState::new();
+        // zwp_linux_dmabuf_v1 intentionally disabled: KWin must use SHM
+        // buffers so frame_cache can extract pixels via shm::with_buffer_contents.
 
         let single_pixel_buffer_state = SinglePixelBufferState::new::<Self>(&dh);
         let viewporter_state = ViewporterState::new::<Self>(&dh);
