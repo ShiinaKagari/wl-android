@@ -1,10 +1,28 @@
-use std::io::{self, Read, Write};
+use std::ffi::CString;
+use std::io::{self, Write};
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 
 use wl_android_common::proto;
 use wl_android_common::proto::Message;
+
+#[allow(unused)]
+fn dlog(tag: &str, msg: &str) {
+    #[cfg(target_os = "android")]
+    {
+        let tag_c = CString::new(tag).unwrap_or_default();
+        let msg_c = CString::new(msg).unwrap_or_default();
+        unsafe {
+            ndk_sys::__android_log_write(4, tag_c.as_ptr(), msg_c.as_ptr());
+        }
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = (tag, msg);
+        eprintln!("[{}] {}", tag, msg);
+    }
+}
 
 pub struct AppSession {
     pub write_stream: Arc<UnixStream>,
@@ -58,17 +76,20 @@ impl AppSession {
         write_stream: UnixStream,
         on_frame: impl Fn(u64, u32, u32, u32, &[u8]),
     ) -> io::Result<()> {
+        dlog("land-native", "run_loop: entered");
         let mut buf = vec![0u8; 65536];
         let mut rd = read_stream;
         let mut wr = write_stream;
 
         // 1. Receive HELO
+        dlog("land-native", "recv_thread: waiting for HELO...");
         let (data, _fds) = Self::recv_raw_with_fds(&mut rd, &mut buf)?;
         let msg = proto::decode(&data, vec![])
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
         if !matches!(msg, Message::Hello(_)) {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "expected HELO"));
         }
+        dlog("land-native", "HELO received");
         log::info!("HELO received");
 
         // 2. Send CONF
@@ -78,13 +99,16 @@ impl AppSession {
         wr.write_all(&conf_data)?;
         wr.flush()?;
         log::info!("CONF sent, entering frame loop");
+        dlog("land-native", "CONF sent, entering frame loop");
 
         // 3. Frame ← Ack loop
         loop {
             let (data, fds) = match Self::recv_raw_with_fds(&mut rd, &mut buf) {
                 Ok(v) => v,
                 Err(e) => {
-                    log::error!("recv_raw_with_fds failed: {e}");
+                    let err_msg = format!("recv_raw_with_fds failed: {e}");
+                    dlog("land-native", &err_msg);
+                    log::error!("{err_msg}");
                     return Err(e);
                 }
             };
@@ -92,7 +116,9 @@ impl AppSession {
             let msg = match proto::decode(&data, fds) {
                 Ok(m) => m,
                 Err(e) => {
-                    log::error!("proto::decode failed: {e} data[..min(8)]={:02x?}", &data[..data.len().min(8)]);
+                    let err_msg = format!("proto::decode failed: {e}");
+                    dlog("land-native", &err_msg);
+                    log::error!("{err_msg} data[..min(8)]={:02x?}", &data[..data.len().min(8)]);
                     return Err(io::Error::new(io::ErrorKind::InvalidData, e.to_string()));
                 }
             };
@@ -169,7 +195,9 @@ impl AppSession {
             (msg.bytes, fds)
         };
 
-        log::info!("recv_raw: {n_bytes} bytes, {} fds", fds.len());
+        let info_msg = format!("recv_raw: {n_bytes} bytes, {} fds", fds.len());
+        dlog("land-native", &info_msg);
+        log::info!("{info_msg}");
 
         if n_bytes < 4 {
             return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "recv too short"));

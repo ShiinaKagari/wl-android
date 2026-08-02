@@ -109,6 +109,7 @@ extern "system" fn Java_com_wl_android_NativeBridge_nativeInit(
 
     let state_clone = state.clone();
     thread::spawn(move || {
+        log::info!("recv_thread: started");
         let write_clone = {
             let inner = state_clone.lock().unwrap();
             let ws = inner.session.as_ref().unwrap().write_stream.as_ref();
@@ -116,7 +117,7 @@ extern "system" fn Java_com_wl_android_NativeBridge_nativeInit(
         };
         state_clone.lock().unwrap().state = AppState::Handshake;
 
-        let _ = AppSession::run_loop(read_stream, write_clone, move |serial, buffer_id, width, height, pixel_data: &[u8]| {
+        let result = AppSession::run_loop(read_stream, write_clone, move |serial, buffer_id, width, height, pixel_data: &[u8]| {
             log::info!("FRAME: serial={serial} {width}x{height} buf={buffer_id} data={}B", pixel_data.len());
             let _ = crate::jni_bridge::render_frame(serial, width, height, pixel_data);
             if let Ok(mut inner) = state_clone.lock() {
@@ -124,9 +125,10 @@ extern "system" fn Java_com_wl_android_NativeBridge_nativeInit(
                 inner.frame_queue.push_back(FrameData { serial, buffer_id, width, height });
             }
         });
+        if let Err(ref e) = result {
+            log::error!("recv_thread: run_loop failed: {e}");
+        }
     });
-
-    log::info!("nativeInit: connected, handle={handle}");
     handle
 }
 

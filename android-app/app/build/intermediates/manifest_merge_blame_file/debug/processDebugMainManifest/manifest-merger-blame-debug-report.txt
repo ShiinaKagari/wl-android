@@ -55,84 +55,83 @@
 33-->/home/kagari/Projects/wl-android/android-app/app/src/main/AndroidManifest.xml:12:9-35
 34        android:supportsRtl="true"
 34-->/home/kagari/Projects/wl-android/android-app/app/src/main/AndroidManifest.xml:13:9-35
-35        android:testOnly="true"
-36        android:theme="@android:style/Theme.Material.NoActionBar.Fullscreen" >
-36-->/home/kagari/Projects/wl-android/android-app/app/src/main/AndroidManifest.xml:14:9-77
-37        <activity
-37-->/home/kagari/Projects/wl-android/android-app/app/src/main/AndroidManifest.xml:16:9-25:20
-38            android:name="com.wl.android.MainActivity"
-38-->/home/kagari/Projects/wl-android/android-app/app/src/main/AndroidManifest.xml:17:13-41
-39            android:configChanges="orientation|screenSize|screenLayout|density"
-39-->/home/kagari/Projects/wl-android/android-app/app/src/main/AndroidManifest.xml:18:13-80
-40            android:exported="true"
-40-->/home/kagari/Projects/wl-android/android-app/app/src/main/AndroidManifest.xml:19:13-36
-41            android:resizeableActivity="true" >
-41-->/home/kagari/Projects/wl-android/android-app/app/src/main/AndroidManifest.xml:20:13-46
-42            <intent-filter>
-42-->/home/kagari/Projects/wl-android/android-app/app/src/main/AndroidManifest.xml:21:13-24:29
-43                <action android:name="android.intent.action.MAIN" />
-43-->/home/kagari/Projects/wl-android/android-app/app/src/main/AndroidManifest.xml:22:17-69
-43-->/home/kagari/Projects/wl-android/android-app/app/src/main/AndroidManifest.xml:22:25-66
-44
-45                <category android:name="android.intent.category.LAUNCHER" />
-45-->/home/kagari/Projects/wl-android/android-app/app/src/main/AndroidManifest.xml:23:17-77
-45-->/home/kagari/Projects/wl-android/android-app/app/src/main/AndroidManifest.xml:23:27-74
-46            </intent-filter>
-47        </activity>
-48
-49        <provider
-49-->[androidx.profileinstaller:profileinstaller:1.3.0] /home/kagari/.gradle/caches/8.12/transforms/ea1511b6cc00dbc53a904e72e319e631/transformed/profileinstaller-1.3.0/AndroidManifest.xml:24:9-32:20
-50            android:name="androidx.startup.InitializationProvider"
-50-->[androidx.profileinstaller:profileinstaller:1.3.0] /home/kagari/.gradle/caches/8.12/transforms/ea1511b6cc00dbc53a904e72e319e631/transformed/profileinstaller-1.3.0/AndroidManifest.xml:25:13-67
-51            android:authorities="com.wl.android.androidx-startup"
-51-->[androidx.profileinstaller:profileinstaller:1.3.0] /home/kagari/.gradle/caches/8.12/transforms/ea1511b6cc00dbc53a904e72e319e631/transformed/profileinstaller-1.3.0/AndroidManifest.xml:26:13-68
-52            android:exported="false" >
-52-->[androidx.profileinstaller:profileinstaller:1.3.0] /home/kagari/.gradle/caches/8.12/transforms/ea1511b6cc00dbc53a904e72e319e631/transformed/profileinstaller-1.3.0/AndroidManifest.xml:27:13-37
-53            <meta-data
-53-->[androidx.profileinstaller:profileinstaller:1.3.0] /home/kagari/.gradle/caches/8.12/transforms/ea1511b6cc00dbc53a904e72e319e631/transformed/profileinstaller-1.3.0/AndroidManifest.xml:29:13-31:52
-54                android:name="androidx.profileinstaller.ProfileInstallerInitializer"
-54-->[androidx.profileinstaller:profileinstaller:1.3.0] /home/kagari/.gradle/caches/8.12/transforms/ea1511b6cc00dbc53a904e72e319e631/transformed/profileinstaller-1.3.0/AndroidManifest.xml:30:17-85
-55                android:value="androidx.startup" />
-55-->[androidx.profileinstaller:profileinstaller:1.3.0] /home/kagari/.gradle/caches/8.12/transforms/ea1511b6cc00dbc53a904e72e319e631/transformed/profileinstaller-1.3.0/AndroidManifest.xml:31:17-49
-56        </provider>
-57
-58        <receiver
-58-->[androidx.profileinstaller:profileinstaller:1.3.0] /home/kagari/.gradle/caches/8.12/transforms/ea1511b6cc00dbc53a904e72e319e631/transformed/profileinstaller-1.3.0/AndroidManifest.xml:34:9-52:20
-59            android:name="androidx.profileinstaller.ProfileInstallReceiver"
-59-->[androidx.profileinstaller:profileinstaller:1.3.0] /home/kagari/.gradle/caches/8.12/transforms/ea1511b6cc00dbc53a904e72e319e631/transformed/profileinstaller-1.3.0/AndroidManifest.xml:35:13-76
-60            android:directBootAware="false"
-60-->[androidx.profileinstaller:profileinstaller:1.3.0] /home/kagari/.gradle/caches/8.12/transforms/ea1511b6cc00dbc53a904e72e319e631/transformed/profileinstaller-1.3.0/AndroidManifest.xml:36:13-44
-61            android:enabled="true"
-61-->[androidx.profileinstaller:profileinstaller:1.3.0] /home/kagari/.gradle/caches/8.12/transforms/ea1511b6cc00dbc53a904e72e319e631/transformed/profileinstaller-1.3.0/AndroidManifest.xml:37:13-35
-62            android:exported="true"
-62-->[androidx.profileinstaller:profileinstaller:1.3.0] /home/kagari/.gradle/caches/8.12/transforms/ea1511b6cc00dbc53a904e72e319e631/transformed/profileinstaller-1.3.0/AndroidManifest.xml:38:13-36
-63            android:permission="android.permission.DUMP" >
-63-->[androidx.profileinstaller:profileinstaller:1.3.0] /home/kagari/.gradle/caches/8.12/transforms/ea1511b6cc00dbc53a904e72e319e631/transformed/profileinstaller-1.3.0/AndroidManifest.xml:39:13-57
-64            <intent-filter>
-64-->[androidx.profileinstaller:profileinstaller:1.3.0] /home/kagari/.gradle/caches/8.12/transforms/ea1511b6cc00dbc53a904e72e319e631/transformed/profileinstaller-1.3.0/AndroidManifest.xml:40:13-42:29
-65                <action android:name="androidx.profileinstaller.action.INSTALL_PROFILE" />
-65-->[androidx.profileinstaller:profileinstaller:1.3.0] /home/kagari/.gradle/caches/8.12/transforms/ea1511b6cc00dbc53a904e72e319e631/transformed/profileinstaller-1.3.0/AndroidManifest.xml:41:17-91
-65-->[androidx.profileinstaller:profileinstaller:1.3.0] /home/kagari/.gradle/caches/8.12/transforms/ea1511b6cc00dbc53a904e72e319e631/transformed/profileinstaller-1.3.0/AndroidManifest.xml:41:25-88
-66            </intent-filter>
-67            <intent-filter>
-67-->[androidx.profileinstaller:profileinstaller:1.3.0] /home/kagari/.gradle/caches/8.12/transforms/ea1511b6cc00dbc53a904e72e319e631/transformed/profileinstaller-1.3.0/AndroidManifest.xml:43:13-45:29
-68                <action android:name="androidx.profileinstaller.action.SKIP_FILE" />
-68-->[androidx.profileinstaller:profileinstaller:1.3.0] /home/kagari/.gradle/caches/8.12/transforms/ea1511b6cc00dbc53a904e72e319e631/transformed/profileinstaller-1.3.0/AndroidManifest.xml:44:17-85
-68-->[androidx.profileinstaller:profileinstaller:1.3.0] /home/kagari/.gradle/caches/8.12/transforms/ea1511b6cc00dbc53a904e72e319e631/transformed/profileinstaller-1.3.0/AndroidManifest.xml:44:25-82
-69            </intent-filter>
-70            <intent-filter>
-70-->[androidx.profileinstaller:profileinstaller:1.3.0] /home/kagari/.gradle/caches/8.12/transforms/ea1511b6cc00dbc53a904e72e319e631/transformed/profileinstaller-1.3.0/AndroidManifest.xml:46:13-48:29
-71                <action android:name="androidx.profileinstaller.action.SAVE_PROFILE" />
-71-->[androidx.profileinstaller:profileinstaller:1.3.0] /home/kagari/.gradle/caches/8.12/transforms/ea1511b6cc00dbc53a904e72e319e631/transformed/profileinstaller-1.3.0/AndroidManifest.xml:47:17-88
-71-->[androidx.profileinstaller:profileinstaller:1.3.0] /home/kagari/.gradle/caches/8.12/transforms/ea1511b6cc00dbc53a904e72e319e631/transformed/profileinstaller-1.3.0/AndroidManifest.xml:47:25-85
-72            </intent-filter>
-73            <intent-filter>
-73-->[androidx.profileinstaller:profileinstaller:1.3.0] /home/kagari/.gradle/caches/8.12/transforms/ea1511b6cc00dbc53a904e72e319e631/transformed/profileinstaller-1.3.0/AndroidManifest.xml:49:13-51:29
-74                <action android:name="androidx.profileinstaller.action.BENCHMARK_OPERATION" />
-74-->[androidx.profileinstaller:profileinstaller:1.3.0] /home/kagari/.gradle/caches/8.12/transforms/ea1511b6cc00dbc53a904e72e319e631/transformed/profileinstaller-1.3.0/AndroidManifest.xml:50:17-95
-74-->[androidx.profileinstaller:profileinstaller:1.3.0] /home/kagari/.gradle/caches/8.12/transforms/ea1511b6cc00dbc53a904e72e319e631/transformed/profileinstaller-1.3.0/AndroidManifest.xml:50:25-92
-75            </intent-filter>
-76        </receiver>
-77    </application>
-78
-79</manifest>
+35        android:theme="@android:style/Theme.Material.NoActionBar.Fullscreen" >
+35-->/home/kagari/Projects/wl-android/android-app/app/src/main/AndroidManifest.xml:14:9-77
+36        <activity
+36-->/home/kagari/Projects/wl-android/android-app/app/src/main/AndroidManifest.xml:16:9-25:20
+37            android:name="com.wl.android.MainActivity"
+37-->/home/kagari/Projects/wl-android/android-app/app/src/main/AndroidManifest.xml:17:13-41
+38            android:configChanges="orientation|screenSize|screenLayout|density"
+38-->/home/kagari/Projects/wl-android/android-app/app/src/main/AndroidManifest.xml:18:13-80
+39            android:exported="true"
+39-->/home/kagari/Projects/wl-android/android-app/app/src/main/AndroidManifest.xml:19:13-36
+40            android:resizeableActivity="true" >
+40-->/home/kagari/Projects/wl-android/android-app/app/src/main/AndroidManifest.xml:20:13-46
+41            <intent-filter>
+41-->/home/kagari/Projects/wl-android/android-app/app/src/main/AndroidManifest.xml:21:13-24:29
+42                <action android:name="android.intent.action.MAIN" />
+42-->/home/kagari/Projects/wl-android/android-app/app/src/main/AndroidManifest.xml:22:17-69
+42-->/home/kagari/Projects/wl-android/android-app/app/src/main/AndroidManifest.xml:22:25-66
+43
+44                <category android:name="android.intent.category.LAUNCHER" />
+44-->/home/kagari/Projects/wl-android/android-app/app/src/main/AndroidManifest.xml:23:17-77
+44-->/home/kagari/Projects/wl-android/android-app/app/src/main/AndroidManifest.xml:23:27-74
+45            </intent-filter>
+46        </activity>
+47
+48        <provider
+48-->[androidx.profileinstaller:profileinstaller:1.3.0] /home/kagari/.gradle/caches/8.12/transforms/ea1511b6cc00dbc53a904e72e319e631/transformed/profileinstaller-1.3.0/AndroidManifest.xml:24:9-32:20
+49            android:name="androidx.startup.InitializationProvider"
+49-->[androidx.profileinstaller:profileinstaller:1.3.0] /home/kagari/.gradle/caches/8.12/transforms/ea1511b6cc00dbc53a904e72e319e631/transformed/profileinstaller-1.3.0/AndroidManifest.xml:25:13-67
+50            android:authorities="com.wl.android.androidx-startup"
+50-->[androidx.profileinstaller:profileinstaller:1.3.0] /home/kagari/.gradle/caches/8.12/transforms/ea1511b6cc00dbc53a904e72e319e631/transformed/profileinstaller-1.3.0/AndroidManifest.xml:26:13-68
+51            android:exported="false" >
+51-->[androidx.profileinstaller:profileinstaller:1.3.0] /home/kagari/.gradle/caches/8.12/transforms/ea1511b6cc00dbc53a904e72e319e631/transformed/profileinstaller-1.3.0/AndroidManifest.xml:27:13-37
+52            <meta-data
+52-->[androidx.profileinstaller:profileinstaller:1.3.0] /home/kagari/.gradle/caches/8.12/transforms/ea1511b6cc00dbc53a904e72e319e631/transformed/profileinstaller-1.3.0/AndroidManifest.xml:29:13-31:52
+53                android:name="androidx.profileinstaller.ProfileInstallerInitializer"
+53-->[androidx.profileinstaller:profileinstaller:1.3.0] /home/kagari/.gradle/caches/8.12/transforms/ea1511b6cc00dbc53a904e72e319e631/transformed/profileinstaller-1.3.0/AndroidManifest.xml:30:17-85
+54                android:value="androidx.startup" />
+54-->[androidx.profileinstaller:profileinstaller:1.3.0] /home/kagari/.gradle/caches/8.12/transforms/ea1511b6cc00dbc53a904e72e319e631/transformed/profileinstaller-1.3.0/AndroidManifest.xml:31:17-49
+55        </provider>
+56
+57        <receiver
+57-->[androidx.profileinstaller:profileinstaller:1.3.0] /home/kagari/.gradle/caches/8.12/transforms/ea1511b6cc00dbc53a904e72e319e631/transformed/profileinstaller-1.3.0/AndroidManifest.xml:34:9-52:20
+58            android:name="androidx.profileinstaller.ProfileInstallReceiver"
+58-->[androidx.profileinstaller:profileinstaller:1.3.0] /home/kagari/.gradle/caches/8.12/transforms/ea1511b6cc00dbc53a904e72e319e631/transformed/profileinstaller-1.3.0/AndroidManifest.xml:35:13-76
+59            android:directBootAware="false"
+59-->[androidx.profileinstaller:profileinstaller:1.3.0] /home/kagari/.gradle/caches/8.12/transforms/ea1511b6cc00dbc53a904e72e319e631/transformed/profileinstaller-1.3.0/AndroidManifest.xml:36:13-44
+60            android:enabled="true"
+60-->[androidx.profileinstaller:profileinstaller:1.3.0] /home/kagari/.gradle/caches/8.12/transforms/ea1511b6cc00dbc53a904e72e319e631/transformed/profileinstaller-1.3.0/AndroidManifest.xml:37:13-35
+61            android:exported="true"
+61-->[androidx.profileinstaller:profileinstaller:1.3.0] /home/kagari/.gradle/caches/8.12/transforms/ea1511b6cc00dbc53a904e72e319e631/transformed/profileinstaller-1.3.0/AndroidManifest.xml:38:13-36
+62            android:permission="android.permission.DUMP" >
+62-->[androidx.profileinstaller:profileinstaller:1.3.0] /home/kagari/.gradle/caches/8.12/transforms/ea1511b6cc00dbc53a904e72e319e631/transformed/profileinstaller-1.3.0/AndroidManifest.xml:39:13-57
+63            <intent-filter>
+63-->[androidx.profileinstaller:profileinstaller:1.3.0] /home/kagari/.gradle/caches/8.12/transforms/ea1511b6cc00dbc53a904e72e319e631/transformed/profileinstaller-1.3.0/AndroidManifest.xml:40:13-42:29
+64                <action android:name="androidx.profileinstaller.action.INSTALL_PROFILE" />
+64-->[androidx.profileinstaller:profileinstaller:1.3.0] /home/kagari/.gradle/caches/8.12/transforms/ea1511b6cc00dbc53a904e72e319e631/transformed/profileinstaller-1.3.0/AndroidManifest.xml:41:17-91
+64-->[androidx.profileinstaller:profileinstaller:1.3.0] /home/kagari/.gradle/caches/8.12/transforms/ea1511b6cc00dbc53a904e72e319e631/transformed/profileinstaller-1.3.0/AndroidManifest.xml:41:25-88
+65            </intent-filter>
+66            <intent-filter>
+66-->[androidx.profileinstaller:profileinstaller:1.3.0] /home/kagari/.gradle/caches/8.12/transforms/ea1511b6cc00dbc53a904e72e319e631/transformed/profileinstaller-1.3.0/AndroidManifest.xml:43:13-45:29
+67                <action android:name="androidx.profileinstaller.action.SKIP_FILE" />
+67-->[androidx.profileinstaller:profileinstaller:1.3.0] /home/kagari/.gradle/caches/8.12/transforms/ea1511b6cc00dbc53a904e72e319e631/transformed/profileinstaller-1.3.0/AndroidManifest.xml:44:17-85
+67-->[androidx.profileinstaller:profileinstaller:1.3.0] /home/kagari/.gradle/caches/8.12/transforms/ea1511b6cc00dbc53a904e72e319e631/transformed/profileinstaller-1.3.0/AndroidManifest.xml:44:25-82
+68            </intent-filter>
+69            <intent-filter>
+69-->[androidx.profileinstaller:profileinstaller:1.3.0] /home/kagari/.gradle/caches/8.12/transforms/ea1511b6cc00dbc53a904e72e319e631/transformed/profileinstaller-1.3.0/AndroidManifest.xml:46:13-48:29
+70                <action android:name="androidx.profileinstaller.action.SAVE_PROFILE" />
+70-->[androidx.profileinstaller:profileinstaller:1.3.0] /home/kagari/.gradle/caches/8.12/transforms/ea1511b6cc00dbc53a904e72e319e631/transformed/profileinstaller-1.3.0/AndroidManifest.xml:47:17-88
+70-->[androidx.profileinstaller:profileinstaller:1.3.0] /home/kagari/.gradle/caches/8.12/transforms/ea1511b6cc00dbc53a904e72e319e631/transformed/profileinstaller-1.3.0/AndroidManifest.xml:47:25-85
+71            </intent-filter>
+72            <intent-filter>
+72-->[androidx.profileinstaller:profileinstaller:1.3.0] /home/kagari/.gradle/caches/8.12/transforms/ea1511b6cc00dbc53a904e72e319e631/transformed/profileinstaller-1.3.0/AndroidManifest.xml:49:13-51:29
+73                <action android:name="androidx.profileinstaller.action.BENCHMARK_OPERATION" />
+73-->[androidx.profileinstaller:profileinstaller:1.3.0] /home/kagari/.gradle/caches/8.12/transforms/ea1511b6cc00dbc53a904e72e319e631/transformed/profileinstaller-1.3.0/AndroidManifest.xml:50:17-95
+73-->[androidx.profileinstaller:profileinstaller:1.3.0] /home/kagari/.gradle/caches/8.12/transforms/ea1511b6cc00dbc53a904e72e319e631/transformed/profileinstaller-1.3.0/AndroidManifest.xml:50:25-92
+74            </intent-filter>
+75        </receiver>
+76    </application>
+77
+78</manifest>

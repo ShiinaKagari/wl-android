@@ -11,3 +11,7 @@ int wl_lock_window(ANativeWindow* window, ANativeWindow_Buffer* outBuf) {
 int wl_unlock_and_post(ANativeWindow* window) {
     return ANativeWindow_unlockAndPost(window);
 }
+
+int wl_acquire_window(ANativeWindow* window) {
+    return ANativeWindow_acquire(window);
+}

@@ -9,6 +9,7 @@ unsafe extern "C" {
     fn wl_get_native_window(env: *mut std::ffi::c_void, surface: jni::sys::jobject) -> *mut std::ffi::c_void;
     fn wl_lock_window(window: *mut std::ffi::c_void, buf: *mut ndk_sys::ANativeWindow_Buffer) -> std::ffi::c_int;
     fn wl_unlock_and_post(window: *mut std::ffi::c_void) -> std::ffi::c_int;
+    fn wl_acquire_window(window: *mut std::ffi::c_void) -> std::ffi::c_int;
 }
 
 static WINDOW: Mutex<Option<usize>> = Mutex::new(None);
@@ -16,7 +17,10 @@ static WINDOW: Mutex<Option<usize>> = Mutex::new(None);
 pub fn set_surface(env: *mut std::ffi::c_void, surface: jni::sys::jobject) {
     let mut w = WINDOW.lock().unwrap();
     if let Some(old) = w.take() {
-        if old != 0 { unsafe { ndk_sys::ANativeWindow_release(old as _); } }
+        if old != 0 {
+            unsafe { ndk_sys::ANativeWindow_release(old as _); }
+            unsafe { ndk_sys::ANativeWindow_release(old as _); }
+        }
     }
     if surface.is_null() {
         log::info!("set_surface: null, releasing");
@@ -27,7 +31,8 @@ pub fn set_surface(env: *mut std::ffi::c_void, surface: jni::sys::jobject) {
         log::error!("set_surface: wl_get_native_window returned null");
         return;
     }
-    log::info!("set_surface: window={window:p}");
+    unsafe { wl_acquire_window(window as _); }
+    log::info!("set_surface: window={window:p} (acquired)");
     *w = Some(window as usize);
 }
 
