@@ -26,4 +26,8 @@
 ## Final verification wave
 
 - [x] F1. 代码审查: session.rs 变更正确性
-- [x] F2. 功能验证: App 画面正常显示（需解锁设备后确认）
+- [x] F2. 功能验证: App 画面正常显示 ✅
+    - 屏幕显示 weston-simple-shm 彩色动画
+    - 内容铺满 3340x2360（近全屏）
+    - 两截图间 48% 像素变化（动画运行中）
+    - 无 crash、无乱码

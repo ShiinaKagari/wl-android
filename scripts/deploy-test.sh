@@ -1,5 +1,5 @@
 #!/bin/bash
-# wl-android 快速部署测试脚本
+# wl-android 快速部署测试脚本（用 droidspaces run 简化）
 # 用法:
 #   ./deploy-test.sh server   # 重新编译+部署 server binary，重启会话
 #   ./deploy-test.sh app      # 重新编译+部署 App .so，重启 App
@@ -15,16 +15,11 @@ if [ -z "$DEVICE" ]; then
 fi
 echo "device: $DEVICE"
 
-# 容器内进程 PID
-CONTAINER_PID=$(adb shell "ps -A | grep wl-android | awk '{print \$2}' | head -1")
-if [ -z "$CONTAINER_PID" ]; then
-    CONTAINER_PID=$(adb shell "ps -A | grep droidspaces | awk '{print \$2}' | head -1")
-fi
-echo "container_pid: $CONTAINER_PID"
+DS="/data/local/Droidspaces/bin/droidspaces --name=arch"
+REPO=/home/kagari/wl-android
 
-# 在容器内执行命令的辅助函数
-ns_exec() {
-    adb shell "su -c 'nsenter -t $CONTAINER_PID -m -p -u -- chroot /proc/$CONTAINER_PID/root /bin/sh -c \"$1\"'"
+run() {
+    adb shell "su -c '$DS run /bin/bash -c \"export PATH=/usr/sbin:/usr/bin:/sbin:/bin; $1\"'"
 }
 
 verify() {
@@ -45,23 +40,21 @@ show_status() {
     adb shell "su -c 'ss -xpn 2>/dev/null | grep -E \"land|wayland\"'" 2>/dev/null || true
     echo "--- processes ---"
     adb shell "ps -A | grep -E 'wl-android|kwin|plasma|com.wl.android'" 2>/dev/null || true
-    echo "--- server frame count ---"
-    ns_exec "grep -c 'sending frame' /tmp/wl-runtime/wl-android.log 2>/dev/null" 2>/dev/null || echo "n/a"
 }
 
 start_server() {
     echo "--- rebuild server in container ---"
-    ns_exec "cd /home/kagari/wl-android && cargo build --release -p wl-android > /tmp/b.log 2>&1; tail -2 /tmp/b.log"
+    run "cd $REPO && cargo build --release -p wl-android > /tmp/b.log 2>&1; tail -2 /tmp/b.log"
     echo "--- deploy ---"
-    ns_exec "cp /home/kagari/wl-android/target/release/wl-android /data/local/tmp/wl-android/wl-android"
+    run "cp $REPO/target/release/wl-android /data/local/tmp/wl-android/wl-android"
     echo "--- restart session ---"
-    ns_exec "pkill plasmashell; pkill kwin_wayland; pkill wl-android; sleep 1" || true
+    run "pkill plasmashell; pkill kwin_wayland; pkill wl-android; sleep 1" || true
     sleep 2
-    ns_exec "XDG_RUNTIME_DIR=/tmp/wl-runtime WAYLAND_DISPLAY=land-0 VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/freedreno_icd.aarch64.json LAND_SOCKET=/run/wl-android/land.sock /home/kagari/wl-android/target/release/wl-android run &" &
+    run "XDG_RUNTIME_DIR=/tmp/wl-runtime WAYLAND_DISPLAY=land-0 VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/freedreno_icd.aarch64.json MESA_LOADER_DRIVER_OVERRIDE=kgsl vblank_mode=3 MESA_VK_WSI_PRESENT_MODE=mailbox LAND_SOCKET=/run/wl-android/land.sock $REPO/target/release/wl-android run &" &
     sleep 4
-    ns_exec "XDG_RUNTIME_DIR=/tmp/wl-runtime WAYLAND_DISPLAY=land-0 VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/freedreno_icd.aarch64.json HOME=/home/kagari kwin_wayland --no-lockscreen --socket wayland-0 &" &
+    run "XDG_RUNTIME_DIR=/tmp/wl-runtime WAYLAND_DISPLAY=land-0 VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/freedreno_icd.aarch64.json MESA_LOADER_DRIVER_OVERRIDE=kgsl vblank_mode=3 MESA_VK_WSI_PRESENT_MODE=mailbox HOME=/home/kagari kwin_wayland --no-lockscreen --socket wayland-0 &" &
     sleep 10
-    ns_exec "XDG_RUNTIME_DIR=/tmp/wl-runtime WAYLAND_DISPLAY=wayland-0 HOME=/home/kagari KDE_FULL_SESSION=true plasmashell &" &
+    run "XDG_RUNTIME_DIR=/tmp/wl-runtime WAYLAND_DISPLAY=wayland-0 HOME=/home/kagari KDE_FULL_SESSION=true plasmashell &" &
     sleep 10
     adb shell "am force-stop com.wl.android && am start com.wl.android/.MainActivity"
     verify

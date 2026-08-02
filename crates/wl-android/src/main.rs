@@ -146,23 +146,21 @@ fn run_server() -> Result<(), Box<dyn std::error::Error>> {
         state.land_listener = listener_opt;
         dispatch_router_actions(state, &connect_actions);
 
-        if let Some(cache) = &state.frame_cache {
-            if let Some((fd, seq)) = cache.current_frame() {
-                if let Some(session) = &mut state.app_session {
-                    let _ = session.send_frame(
-                        seq, 0, state.screen_width, state.screen_height,
-                        state.screen_width, state.screen_height, Some(fd),
-                    );
-                }
-            }
-        }
-
         // ── Poll app session ──
         let lost = if let Some(session) = &mut state.app_session {
             match session.mode() {
                 SessionMode::Handshake => match session.do_handshake() {
                     Ok(true) => {
                         info!("handshake complete, mode={:?}", session.mode());
+                        // 握手完成后，把缓存的当前帧发给新客户端，避免黑屏
+                        if let Some(cache) = &state.frame_cache {
+                            if let Some((fd, seq, cw, ch)) = cache.current_frame() {
+                                let _ = session.send_frame(
+                                    seq, 0, state.screen_width, state.screen_height,
+                                    cw, ch, Some(fd),
+                                );
+                            }
+                        }
                         false
                     }
                     Ok(false) => false,

@@ -93,13 +93,13 @@ impl FrameCache {
         }
     }
 
-    pub fn current_frame(&self) -> Option<(OwnedFd, u64)> {
+    pub fn current_frame(&self) -> Option<(OwnedFd, u64, u32, u32)> {
         if self.seq == 0 {
             return None;
         }
         let raw = unsafe { libc::dup(self.buffers[self.current].as_raw_fd()) };
         if raw >= 0 {
-            Some((unsafe { OwnedFd::from_raw_fd(raw) }, self.seq))
+            Some((unsafe { OwnedFd::from_raw_fd(raw) }, self.seq, self.width, self.height))
         } else {
             None
         }

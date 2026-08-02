@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
-use std::os::fd::{FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::net::UnixListener;
 
 use smithay::delegate_compositor;
@@ -14,6 +14,7 @@ use smithay::delegate_single_pixel_buffer;
 use smithay::delegate_viewporter;
 use smithay::delegate_xdg_shell;
 use smithay::delegate_alpha_modifier;
+use smithay::backend::allocator::Buffer;
 use smithay::backend::input::ButtonState;
 use smithay::input::pointer::{ButtonEvent, MotionEvent as PointerMotionEvent};
 use smithay::input::{Seat, SeatHandler, SeatState};
@@ -23,11 +24,11 @@ use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::Display;
 use smithay::wayland::compositor::{self, BufferAssignment, CompositorClientState, CompositorHandler, CompositorState, SurfaceAttributes};
 use smithay::wayland::output::OutputManagerState;
-use smithay::wayland::buffer::BufferHandler;
 use smithay::wayland::shell::xdg::{ToplevelSurface, XdgShellHandler, XdgShellState};
 use smithay::wayland::shm::{self, ShmHandler, ShmState};
 use smithay::wayland::single_pixel_buffer::SinglePixelBufferState;
 use smithay::wayland::viewporter::ViewporterState;
+use smithay::wayland::dmabuf::{get_dmabuf, DmabufState};
 use smithay::wayland::content_type::ContentTypeState;
 use smithay::wayland::alpha_modifier::AlphaModifierState;
 use smithay::wayland::pointer_constraints::{PointerConstraintsHandler, PointerConstraintsState};
@@ -44,6 +45,45 @@ use crate::frame_cache::FrameCache;
 use crate::frame_router::FrameRouter;
 use crate::touch::TouchInjector;
 use wl_android_common::proto::{TouchMessage, TOUCH_PHASE_DOWN, TOUCH_PHASE_MOVE, TOUCH_PHASE_UP};
+
+enum ExtractedFrame {
+    Shm(u32, u32, Vec<u8>),
+    Dmabuf(u32, u32, OwnedFd),
+}
+
+fn extract_from_buffer(wl_buffer: &smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer) -> Option<ExtractedFrame> {
+    let shm_result = shm::with_buffer_contents(wl_buffer, |ptr, _pool_len, data| {
+        let stride = data.stride as usize;
+        let height = data.height as usize;
+        if height == 0 || stride == 0 { return None; }
+        let offset = data.offset as usize;
+        let mut vec = vec![0u8; height * stride];
+        for y in 0..height {
+            let src = unsafe { ptr.add(offset + y * stride) };
+            let dst = unsafe { vec.as_mut_ptr().add(y * stride) };
+            unsafe { std::ptr::copy_nonoverlapping(src, dst, stride); }
+        }
+        Some((stride as u32 / 4, height as u32, vec))
+    }).unwrap_or(None);
+    if let Some((w, h, data)) = shm_result {
+        return Some(ExtractedFrame::Shm(w, h, data));
+    }
+
+    if let Ok(dmabuf) = get_dmabuf(wl_buffer) {
+        let w = dmabuf.width();
+        let h = dmabuf.height();
+        let handles: Vec<_> = dmabuf.handles().collect();
+        if let Some(handle) = handles.first() {
+            let raw_fd = handle.as_raw_fd();
+            let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(raw_fd) };
+            if let Ok(fd) = borrowed.try_clone_to_owned() {
+                return Some(ExtractedFrame::Dmabuf(w, h, fd));
+            }
+        }
+    }
+
+    None
+}
 
 pub struct WlState {
     pub display: Display<Self>,
@@ -62,6 +102,7 @@ pub struct WlState {
     pub frame_router: FrameRouter,
     pub frame_cache: Option<FrameCache>,
     pub blit_image_handles: Vec<u64>,
+    pub dmabuf_state: DmabufState,
     #[allow(dead_code)]
     pub blit_engine: BlitEngine,
     pub app_session: Option<AppSession>,
@@ -91,6 +132,11 @@ impl WlState {
         let output_state = OutputManagerState::new_with_xdg_output::<Self>(&dh);
         let frame_router = FrameRouter::new();
         let blit_engine = BlitEngine::new();
+
+        let mut dmabuf_state = DmabufState::new();
+        let dmabuf_feedback = crate::comp::dmabuf::build_default_feedback();
+        let _dmabuf_global =
+            dmabuf_state.create_global_with_default_feedback::<Self>(&dh, &dmabuf_feedback);
 
         let single_pixel_buffer_state = SinglePixelBufferState::new::<Self>(&dh);
         let viewporter_state = ViewporterState::new::<Self>(&dh);
@@ -133,6 +179,7 @@ impl WlState {
             viewporter_state, content_type_state, alpha_modifier_state, pointer_constraints_state,
             fractional_scale_state, presentation_state,
             xdg_shell_state, output_state, frame_router, frame_cache: None, blit_engine,
+            dmabuf_state,
             blit_image_handles: Vec::new(),
             app_session: None, land_listener: None,
             clock_epoch: std::time::Instant::now(),
@@ -287,24 +334,12 @@ impl CompositorHandler for WlState {
             h.finish() as u32
         };
         {
-            let extracted: Option<(u32, u32, Vec<u8>)> = 'extract: {
+            let extracted: Option<ExtractedFrame> = 'extract: {
                 let parent_data = compositor::with_states(surface, |states| {
                     let mut guard = states.cached_state.get::<SurfaceAttributes>();
                     match &guard.current().buffer {
                         Some(BufferAssignment::NewBuffer(wl_buffer)) => {
-                            shm::with_buffer_contents(wl_buffer, |ptr, _pool_len, data| {
-                                let stride = data.stride as usize;
-                                let height = data.height as usize;
-                                if height == 0 || stride == 0 { return None; }
-                                let offset = data.offset as usize;
-                                let mut vec = vec![0u8; height * stride];
-                                for y in 0..height {
-                                    let src = unsafe { ptr.add(offset + y * stride) };
-                                    let dst = unsafe { vec.as_mut_ptr().add(y * stride) };
-                                    unsafe { std::ptr::copy_nonoverlapping(src, dst, stride); }
-                                }
-                                Some((stride as u32 / 4, height as u32, vec))
-                            }).unwrap_or(None)
+                            extract_from_buffer(wl_buffer)
                         }
                         _ => None,
                     }
@@ -316,19 +351,7 @@ impl CompositorHandler for WlState {
                         let mut guard = states.cached_state.get::<SurfaceAttributes>();
                         match &guard.current().buffer {
                             Some(BufferAssignment::NewBuffer(wl_buffer)) => {
-                                shm::with_buffer_contents(wl_buffer, |ptr, _pool_len, data| {
-                                    let stride = data.stride as usize;
-                                    let height = data.height as usize;
-                                    if height == 0 || stride == 0 { return None; }
-                                    let offset = data.offset as usize;
-                                    let mut vec = vec![0u8; height * stride];
-                                    for y in 0..height {
-                                        let src = unsafe { ptr.add(offset + y * stride) };
-                                        let dst = unsafe { vec.as_mut_ptr().add(y * stride) };
-                                        unsafe { std::ptr::copy_nonoverlapping(src, dst, stride); }
-                                    }
-                                    Some((stride as u32 / 4, height as u32, vec))
-                                }).unwrap_or(None)
+                                extract_from_buffer(wl_buffer)
                             }
                             _ => None,
                         }
@@ -338,19 +361,58 @@ impl CompositorHandler for WlState {
                 None
             };
 
-            if let Some((bw, bh, data)) = extracted {
-                if self.frame_cache.is_none() {
-                    self.frame_cache = FrameCache::new(bw, bh).ok();
+            match extracted {
+                Some(ExtractedFrame::Shm(bw, bh, data)) => {
+                    tracing::info!(bw, bh, data_len = data.len(), "frame extracted from SHM");
+                    if self.frame_cache.is_none() {
+                        match FrameCache::new(bw, bh) {
+                            Ok(c) => self.frame_cache = Some(c),
+                            Err(e) => tracing::error!(err = %e, "FrameCache::new failed"),
+                        }
+                    }
+                    if let Some(cache) = &mut self.frame_cache {
+                        cache.set_dimensions(bw, bh);
+                        let fd = cache.push(&data, bw, bh);
+                        if let Some(fd) = fd {
+                            if let Some(session) = &mut self.app_session {
+                                let serial = cache.seq();
+                                tracing::info!(serial, bw, bh, "sending frame to App");
+                                let _ = session.send_frame(
+                                    serial, buffer_id, bw, bh, bw, bh, Some(fd),
+                                );
+                            }
+                        } else {
+                            tracing::warn!("frame_cache.push returned None");
+                        }
+                    }
                 }
-                if let Some(cache) = &mut self.frame_cache {
-                    cache.set_dimensions(bw, bh);
-                    let fd = cache.push(&data, bw, bh);
-                    if let Some(fd) = fd {
-                        if let Some(session) = &mut self.app_session {
-                            let serial = cache.seq();
-                            let _ = session.send_frame(
-                                serial, buffer_id, bw, bh, bw, bh, Some(fd),
-                            );
+                Some(ExtractedFrame::Dmabuf(bw, bh, fd)) => {
+                    tracing::info!(bw, bh, "frame extracted from DMABUF");
+                    if let Some(session) = &mut self.app_session {
+                        tracing::info!(bw, bh, "sending frame to App (dmabuf)");
+                        let _ = session.send_frame(
+                            0, buffer_id, bw, bh, bw, bh, Some(fd),
+                        );
+                    }
+                }
+                None => {
+                    tracing::warn!("no SHM or DMABUF buffer extracted on commit");
+                    // 仍发一个空帧（带 fd），保持 SCM_RIGHTS 消息边界对齐
+                    if self.frame_cache.is_none() {
+                        match FrameCache::new(self.screen_width, self.screen_height) {
+                            Ok(c) => self.frame_cache = Some(c),
+                            Err(e) => tracing::error!(err = %e, "FrameCache::new failed"),
+                        }
+                    }
+                    if let Some(cache) = &mut self.frame_cache {
+                        if let Some(fd) = cache.current_frame() {
+                            if let Some(session) = &mut self.app_session {
+                                let (fd, seq, cw, ch) = fd;
+                                let _ = session.send_frame(
+                                    seq, buffer_id, self.screen_width, self.screen_height,
+                                    cw, ch, Some(fd),
+                                );
+                            }
                         }
                     }
                 }
@@ -405,10 +467,6 @@ delegate_shm!(WlState);
 
 impl ShmHandler for WlState {
     fn shm_state(&self) -> &ShmState { &self.shm_state }
-}
-
-impl BufferHandler for WlState {
-    fn buffer_destroyed(&mut self, _buffer: &smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer) {}
 }
 
 // ── XDG Shell ──
