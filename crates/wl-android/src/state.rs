@@ -14,7 +14,10 @@ use smithay::delegate_single_pixel_buffer;
 use smithay::delegate_viewporter;
 use smithay::delegate_xdg_shell;
 use smithay::delegate_alpha_modifier;
+use smithay::backend::input::ButtonState;
+use smithay::input::pointer::{ButtonEvent, MotionEvent as PointerMotionEvent};
 use smithay::input::{Seat, SeatHandler, SeatState};
+use smithay::utils::{Logical, Point, Serial};
 use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::Display;
@@ -39,7 +42,7 @@ use crate::app_link::AppSession;
 use crate::blit::BlitEngine;
 use crate::frame_router::FrameRouter;
 use crate::touch::TouchInjector;
-use wl_android_common::proto::TouchMessage;
+use wl_android_common::proto::{TouchMessage, TOUCH_PHASE_DOWN, TOUCH_PHASE_MOVE, TOUCH_PHASE_UP};
 
 pub struct WlState {
     pub display: Display<Self>,
@@ -72,6 +75,7 @@ pub struct WlState {
     pub seat_state: SeatState<Self>,
     pub seat: Seat<Self>,
     pub touch_injector: TouchInjector,
+    pub next_serial: u32,
     pub pending_pixel_fds: HashMap<u64, OwnedFd>,
 }
 
@@ -103,6 +107,8 @@ impl WlState {
         let mut seat_state = SeatState::new();
         let mut seat = seat_state.new_wl_seat(&dh, "seat-0");
         let _touch = seat.add_touch();
+        let _pointer = seat.add_pointer();
+        let _keyboard = seat.add_keyboard(Default::default(), 200, 25)?;
 
         let w = 3392;
         let h = 2400;
@@ -136,6 +142,7 @@ impl WlState {
             clock_epoch: std::time::Instant::now(),
             screen_width: w, screen_height: h, refresh_millihz: refresh, dpi,
             output, toplevel: None, seat_state, seat, touch_injector,
+            next_serial: 1,
             pending_pixel_fds: HashMap::new(),
         };
 
@@ -168,6 +175,57 @@ impl WlState {
         if let Some(touch) = touch_opt {
             let ptr = self as *mut Self;
             unsafe { (*ptr).touch_injector.handle(msg, &touch, &mut *ptr); }
+        }
+
+        let serial = {
+            let s = Serial::from(self.next_serial);
+            self.next_serial += 1;
+            s
+        };
+
+        if let Some(ref toplevel) = self.toplevel
+            && let Some(pointer) = self.seat.get_pointer()
+        {
+            let surface = toplevel.wl_surface().clone();
+            let surface_pos: Point<f64, Logical> = (0.0, 0.0).into();
+            let x = msg.x as f64 * self.screen_width as f64;
+            let y = msg.y as f64 * self.screen_height as f64;
+            let loc: Point<f64, Logical> = (x, y).into();
+
+            match msg.phase {
+                TOUCH_PHASE_DOWN => {
+                    pointer.motion(self, Some((surface, surface_pos)), &PointerMotionEvent {
+                        location: loc,
+                        serial,
+                        time: msg.time_ms,
+                    });
+                    pointer.button(self, &ButtonEvent {
+                        serial,
+                        time: msg.time_ms,
+                        button: 0x110, // BTN_LEFT
+                        state: ButtonState::Pressed,
+                    });
+                    pointer.frame(self);
+                }
+                TOUCH_PHASE_MOVE => {
+                    pointer.motion(self, Some((surface, surface_pos)), &PointerMotionEvent {
+                        location: loc,
+                        serial,
+                        time: msg.time_ms,
+                    });
+                    pointer.frame(self);
+                }
+                TOUCH_PHASE_UP => {
+                    pointer.button(self, &ButtonEvent {
+                        serial,
+                        time: msg.time_ms,
+                        button: 0x110, // BTN_LEFT
+                        state: ButtonState::Released,
+                    });
+                    pointer.frame(self);
+                }
+                _ => {}
+            }
         }
     }
 
@@ -426,7 +484,26 @@ impl SeatHandler for WlState {
     type TouchFocus = WlSurface;
 
     fn seat_state(&mut self) -> &mut SeatState<Self> { &mut self.seat_state }
-    fn focus_changed(&mut self, _: &Seat<Self>, _: Option<&WlSurface>) {}
+    fn focus_changed(&mut self, seat: &Seat<Self>, focused: Option<&WlSurface>) {
+        if let Some(pointer) = seat.get_pointer()
+            && let Some(surface) = focused
+        {
+            let current = pointer.current_focus();
+            if current.as_ref() != Some(surface) {
+                let loc = pointer.current_location();
+                let serial = {
+                    let s = Serial::from(self.next_serial);
+                    self.next_serial += 1;
+                    s
+                };
+                pointer.motion(self, Some((surface.clone(), (0.0f64, 0.0f64).into())), &PointerMotionEvent {
+                    location: loc,
+                    serial,
+                    time: 0,
+                });
+            }
+        }
+    }
     fn cursor_image(&mut self, _: &Seat<Self>, _: smithay::input::pointer::CursorImageStatus) {}
 }
 
