@@ -69,6 +69,7 @@ impl AppSession {
         if !matches!(msg, Message::Hello(_)) {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "expected HELO"));
         }
+        log::info!("HELO received");
 
         // 2. Send CONF
         let conf_data = proto::encode(&Message::Config(proto::ConfigMessage::new(3392, 2400, 144000, 289, 0)));
@@ -76,6 +77,7 @@ impl AppSession {
         wr.write_all(&len)?;
         wr.write_all(&conf_data)?;
         wr.flush()?;
+        log::info!("CONF sent, entering frame loop");
 
         // 3. Frame ← Ack loop
         loop {
@@ -86,15 +88,17 @@ impl AppSession {
                     return Err(e);
                 }
             };
+            log::info!("recv: {} bytes, {} fds", data.len(), fds.len());
             let msg = match proto::decode(&data, fds) {
                 Ok(m) => m,
                 Err(e) => {
-                    log::error!("proto::decode failed: {e}");
+                    log::error!("proto::decode failed: {e} data[..min(8)]={:02x?}", &data[..data.len().min(8)]);
                     return Err(io::Error::new(io::ErrorKind::InvalidData, e.to_string()));
                 }
             };
             match msg {
                 Message::Frame(fm, fds) => {
+                    log::info!("Frame received: serial={} {}x{} fds={}", fm.serial, fm.width, fm.height, fds.len());
                     let size = fm.width as usize * fm.height as usize * 4;
                     let pixel_data = if !fds.is_empty() {
                         use std::os::fd::AsRawFd;
@@ -128,8 +132,9 @@ impl AppSession {
                     wr.write_all(&ack_data)?;
                     wr.flush()?;
                 }
-                Message::Config(_) | Message::Hello(_) | Message::Gone(_) => {}
-                _ => {}
+                other => {
+                    log::warn!("unexpected message: {:?}", other);
+                }
             }
         }
     }
