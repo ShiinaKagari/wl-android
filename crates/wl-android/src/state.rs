@@ -22,7 +22,6 @@ use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::Display;
 use smithay::wayland::compositor::{self, BufferAssignment, CompositorClientState, CompositorHandler, CompositorState, SurfaceAttributes};
-use smithay::wayland::dmabuf::DmabufState;
 use smithay::wayland::output::OutputManagerState;
 use smithay::wayland::shell::xdg::{ToplevelSurface, XdgShellHandler, XdgShellState};
 use smithay::wayland::shm::{self, ShmHandler, ShmState};
@@ -49,7 +48,6 @@ pub struct WlState {
     pub display: Display<Self>,
     pub compositor_state: CompositorState,
     pub shm_state: ShmState,
-    pub dmabuf_state: DmabufState,
     pub single_pixel_buffer_state: SinglePixelBufferState,
     pub viewporter_state: ViewporterState,
     pub content_type_state: ContentTypeState,
@@ -93,10 +91,6 @@ impl WlState {
         let frame_router = FrameRouter::new();
         let blit_engine = BlitEngine::new();
 
-        let dmabuf_state = DmabufState::new();
-        // zwp_linux_dmabuf_v1 intentionally disabled: KWin must use SHM
-        // buffers so frame_cache can extract pixels via shm::with_buffer_contents.
-
         let single_pixel_buffer_state = SinglePixelBufferState::new::<Self>(&dh);
         let viewporter_state = ViewporterState::new::<Self>(&dh);
         let content_type_state = ContentTypeState::new::<Self>(&dh);
@@ -134,7 +128,7 @@ impl WlState {
         let _global = output.create_global::<Self>(&dh);
 
         let mut state = Self {
-            display, compositor_state, shm_state, dmabuf_state, single_pixel_buffer_state,
+            display, compositor_state, shm_state, single_pixel_buffer_state,
             viewporter_state, content_type_state, alpha_modifier_state, pointer_constraints_state,
             fractional_scale_state, presentation_state,
             xdg_shell_state, output_state, frame_router, frame_cache: None, blit_engine,
