@@ -16,6 +16,7 @@ mod app_link;
 mod blit;
 mod comp;
 mod doctor;
+mod frame_cache;
 mod frame_router;
 mod state;
 mod touch;
@@ -144,6 +145,17 @@ fn run_server() -> Result<(), Box<dyn std::error::Error>> {
         }
         state.land_listener = listener_opt;
         dispatch_router_actions(state, &connect_actions);
+
+        if let Some(cache) = &state.frame_cache {
+            if let Some((fd, seq)) = cache.current_frame() {
+                if let Some(session) = &mut state.app_session {
+                    let _ = session.send_frame(
+                        seq, 0, state.screen_width, state.screen_height,
+                        state.screen_width, state.screen_height, Some(fd),
+                    );
+                }
+            }
+        }
 
         // ── Poll app session ──
         let lost = if let Some(session) = &mut state.app_session {

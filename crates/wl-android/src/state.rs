@@ -40,6 +40,7 @@ use wayland_protocols::xdg::shell::server::xdg_toplevel;
 
 use crate::app_link::AppSession;
 use crate::blit::BlitEngine;
+use crate::frame_cache::FrameCache;
 use crate::frame_router::FrameRouter;
 use crate::touch::TouchInjector;
 use wl_android_common::proto::{TouchMessage, TOUCH_PHASE_DOWN, TOUCH_PHASE_MOVE, TOUCH_PHASE_UP};
@@ -60,6 +61,7 @@ pub struct WlState {
     #[allow(dead_code)]
     pub output_state: OutputManagerState,
     pub frame_router: FrameRouter,
+    pub frame_cache: Option<FrameCache>,
     pub blit_image_handles: Vec<u64>,
     #[allow(dead_code)]
     pub blit_engine: BlitEngine,
@@ -136,7 +138,7 @@ impl WlState {
             display, compositor_state, shm_state, dmabuf_state, single_pixel_buffer_state,
             viewporter_state, content_type_state, alpha_modifier_state, pointer_constraints_state,
             fractional_scale_state, presentation_state,
-            xdg_shell_state, output_state, frame_router, blit_engine,
+            xdg_shell_state, output_state, frame_router, frame_cache: None, blit_engine,
             blit_image_handles: Vec::new(),
             app_session: None, land_listener: None,
             clock_epoch: std::time::Instant::now(),
@@ -290,9 +292,6 @@ impl CompositorHandler for WlState {
             surface.hash(&mut h);
             h.finish() as u32
         };
-        let has_fds = false;
-
-        let mut pixel_fd: Option<std::os::fd::OwnedFd> = None;
         {
             let extracted: Option<(u32, u32, Vec<u8>)> = 'extract: {
                 let parent_data = compositor::with_states(surface, |states| {
@@ -345,78 +344,39 @@ impl CompositorHandler for WlState {
                 None
             };
 
-            if let Some((_bw, _bh, data)) = extracted {
-                let size = data.len();
-                match nix::sys::memfd::memfd_create(
-                    "wl-frame",
-                    nix::sys::memfd::MFdFlags::MFD_CLOEXEC | nix::sys::memfd::MFdFlags::MFD_ALLOW_SEALING,
-                ) {
-                    Ok(memfd) => {
-                        use std::os::fd::AsRawFd;
-                        if nix::unistd::ftruncate(&memfd, size as _).is_ok() {
-                            let ptr = unsafe {
-                                nix::sys::mman::mmap(
-                                    None,
-                                    NonZeroUsize::new(size).unwrap(),
-                                    nix::sys::mman::ProtFlags::PROT_READ | nix::sys::mman::ProtFlags::PROT_WRITE,
-                                    nix::sys::mman::MapFlags::MAP_SHARED,
-                                    &memfd,
-                                    0,
-                                )
-                            };
-                            if let Ok(ptr) = ptr {
-                                unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), ptr.as_ptr() as *mut u8, size); }
-                                unsafe { nix::sys::mman::munmap(ptr, size).ok(); }
-                                let raw = unsafe { libc::dup(memfd.as_raw_fd()) };
-                                if raw >= 0 {
-                                    pixel_fd = Some(unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) });
-                                }
-                            }
+            if let Some((bw, bh, data)) = extracted {
+                if self.frame_cache.is_none() {
+                    self.frame_cache = FrameCache::new(bw, bh).ok();
+                }
+                if let Some(cache) = &mut self.frame_cache {
+                    cache.set_dimensions(bw, bh);
+                    let fd = cache.push(&data, bw, bh);
+                    if let Some(fd) = fd {
+                        if let Some(session) = &mut self.app_session {
+                            let serial = cache.seq();
+                            let _ = session.send_frame(
+                                serial, buffer_id, bw, bh, bw, bh, Some(fd),
+                            );
                         }
                     }
-                    Err(e) => tracing::warn!(err = %e, "memfd_create failed"),
                 }
             }
         }
 
-        let actions = self.frame_router.handle(
+        let _actions = self.frame_router.handle(
             crate::frame_router::RouterEvent::Commit {
                 buffer_id,
-                has_fds,
+                has_fds: false,
                 serial: 0,
             },
         );
-        let has_enqueue = actions.iter().any(|a| matches!(a, crate::frame_router::RouterAction::EnqueueFrame { .. }));
-        for action in actions {
-            match action {
-                crate::frame_router::RouterAction::EnqueueFrame { buffer_id: bid, serial, .. } => {
-                    tracing::info!(serial, bid, "sending frame to App");
-                    if let Some(session) = &mut self.app_session {
-                        let fd = pixel_fd.take();
-                        let _ = session.send_frame(
-                            serial, bid, self.screen_width, self.screen_height,
-                            self.screen_width, self.screen_height, fd,
-                        );
-                    }
-                }
-                crate::frame_router::RouterAction::FireCallback => {}
-                _ => {}
-            }
-        }
-        if !has_enqueue {
-            if let Some(fd) = pixel_fd.take() {
-                self.pending_pixel_fds.clear();
-                let serial = self.frame_router.current_serial();
-                self.pending_pixel_fds.insert(serial, fd);
-            }
-        }
 
         let now_ms = std::time::Instant::now()
             .duration_since(self.clock_epoch)
             .as_millis() as u32;
         let period_ns = 1_000_000_000_000u64 / self.refresh_millihz as u64;
         let refresh = Refresh::Fixed(std::time::Duration::from_nanos(period_ns));
-        let seq = self.frame_router.current_serial();
+        let seq = self.frame_cache.as_ref().map(|c| c.seq()).unwrap_or(0);
         compositor::with_states(surface, |states| {
             let mut guard = states.cached_state.get::<SurfaceAttributes>();
             let count = guard.current().frame_callbacks.len();
