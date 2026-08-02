@@ -23,6 +23,7 @@ use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::Display;
 use smithay::wayland::compositor::{self, BufferAssignment, CompositorClientState, CompositorHandler, CompositorState, SurfaceAttributes};
 use smithay::wayland::output::OutputManagerState;
+use smithay::wayland::buffer::BufferHandler;
 use smithay::wayland::shell::xdg::{ToplevelSurface, XdgShellHandler, XdgShellState};
 use smithay::wayland::shm::{self, ShmHandler, ShmState};
 use smithay::wayland::single_pixel_buffer::SinglePixelBufferState;
@@ -404,6 +405,10 @@ delegate_shm!(WlState);
 
 impl ShmHandler for WlState {
     fn shm_state(&self) -> &ShmState { &self.shm_state }
+}
+
+impl BufferHandler for WlState {
+    fn buffer_destroyed(&mut self, _buffer: &smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer) {}
 }
 
 // ── XDG Shell ──
