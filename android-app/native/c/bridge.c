@@ -12,6 +12,10 @@ int wl_unlock_and_post(ANativeWindow* window) {
     return ANativeWindow_unlockAndPost(window);
 }
 
-int wl_acquire_window(ANativeWindow* window) {
-    return ANativeWindow_acquire(window);
+void wl_acquire_window(ANativeWindow* window) {
+    ANativeWindow_acquire(window);
+}
+
+int wl_set_format(ANativeWindow* window) {
+    return ANativeWindow_setBuffersGeometry(window, 0, 0, WINDOW_FORMAT_RGBA_8888);
 }
