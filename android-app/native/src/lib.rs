@@ -218,19 +218,28 @@ extern "system" fn Java_com_wl_android_NativeBridge_nativeInit(
                 }
                 Err(e) => {
                     log::error!("connect failed: {e}");
-                    // CONN-STATE: still disconnected — reconnect loop is
-                    // retrying, Java overlay shows "Reconnection".
+                    // CONN-STATE: still disconnected — the reconnect loop is
+                    // retrying; Init maps to "Reconnection" in the overlay
+                    // (Distinguished from Disconnected: the run_loop failed,
+                    // i.e. we HAD a session and lost it).
                     let mut inner = state_clone.lock().unwrap();
-                    inner.state = AppState::Disconnected;
+                    inner.state = AppState::Init;
                 }
             }
             // Tear down the dead session so JNI sends drop their messages,
             // then retry after a short backoff.
+            //
+            // CONN-STATE: after a connect failure (state already Init =
+            // "Reconnection") this must NOT overwrite it with Disconnected —
+            // we never had a session. After a run_loop failure (state was
+            // set to Disconnected above) it stays Disconnected.
             {
                 let mut inner = state_clone.lock().unwrap();
                 inner.session = None;
                 inner.input_write.lock().unwrap().take();
-                inner.state = AppState::Disconnected;
+                if inner.state != AppState::Init {
+                    inner.state = AppState::Disconnected;
+                }
             }
             log::info!("reconnecting in 1s...");
             std::thread::sleep(std::time::Duration::from_millis(1000));

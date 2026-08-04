@@ -54,6 +54,11 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
 
         surfaceView = SurfaceView(this).apply {
             holder.addCallback(this@MainActivity)
+            // SurfaceView's Surface lives ABOVE normal views in the window
+            // Z-order by default — the status overlay would be hidden behind
+            // it. Media-overlay Z keeps the Surface below regular views so
+            // the Disconnected/Reconnection TextView stays visible on top.
+            setZOrderMediaOverlay(true)
         }
 
         // CONN-STATE overlay: a semi-transparent black layer with the
