@@ -15,11 +15,19 @@ unsafe extern "C" {
 
 static WINDOW: Mutex<Option<usize>> = Mutex::new(None);
 
+/// Borrow the current ANativeWindow (as `*mut c_void`) for renderer init
+/// (TODO 26). Returns None when no surface is set. Ownership stays here —
+/// the caller must not release it; the window may be replaced by a later
+/// `set_surface`, so use it immediately (e.g. vkCreateAndroidSurfaceKHR) and
+/// don't cache it.
+pub fn window_ptr() -> Option<*mut std::ffi::c_void> {
+    WINDOW.lock().unwrap().filter(|w| *w != 0).map(|w| w as *mut std::ffi::c_void)
+}
+
 pub fn set_surface(env: *mut std::ffi::c_void, surface: jni::sys::jobject) {
     let mut w = WINDOW.lock().unwrap();
     if let Some(old) = w.take() {
         if old != 0 {
-            unsafe { ndk_sys::ANativeWindow_release(old as _); }
             unsafe { ndk_sys::ANativeWindow_release(old as _); }
         }
     }
@@ -38,6 +46,67 @@ pub fn set_surface(env: *mut std::ffi::c_void, surface: jni::sys::jobject) {
     *w = Some(window as usize);
 }
 
+/// Row-wise BGRX -> BGRA copy (byte-identical: both sides are B,G,R,X memory
+/// order; only the strides differ). Replaces the old per-pixel channel-swap
+/// loop for `bpp == 4` windows — 8.14M pixels/frame of per-pixel work was
+/// 12-80ms/frame.
+///
+/// Per-row clamping guarantees we never read past the end of `src`, even when
+/// it is shorter than the full expected `copy_w * copy_h * 4` bytes (e.g. an
+/// fstat-truncated SHM frame, TODO 7), and never write past `dst`.
+///
+/// Returns `true` if a truncated source or destination was detected and one or
+/// more rows were clamped or skipped (caller logs a warning).
+fn copy_row_bgra(
+    dst: &mut [u8],
+    dst_stride_bytes: usize,
+    src: &[u8],
+    src_stride_bytes: usize,
+    copy_w: usize,
+    copy_h: usize,
+) -> bool {
+    let row_bytes = copy_w * 4;
+    let mut truncated = false;
+    for y in 0..copy_h {
+        let src_row = y * src_stride_bytes;
+        if src_row >= src.len() {
+            truncated = true;
+            continue;
+        }
+        let n = row_bytes.min(src.len() - src_row);
+        if n < row_bytes {
+            truncated = true;
+        }
+        if n == 0 {
+            continue;
+        }
+        let dst_row = y * dst_stride_bytes;
+        if dst_row >= dst.len() {
+            truncated = true;
+            continue;
+        }
+        let n = n.min(dst.len() - dst_row);
+        unsafe {
+            // `src` (SHM frame) and `dst` (window buffer) are distinct
+            // allocations, so the regions never overlap.
+            std::ptr::copy_nonoverlapping(
+                src.as_ptr().add(src_row),
+                dst.as_mut_ptr().add(dst_row),
+                n,
+            );
+        }
+    }
+    truncated
+}
+
+/// CPU fallback render path (legacy SHM frames / swapchain-unavailable
+/// devices): BGRX→BGRA row copy into the ANativeWindow via
+/// `ANativeWindow_lock`. Deprecated in favor of the Vulkan swapchain present
+/// path (P3, TODO 30): when the swapchain is up, fence frames bypass this
+/// entirely, and this function only serves pre-blit SHM servers or a
+/// failed/absent swapchain init. Kept working — it is the non-swapchain
+/// fallback.
+#[deprecated(note = "CPU fallback path — swapchain present is primary (P3)")]
 pub fn render_frame(serial: u64, width: u32, height: u32, pixel_data: &[u8]) -> Result<(), String> {
     let guard = WINDOW.lock().unwrap();
     let window = match *guard {
@@ -94,20 +163,30 @@ pub fn render_frame(serial: u64, width: u32, height: u32, pixel_data: &[u8]) -> 
         let dst_bits = buf.bits as *mut u8;
         let copy_w = (buf.width as usize).min(width as usize);
         let copy_h = (buf.height as usize).min(height as usize);
-        for y in 0..copy_h {
-            for x in 0..copy_w {
-                let src_off = y * src_stride + x * 4;
-                let dst_off = y * dst_stride * bpp + x * bpp;
-                let b = pixel_data[src_off];     // BGRX: byte0=B
-                let g = pixel_data[src_off + 1]; // byte1=G
-                let r = pixel_data[src_off + 2]; // byte2=R
-                unsafe {
-                    if bpp == 4 {
-                        *dst_bits.add(dst_off) = r;       // RGBA: byte0=R
-                        *dst_bits.add(dst_off + 1) = g;   // byte1=G
-                        *dst_bits.add(dst_off + 2) = b;   // byte2=B
-                        *dst_bits.add(dst_off + 3) = 0xFF; // byte3=A
-                    } else {
+        if bpp == 4 {
+            // Fast path: the window is now WINDOW_FORMAT_BGRA_8888 (TODO 9),
+            // whose buffer is B,G,R,X memory order — byte-identical to the
+            // KWin SHM BGRX frames. Only the strides differ, so a per-row
+            // memcpy replaces the old per-pixel channel-swap loop.
+            let dst_len = dst_stride * copy_h * bpp;
+            let dst_slice = unsafe { std::slice::from_raw_parts_mut(dst_bits, dst_len) };
+            if copy_row_bgra(dst_slice, dst_stride * bpp, pixel_data, src_stride, copy_w, copy_h) {
+                log::warn!(
+                    "render_frame: SHM frame truncated ({}B < {}B expected); rows clamped",
+                    pixel_data.len(),
+                    copy_w * copy_h * 4
+                );
+            }
+        } else {
+            // RGB_565 fallback (old window format): keep per-pixel conversion.
+            for y in 0..copy_h {
+                for x in 0..copy_w {
+                    let src_off = y * src_stride + x * 4;
+                    let dst_off = y * dst_stride * bpp + x * bpp;
+                    let b = pixel_data[src_off];
+                    let g = pixel_data[src_off + 1];
+                    let r = pixel_data[src_off + 2];
+                    unsafe {
                         let r5 = ((r as u16) >> 3) & 0x1F;
                         let g6 = ((g as u16) >> 2) & 0x3F;
                         let b5 = ((b as u16) >> 3) & 0x1F;

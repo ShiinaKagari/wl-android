@@ -1,5 +1,11 @@
 #include <android/native_window_jni.h>
 
+/* NDK 27's native_window.h does not define WINDOW_FORMAT_BGRA_8888.
+ * Value 5 matches android.graphics.PixelFormat.BGRA_8888. */
+#ifndef WINDOW_FORMAT_BGRA_8888
+#define WINDOW_FORMAT_BGRA_8888 5
+#endif
+
 ANativeWindow* wl_get_native_window(JNIEnv* env, jobject surface) {
     return ANativeWindow_fromSurface(env, surface);
 }
@@ -17,5 +23,5 @@ void wl_acquire_window(ANativeWindow* window) {
 }
 
 int wl_set_format(ANativeWindow* window) {
-    return ANativeWindow_setBuffersGeometry(window, 0, 0, WINDOW_FORMAT_RGBA_8888);
+    return ANativeWindow_setBuffersGeometry(window, 0, 0, WINDOW_FORMAT_BGRA_8888);
 }

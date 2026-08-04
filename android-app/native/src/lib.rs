@@ -4,6 +4,7 @@ mod ahb;
 mod jni_bridge;
 
 use std::collections::VecDeque;
+use std::os::fd::OwnedFd;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -11,6 +12,7 @@ use jni::objects::{JClass, JString, JObject};
 use jni::sys::{jfloat, jint, jlong, jobject};
 use jni::JNIEnv;
 
+use crate::ahb::AhbSlot;
 use crate::session::AppSession;
 use crate::render::RenderState;
 
@@ -37,7 +39,15 @@ struct Inner {
     render: RenderState,
     state: AppState,
     frame_queue: VecDeque<FrameData>,
+    /// App-side bring-up gate (V-33): consecutive `present` failures. When a
+    /// streak reaches [`PRESENT_FAIL_GATE`] the frame loop logs a clear
+    /// "UBWC import failure suspected" message (the actual pixel read-back is
+    /// the server doctor's `import_ubwc_test`, lane 32).
+    consecutive_present_failures: u32,
 }
+
+/// How many consecutive present failures trip the UBWC-suspicion gate.
+const PRESENT_FAIL_GATE: u32 = 3;
 
 type StateRef = Arc<Mutex<Inner>>;
 
@@ -93,6 +103,7 @@ extern "system" fn Java_com_wl_android_NativeBridge_nativeInit(
             let inner = Arc::new(Mutex::new(Inner {
                 session: None, render: RenderState::new(),
                 state: AppState::Error, frame_queue: VecDeque::new(),
+                consecutive_present_failures: 0,
             }));
             return register(inner);
         }
@@ -103,6 +114,7 @@ extern "system" fn Java_com_wl_android_NativeBridge_nativeInit(
         render: RenderState::new(),
         state: AppState::Init,
         frame_queue: VecDeque::new(),
+        consecutive_present_failures: 0,
     }));
 
     let handle = register(state.clone());
@@ -117,9 +129,27 @@ extern "system" fn Java_com_wl_android_NativeBridge_nativeInit(
         };
         state_clone.lock().unwrap().state = AppState::Handshake;
 
-        let result = AppSession::run_loop(read_stream, write_clone, move |serial, buffer_id, width, height, pixel_data: &[u8]| {
-            log::info!("FRAME: serial={serial} {width}x{height} buf={buffer_id} data={}B", pixel_data.len());
-            let _ = crate::jni_bridge::render_frame(serial, width, height, pixel_data);
+        // Lanes 27/30: AhbSlots are built + registered in nativeSetSurface
+        // (the SurfaceView surface arrives AFTER this thread spawns, so run_loop
+        // can't build them here). run_loop receives an empty list: its startup
+        // registration warns and skips — the real TBUF+handle registration is
+        // performed by `register_swapchain_slots` once the surface arrives.
+        let result = AppSession::run_loop(read_stream, write_clone, Vec::new(), move |serial, buffer_id, width, height, fence_fd: Option<OwnedFd>, pixel_data: &[u8]| {
+            log::info!("FRAME: serial={serial} {width}x{height} buf={buffer_id} data={}B fence={}", pixel_data.len(), if fence_fd.is_some() { "yes" } else { "no" });
+            if let Some(fence) = fence_fd {
+                // Fence path (F-12, lane 30): the server already blitted into
+                // swapchain slot buffer_id and shipped the sync_file fence
+                // (owned by this callback). Present under the Inner lock:
+                // import the fence as a wait semaphore → vkQueuePresentKHR →
+                // destroy the temp semaphore; fall back to a CPU poll of the
+                // fence when SYNC_FD import is unavailable or fails.
+                present_fence_frame(&state_clone, serial, buffer_id, &fence);
+            } else {
+                // Legacy SHM frame (pre-blit server): CPU copy fallback. Only
+                // reachable when the swapchain path isn't driving the frames.
+                #[allow(deprecated)]
+                let _ = crate::jni_bridge::render_frame(serial, width, height, pixel_data);
+            }
             if let Ok(mut inner) = state_clone.lock() {
                 inner.state = AppState::Active;
                 inner.frame_queue.push_back(FrameData { serial, buffer_id, width, height });
@@ -141,6 +171,194 @@ extern "system" fn Java_com_wl_android_NativeBridge_nativeSetSurface(
 ) {
     log::info!("nativeSetSurface handle={handle} surface={}", !surface.is_null());
     crate::jni_bridge::set_surface(env as *mut std::ffi::c_void, surface);
+    if surface.is_null() {
+        // Surface removed. Keep the swapchain as-is: a later set_surface may
+        // re-arm it. Surface re-creation (M5, rotation) is out of lane 30's
+        // scope — the existing slots stay registered (possibly stale).
+        log::info!("nativeSetSurface: surface cleared (swapchain left as-is)");
+        return;
+    }
+    let Some(state) = find(handle) else {
+        log::error!("nativeSetSurface: unknown handle {handle}");
+        return;
+    };
+    let mut inner = state.lock().unwrap();
+
+    if inner.render.initialized {
+        log::warn!(
+            "nativeSetSurface: swapchain already initialized — surface re-creation (M5) not handled in this lane; existing slots stay registered (may be stale)"
+        );
+        return;
+    }
+    let window = match crate::jni_bridge::window_ptr() {
+        Some(w) => w,
+        None => {
+            log::warn!("nativeSetSurface: set_surface stored no window — CPU fallback stays active");
+            return;
+        }
+    };
+
+    // 1. Build the swapchain on the SurfaceView's ANativeWindow.
+    if let Err(e) = inner.render.init(window) {
+        log::error!("nativeSetSurface: render.init failed: {e} — CPU fallback path stays active");
+        return;
+    }
+    log::info!(
+        "nativeSetSurface: swapchain initialized — format={:?} extent={}x{} images={}",
+        inner.render.image_format(),
+        inner.render.extent().width,
+        inner.render.extent().height,
+        inner.render.images().len(),
+    );
+
+    // 2. App-side host-driver SYNC_FD runtime assertion (V-33): the server's
+    // blit fence is a sync_file; presenting on it requires importing it as a
+    // VkSemaphore (VK_KHR_external_semaphore_fd). render.rs probed the
+    // extension during init; surface the verdict here. A missing extension
+    // degrades fence frames to the wait_sync_fd CPU poll (logged per frame).
+    log::info!(
+        "nativeSetSurface: SYNC_FD semaphore import {} ({} fence frames)",
+        if inner.render.semaphore_fd_supported() { "SUPPORTED" } else { "UNSUPPORTED" },
+        if inner.render.semaphore_fd_supported() { "import → present" } else { "wait_sync_fd CPU-poll fallback" },
+    );
+
+    // 3. Slot registration (P-13): one AhbSlot per swapchain image, each
+    // shipped as TBUF + AHB native_handle. Done HERE — not in run_loop, which
+    // spawned before the surface existed and already warned+skipped with an
+    // empty list (see the ordering analysis in `register_swapchain_slots`).
+    if let Err(e) = register_swapchain_slots(&mut inner) {
+        log::error!("nativeSetSurface: slot registration failed: {e} — blit will stall; server gates frames on {} TBUFs", wl_android_common::proto::SLOT_COUNT);
+        return;
+    }
+    log::info!("nativeSetSurface: swapchain slots registered — blit mode armed");
+}
+
+/// Present a fence frame (F-12/F-29, lane 30): the server blitted into
+/// swapchain slot `buffer_id` and shipped the sync_file fence. Runs on the
+/// recv thread, inside the Inner lock.
+///
+/// Primary: `import_sync_fd_as_semaphore` → `present(slot, [sem])` →
+/// `destroy_semaphore`. Fallback when the import is unavailable or fails:
+/// CPU-poll the fence (`wait_sync_fd`, 1s) then `present(slot, [])` — the
+/// blit is known complete, so no GPU wait is needed. A fence frame that can
+/// neither be imported nor waited on is dropped (the slot stays occupied; the
+/// server re-arms it via BRDY only after a successful present path).
+///
+/// Bring-up gate (V-33): a streak of [`PRESENT_FAIL_GATE`] present failures
+/// logs a clear "UBWC import failure suspected" message — pixel verification
+/// is the server doctor's `import_ubwc_test` (lane 32).
+fn present_fence_frame(state: &StateRef, serial: u64, buffer_id: u32, fence: &OwnedFd) {
+    let mut inner = match state.lock() {
+        Ok(i) => i,
+        Err(e) => {
+            log::error!("present: inner lock poisoned: {e}");
+            return;
+        }
+    };
+    if !inner.render.initialized {
+        log::warn!(
+            "present: fence frame for slot {buffer_id} (serial={serial}) but swapchain uninitialized — dropped (no present target; fence frame carries no pixels for the CPU path)"
+        );
+        return;
+    }
+    let present_result = match inner.render.import_sync_fd_as_semaphore(fence) {
+        Ok(sem) => {
+            let r = inner.render.present(buffer_id, &[sem]);
+            inner.render.destroy_semaphore(sem);
+            r
+        }
+        Err(import_err) => {
+            log::warn!(
+                "present: SYNC_FD import failed for slot {buffer_id}: {import_err} — fallback: wait_sync_fd + present without wait"
+            );
+            match inner.render.wait_sync_fd(fence, 1000) {
+                Ok(true) => inner.render.present(buffer_id, &[]),
+                Ok(false) => {
+                    log::warn!("present: fence wait timed out (1s) for slot {buffer_id} (serial={serial}) — frame dropped, slot stays occupied");
+                    return;
+                }
+                Err(e) => {
+                    log::warn!("present: wait_sync_fd failed for slot {buffer_id}: {e}");
+                    return;
+                }
+            }
+        }
+    };
+    match present_result {
+        Ok(()) => {
+            log::info!("present: slot={buffer_id} (serial={serial}, fence-waited) — swapchain present path OK");
+            inner.consecutive_present_failures = 0;
+        }
+        Err(e) => {
+            inner.consecutive_present_failures += 1;
+            log::warn!("present: slot={buffer_id} failed: {e}");
+            if inner.consecutive_present_failures == PRESENT_FAIL_GATE {
+                log::error!(
+                    "UBWC IMPORT FAILURE SUSPECTED: {n} consecutive present failures on slot {buffer_id} (serial={serial}) — run server doctor `import_ubwc_test` (lane 32); on failure force LINEAR modifier or pause P3",
+                    n = inner.consecutive_present_failures,
+                );
+            }
+        }
+    }
+}
+
+/// P-13/P-14 slot registration, run on the JNI thread in `nativeSetSurface`:
+/// export each swapchain image's backing AHardwareBuffer
+/// ([`AhbSlot::from_swapchain_image`]), then for each slot send the TBUF
+/// message followed IMMEDIATELY by the AHB native_handle
+/// ([`AhbSlot::send_registration`]) on the session socket — order is
+/// load-bearing (the server decodes TBUF and treats the very next bytes as
+/// the handle, mirroring `AppSession::send_tbuf_then_handle`).
+///
+/// Thread-safety (single-writer analysis): these sends run under the Inner
+/// lock — the same lock all other JNI sends (CONF/touch/key) already use —
+/// so they cannot interleave with each other. The run_loop thread writes its
+/// own `wr` clone (FACK/BRDY), a pre-existing pattern from the mmap era; two
+/// write ends of one socket could in principle interleave a length-prefixed
+/// message mid-frame, but the window is closed here: the server gates blit
+/// frames on [`wl_android_common::proto::SLOT_COUNT`] TBUFs, so no FACK/BRDY
+/// traffic can exist before these TBUFs flush. Full single-writer discipline
+/// (one lock for ALL sends) is a follow-up (M7).
+fn register_swapchain_slots(inner: &mut Inner) -> Result<u32, String> {
+    let (Some(instance), Some(device)) = (inner.render.raw_instance(), inner.render.raw_device_ref())
+    else {
+        return Err("render instance/device not available".into());
+    };
+    let loader = ash::android::external_memory_android_hardware_buffer::Device::new(instance, device);
+    let extent = inner.render.extent();
+    let image_count = inner.render.images().len();
+    let mut slots = Vec::with_capacity(image_count);
+    for i in 0..image_count {
+        let memory = inner.render.image_memory(i as u32)
+            .ok_or_else(|| format!("swapchain image {i} has no bound VkDeviceMemory"))?;
+        slots.push(AhbSlot::from_swapchain_image(
+            &loader,
+            i as u32,
+            memory,
+            extent.width,
+            extent.height,
+        )?);
+    }
+    if image_count != wl_android_common::proto::SLOT_COUNT {
+        log::warn!(
+            "swapchain has {image_count} images but server gates blit on {} TBUFs — blit may stall",
+            wl_android_common::proto::SLOT_COUNT,
+        );
+    }
+    let session = inner.session.as_mut().ok_or("no session — connect failed")?;
+    let sock_fd = session.socket_fd();
+    for slot in &slots {
+        session
+            .send_message(&slot.to_tbuf_message())
+            .map_err(|e| format!("TBUF send for slot {} failed: {e}", slot.slot))?;
+        slot.send_registration(sock_fd)
+            .map_err(|e| format!("slot {} native_handle send failed: {e}", slot.slot))?;
+        log::info!(
+            "slot registered: slot={} {}x{} fmt={:#x} stride={}",
+            slot.slot, slot.width, slot.height, slot.format, slot.stride_bytes,
+        );
+    }
+    Ok(slots.len() as u32)
 }
 
 #[unsafe(no_mangle)]
@@ -168,6 +386,22 @@ extern "system" fn Java_com_wl_android_NativeBridge_nativeOnTouch(
                 touch_id, x, y, phase as u32, time_ms as u32,
             );
             let _ = session.send_message(&wl_android_common::proto::Message::Touch(msg));
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+extern "system" fn Java_com_wl_android_NativeBridge_nativeOnKey(
+    _env: JNIEnv, _class: JClass, handle: jlong,
+    keycode: jint, state: jint, time_ms: jint,
+) {
+    if let Some(state_ref) = find(handle) {
+        let mut inner = state_ref.lock().unwrap();
+        if let Some(ref mut session) = inner.session {
+            let msg = wl_android_common::proto::KeyMessage::new(
+                keycode as u32, state as u32, time_ms as u32,
+            );
+            let _ = session.send_message(&wl_android_common::proto::Message::Key(msg));
         }
     }
 }
