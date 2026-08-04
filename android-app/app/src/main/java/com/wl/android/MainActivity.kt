@@ -79,12 +79,6 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
 
         collector.start()
 
-        // SURFACE-REARM: if the surface callback raced ahead of nativeInit
-        // (or was consumed by a restart), re-assert the window here.
-        if (nativeHandle != 0L && surfaceView.holder.surface != null && surfaceView.holder.surface.isValid) {
-            NativeBridge.nativeSetSurface(nativeHandle, surfaceView.holder.surface)
-        }
-
         // Focus can be stolen (e.g. keyguard dismissal, dialog), re-grab after resume.
         surfaceView.post { surfaceView.requestFocus() }
     }

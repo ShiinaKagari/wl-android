@@ -26,12 +26,12 @@ pub fn window_ptr() -> Option<*mut std::ffi::c_void> {
 
 pub fn set_surface(env: *mut std::ffi::c_void, surface: jni::sys::jobject) {
     let mut w = WINDOW.lock().unwrap();
-    if let Some(old) = w.take() {
-        if old != 0 {
-            unsafe { ndk_sys::ANativeWindow_release(old as _); }
-        }
-    }
     if surface.is_null() {
+        if let Some(old) = w.take() {
+            if old != 0 {
+                unsafe { ndk_sys::ANativeWindow_release(old as _); }
+            }
+        }
         log::info!("set_surface: null, releasing");
         return;
     }
@@ -39,6 +39,21 @@ pub fn set_surface(env: *mut std::ffi::c_void, surface: jni::sys::jobject) {
     if window.is_null() {
         log::error!("set_surface: wl_get_native_window returned null");
         return;
+    }
+    // Idempotent re-arm (SURFACE-REARM): the same window pointer being set
+    // again (surfaceChanged/onResume after a restart) must NOT release +
+    // re-acquire — that tears down the buffer queue on the SurfaceFlinger
+    // side and the display goes black while frames still flow. Keep the
+    // existing acquired window; only (re-)apply the format, which is cheap.
+    if *w == Some(window as usize) {
+        let fmt_result = unsafe { wl_set_format(window as _) };
+        log::info!("set_surface: same window (re-arm) set_format={fmt_result}");
+        return;
+    }
+    if let Some(old) = w.take() {
+        if old != 0 {
+            unsafe { ndk_sys::ANativeWindow_release(old as _); }
+        }
     }
     unsafe { wl_acquire_window(window as _); }
     let fmt_result = unsafe { wl_set_format(window as _) };
