@@ -166,14 +166,17 @@ impl AppSession {
                         Some(handle) => {
                             debug!(slot = slot.slot, num_fds = handle.num_fds, "native_handle parsed");
                             if let Some(fd) = handle.fds.into_iter().next() {
-                                // Validate the fd is a live dma-buf before handing
-                                // it to the driver (a bad fd crashes turnip).
+                                // Validate the fd is live before handing it to the
+                                // driver (a bad fd crashes turnip). dma-buf fds
+                                // fstat as regular files (S_IFREG), NOT char
+                                // devices — reject only a failed fstat or a
+                                // directory.
                                 let mut st = unsafe { std::mem::zeroed::<libc::stat>() };
                                 let rc = unsafe { libc::fstat(fd.as_raw_fd(), &mut st) };
-                                if rc != 0 || st.st_mode & libc::S_IFMT != libc::S_IFCHR {
+                                if rc != 0 || st.st_mode & libc::S_IFMT == libc::S_IFDIR {
                                     warn!(
                                         slot = slot.slot, rc, mode = st.st_mode,
-                                        "slot fd is not a usable dma-buf; slot unavailable",
+                                        "slot fd is not usable; slot unavailable",
                                     );
                                     return Ok(Some(Message::Slot(slot)));
                                 }
