@@ -145,10 +145,15 @@ fn safe_mmap_len(fd: &impl AsRawFd, requested: usize) -> usize {
 ///   and is only valid for the call (see the CONTRACT note in `run_loop`).
 ///
 /// Verbatim copy host-tested in .omo/start-work/frame-loop-harness.
+///
+/// RENDER-DECOUPLE: the SHM pixel fd is handed to `on_frame` by ownership
+/// (no mmap here) — the recv thread enqueues it and the render thread does
+/// the mmap+copy. The fd is fstat-guarded for the expected size so a
+/// truncated frame is reported instead of SIGBUSing in the render thread.
 fn dispatch_frame(
     fm: &proto::FrameMessage,
     fds: Vec<OwnedFd>,
-    on_frame: &impl Fn(u64, u32, u32, u32, Option<OwnedFd>, &[u8]),
+    on_frame: &impl Fn(u64, u32, u32, u32, Option<OwnedFd>, Option<OwnedFd>),
 ) {
     let size = fm.width as usize * fm.height as usize * 4;
     let mut fds = fds;
@@ -157,14 +162,14 @@ fn dispatch_frame(
         // yields the fence in practice; plane fds (if any) are dropped below.
         if let Some(fence) = fds.pop() {
             drop(fds);
-            on_frame(fm.serial, fm.buffer_id, fm.width, fm.height, Some(fence), &[]);
+            on_frame(fm.serial, fm.buffer_id, fm.width, fm.height, Some(fence), None);
         } else {
-            on_frame(fm.serial, fm.buffer_id, fm.width, fm.height, None, &[]);
+            on_frame(fm.serial, fm.buffer_id, fm.width, fm.height, None, None);
         }
         return;
     }
     if fds.is_empty() {
-        on_frame(fm.serial, fm.buffer_id, fm.width, fm.height, None, &[]);
+        on_frame(fm.serial, fm.buffer_id, fm.width, fm.height, None, None);
         return;
     }
     let safe_len = safe_mmap_len(&fds[0], size);
@@ -173,7 +178,7 @@ fn dispatch_frame(
             "frame fd unusable (fstat failed or empty fd): requested={size}B; continuing with empty data"
         );
         drop(fds);
-        on_frame(fm.serial, fm.buffer_id, fm.width, fm.height, None, &[]);
+        on_frame(fm.serial, fm.buffer_id, fm.width, fm.height, None, None);
     } else {
         if safe_len < size {
             log::warn!(
@@ -181,29 +186,9 @@ fn dispatch_frame(
                 serial = fm.serial
             );
         }
-        let ptr = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                safe_len,
-                libc::PROT_READ,
-                libc::MAP_SHARED,
-                fds[0].as_raw_fd(),
-                0,
-            )
-        };
-        if ptr == libc::MAP_FAILED {
-            drop(fds);
-            on_frame(fm.serial, fm.buffer_id, fm.width, fm.height, None, &[]);
-        } else {
-            // SAFETY: ptr is a live, readable mapping of safe_len bytes
-            // (fstat-guarded); it stays alive through on_frame and is
-            // released right after the callback returns. on_frame must not
-            // retain the slice past the call (run_loop CONTRACT).
-            let slice = unsafe { std::slice::from_raw_parts(ptr as *const u8, safe_len) };
-            on_frame(fm.serial, fm.buffer_id, fm.width, fm.height, None, slice);
-            unsafe { libc::munmap(ptr, safe_len); }
-            drop(fds);
-        }
+        let pixel = fds.remove(0);
+        on_frame(fm.serial, fm.buffer_id, fm.width, fm.height, None, Some(pixel));
+        drop(fds);
     }
 }
 
@@ -288,7 +273,7 @@ impl AppSession {
         write_stream: UnixStream,
         slots: Vec<AhbSlot>,
         server_caps: Arc<std::sync::atomic::AtomicU32>,
-        on_frame: impl Fn(u64, u32, u32, u32, Option<OwnedFd>, &[u8]),
+        on_frame: impl Fn(u64, u32, u32, u32, Option<OwnedFd>, Option<OwnedFd>),
     ) -> io::Result<()> {
         dlog("land-native", "run_loop: entered");
         let mut reader = PendingReader::new(read_stream);

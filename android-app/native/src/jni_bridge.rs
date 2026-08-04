@@ -218,3 +218,46 @@ pub fn render_frame(serial: u64, width: u32, height: u32, pixel_data: &[u8]) -> 
     log::debug!("render_frame: serial={serial} {}x{}", width, height);
     Ok(())
 }
+
+/// RENDER-DECOUPLE: render a frame from its pixel fd (the recv thread enqueued
+/// the fd; this runs on the dedicated render thread). fstat-guarded mmap of
+/// the fd, then the same BGRX→BGRA row copy as `render_frame`, then munmap.
+pub fn render_frame_fd(
+    serial: u64,
+    width: u32,
+    height: u32,
+    pixel_fd: &std::os::fd::OwnedFd,
+) -> Result<(), String> {
+    use std::os::fd::AsRawFd;
+    let size = width as usize * height as usize * 4;
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(pixel_fd.as_raw_fd(), &mut st) } != 0 {
+        log::error!("render_frame_fd: fstat failed; dropping frame");
+        return Err("fstat failed".into());
+    }
+    let map_len = (st.st_size as usize).min(size);
+    if map_len == 0 {
+        log::warn!("render_frame_fd: empty fd; dropping frame");
+        return Err("empty fd".into());
+    }
+    let ptr = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            map_len,
+            libc::PROT_READ,
+            libc::MAP_SHARED,
+            pixel_fd.as_raw_fd(),
+            0,
+        )
+    };
+    if ptr == libc::MAP_FAILED {
+        log::error!("render_frame_fd: mmap failed; dropping frame");
+        return Err("mmap failed".into());
+    }
+    // SAFETY: ptr is a live readable mapping of map_len bytes (fstat-guarded).
+    let slice = unsafe { std::slice::from_raw_parts(ptr as *const u8, map_len) };
+    #[allow(deprecated)]
+    let result = render_frame(serial, width, height, slice);
+    unsafe { libc::munmap(ptr, map_len); }
+    result
+}

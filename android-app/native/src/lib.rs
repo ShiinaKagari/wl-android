@@ -25,12 +25,17 @@ pub enum AppState {
     Error = 3,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct FrameData {
     pub serial: u64,
     pub buffer_id: u32,
     pub width: u32,
     pub height: u32,
+    /// RENDER-DECOUPLE: dup'd pixel fd for the SHM path. The recv thread
+    /// enqueues the fd (ownership transfer) instead of rendering inline;
+    /// the dedicated render thread mmaps it, copies into the window and
+    /// drops it. None for fence frames (pixels already in the slot).
+    pub pixel_fd: Option<OwnedFd>,
 }
 
 type Handle = i64;
@@ -39,6 +44,11 @@ struct Inner {
     session: Option<AppSession>,
     render: RenderState,
     state: AppState,
+    /// RENDER-DECOUPLE: recv thread pushes frames here; the render thread
+    /// pops the NEWEST one (latest-wins) so at most two frames are ever in
+    /// flight — safe against the server's 3-buffer FrameCache rotation.
+    /// Wakeup goes through the process-global FRAME_CV (not a field, so the
+    /// render thread's wait never borrows through the mutex it parks on).
     frame_queue: VecDeque<FrameData>,
     /// Server capabilities from the handshake HELO (SERVER_CAP_*). The
     /// recv thread writes it on HELO; nativeSetSurface reads it to decide
@@ -53,6 +63,9 @@ struct Inner {
     /// session's write stream, guarded by its own mutex so UI-thread input
     /// never contends with the recv thread's Inner lock (frame bookkeeping).
     input_write: Mutex<Option<Arc<UnixStream>>>,
+    /// CONN-LOOP: set by nativeDestroy to stop the reconnect thread (it owns
+    /// an Arc of Inner and would otherwise retry forever).
+    stopped: std::sync::atomic::AtomicBool,
 }
 
 /// How many consecutive present failures trip the UBWC-suspicion gate.
@@ -64,6 +77,11 @@ static STATE_MAP: std::sync::LazyLock<Mutex<Vec<(Handle, StateRef)>>> =
     std::sync::LazyLock::new(|| Mutex::new(Vec::new()));
 
 static NEXT_ID: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(1);
+
+/// RENDER-DECOUPLE: global frame-ready condvar (shared by the recv thread's
+/// notify and the render thread's park). Kept OUT of Inner so the render
+/// thread's wait does not borrow through the same mutex it parks on.
+static FRAME_CV: std::sync::Condvar = std::sync::Condvar::new();
 
 fn register(state: StateRef) -> Handle {
     let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -105,87 +123,146 @@ extern "system" fn Java_com_wl_android_NativeBridge_nativeInit(
     };
     log::info!("nativeInit: connecting to {path}");
 
-    let (session, read_stream) = match AppSession::connect(&path) {
-        Ok(pair) => pair,
-        Err(e) => {
-            log::error!("nativeInit: connect failed: {e}");
-            let inner = Arc::new(Mutex::new(Inner {
-                session: None, render: RenderState::new(),
-                state: AppState::Error, frame_queue: VecDeque::new(),
-                server_caps: Arc::new(std::sync::atomic::AtomicU32::new(0)),
-                consecutive_present_failures: 0,
-                input_write: Mutex::new(None),
-            }));
-            return register(inner);
-        }
-    };
-
     let state = Arc::new(Mutex::new(Inner {
-        session: Some(session),
+        session: None,
         render: RenderState::new(),
         state: AppState::Init,
         frame_queue: VecDeque::new(),
         server_caps: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         consecutive_present_failures: 0,
         input_write: Mutex::new(None),
+        stopped: std::sync::atomic::AtomicBool::new(false),
     }));
 
     let handle = register(state.clone());
 
-    // PERF-13: publish the dedicated input write stream — a clone of the
-    // session's write end — so UI-thread Touch/Key sends never take the
-    // Inner lock that the recv thread holds for frame bookkeeping.
-    {
-        let inner = state.lock().unwrap();
-        if let Some(ws) = inner.session.as_ref().map(|s| s.write_stream.clone()) {
-            inner.input_write.lock().unwrap().replace(ws);
-        }
-    }
-
+    // CONN-LOOP: the recv thread owns the connection lifecycle. run_loop
+    // returns on any socket error (server restart, network blip); instead of
+    // dying and freezing the display, it reconnects and re-enters the loop.
+    // The write stream is re-published to `input_write` on every connect so
+    // UI-thread Touch/Key sends always target the live socket.
     let state_clone = state.clone();
     thread::spawn(move || {
-        log::info!("recv_thread: started");
-        let write_clone = {
-            let inner = state_clone.lock().unwrap();
-            let ws = inner.session.as_ref().unwrap().write_stream.as_ref();
-            ws.try_clone().expect("clone write stream")
-        };
-        state_clone.lock().unwrap().state = AppState::Handshake;
-
-        // Lanes 27/30: AhbSlots are built + registered in nativeSetSurface
-        // (the SurfaceView surface arrives AFTER this thread spawns, so run_loop
-        // can't build them here). run_loop receives an empty list: its startup
-        // registration warns and skips — the real TBUF+handle registration is
-        // performed by `register_swapchain_slots` once the surface arrives.
-        let caps = {
-            let inner = state_clone.lock().unwrap();
-            inner.server_caps.clone()
-        };
-        let result = AppSession::run_loop(read_stream, write_clone, Vec::new(), caps, move |serial, buffer_id, width, height, fence_fd: Option<OwnedFd>, pixel_data: &[u8]| {
-            log::info!("FRAME: serial={serial} {width}x{height} buf={buffer_id} data={}B fence={}", pixel_data.len(), if fence_fd.is_some() { "yes" } else { "no" });
-            if let Some(fence) = fence_fd {
-                // Fence path (F-12, lane 30): the server already blitted into
-                // swapchain slot buffer_id and shipped the sync_file fence
-                // (owned by this callback). Present under the Inner lock:
-                // import the fence as a wait semaphore → vkQueuePresentKHR →
-                // destroy the temp semaphore; fall back to a CPU poll of the
-                // fence when SYNC_FD import is unavailable or fails.
-                present_fence_frame(&state_clone, serial, buffer_id, &fence);
-            } else {
-                // Legacy SHM frame (pre-blit server): CPU copy fallback. Only
-                // reachable when the swapchain path isn't driving the frames.
-                #[allow(deprecated)]
-                let _ = crate::jni_bridge::render_frame(serial, width, height, pixel_data);
+        log::info!("recv_thread: started (connection loop)");
+        loop {
+            if state_clone.lock().unwrap().stopped.load(std::sync::atomic::Ordering::Relaxed) {
+                log::info!("recv_thread: stopped by destroy");
+                break;
             }
-            if let Ok(mut inner) = state_clone.lock() {
-                inner.state = AppState::Active;
-                inner.frame_queue.push_back(FrameData { serial, buffer_id, width, height });
+            match AppSession::connect(&path) {
+                Ok((session, read_stream)) => {
+                    // Publish session + input write stream atomically.
+                    {
+                        let mut inner = state_clone.lock().unwrap();
+                        inner.session = Some(session);
+                        if let Some(ws) = inner.session.as_ref().map(|s| s.write_stream.clone()) {
+                            inner.input_write.lock().unwrap().replace(ws);
+                        }
+                        inner.state = AppState::Handshake;
+                    }
+                    let caps = {
+                        let inner = state_clone.lock().unwrap();
+                        inner.server_caps.clone()
+                    };
+                    let on_frame_state = state_clone.clone();
+                    let result = AppSession::run_loop(
+                        read_stream,
+                        {
+                            let inner = state_clone.lock().unwrap();
+                            inner.session.as_ref().unwrap().write_stream.as_ref().try_clone()
+                                .expect("clone write stream")
+                        },
+                        Vec::new(),
+                        caps,
+                        move |serial, buffer_id, width, height, fence_fd: Option<OwnedFd>, pixel_fd: Option<OwnedFd>| {
+                            log::info!("FRAME: serial={serial} {width}x{height} buf={buffer_id} fence={} pixels={}", fence_fd.is_some(), pixel_fd.is_some());
+                            if let Some(fence) = fence_fd {
+                                // Fence path (F-12, lane 30): the server already blitted into
+                                // swapchain slot buffer_id and shipped the sync_file fence
+                                // (owned by this callback). Present under the Inner lock:
+                                // import the fence as a wait semaphore → vkQueuePresentKHR →
+                                // destroy the temp semaphore; fall back to a CPU poll of the
+                                // fence when SYNC_FD import is unavailable or fails.
+                                present_fence_frame(&on_frame_state, serial, buffer_id, &fence);
+                                if let Ok(mut inner) = on_frame_state.lock() {
+                                    inner.state = AppState::Active;
+                                    inner.frame_queue.push_back(FrameData { serial, buffer_id, width, height, pixel_fd: None });
+                                }
+                            } else {
+                                // RENDER-DECOUPLE: the pixel fd is enqueued
+                                // (latest-wins in the render thread); the recv
+                                // thread never touches ANativeWindow.
+                                if let Ok(mut inner) = on_frame_state.lock() {
+                                    inner.state = AppState::Active;
+                                    inner.frame_queue.push_back(FrameData { serial, buffer_id, width, height, pixel_fd });
+                                    crate::FRAME_CV.notify_one();
+                                }
+                            }
+                        },
+                    );
+                    match result {
+                        Ok(()) => log::info!("run_loop exited cleanly"),
+                        Err(ref e) => log::error!("run_loop failed: {e}"),
+                    }
+                }
+                Err(e) => {
+                    log::error!("connect failed: {e}");
+                }
             }
-        });
-        if let Err(ref e) = result {
-            log::error!("recv_thread: run_loop failed: {e}");
+            // Tear down the dead session so JNI sends drop their messages,
+            // then retry after a short backoff.
+            {
+                let mut inner = state_clone.lock().unwrap();
+                inner.session = None;
+                inner.input_write.lock().unwrap().take();
+                inner.state = AppState::Init;
+            }
+            log::info!("reconnecting in 1s...");
+            std::thread::sleep(std::time::Duration::from_millis(1000));
         }
     });
+
+    // RENDER-DECOUPLE: dedicated render thread. Parks on the condvar until a
+    // frame is queued, then renders the NEWEST queued frame (latest-wins:
+    // older queued fds are dropped — at most 2 frames in flight, safe against
+    // the server's 3-buffer FrameCache rotation). The recv thread never
+    // touches ANativeWindow, so a slow lock/copy can't stall frame intake.
+    {
+        let render_state = state.clone();
+        thread::spawn(move || {
+            log::info!("render_thread: started");
+            loop {
+                let frame = loop {
+                    let mut guard = render_state.lock().unwrap();
+                    if guard.stopped.load(std::sync::atomic::Ordering::Relaxed) {
+                        log::info!("render_thread: stopped by destroy");
+                        return;
+                    }
+                    match guard.frame_queue.pop_back() {
+                        Some(f) => {
+                            // latest-wins: drop every older queued frame now —
+                            // their pixel fds would otherwise leak and the
+                            // server's 3-buffer rotation would be overrun.
+                            guard.frame_queue.clear();
+                            break f;
+                        }
+                        None => {
+                            // Condvar::wait consumes the guard by value; the
+                            // re-lock below is the idiomatic park loop.
+                            guard = crate::FRAME_CV.wait(guard).unwrap();
+                        }
+                    }
+                };
+                if let Some(fd) = frame.pixel_fd {
+                    #[allow(deprecated)]
+                    let _ = crate::jni_bridge::render_frame_fd(
+                        frame.serial, frame.width, frame.height, &fd,
+                    );
+                }
+                // fence frames need no render-side work (present already ran)
+            }
+        });
+    }
     handle
 }
 
@@ -454,7 +531,7 @@ extern "system" fn Java_com_wl_android_NativeBridge_nativeOnKey(
 /// syscall: on SOCK_STREAM a single write is atomic, so this never interleaves
 /// with the recv thread's FACK writes on its own stream clone.
 fn send_input_message(state: &StateRef, msg: &wl_android_common::proto::Message) {
-    let Ok(mut inner) = state.lock() else { return };
+    let Ok(inner) = state.lock() else { return };
     let Some(ws) = inner.input_write.lock().unwrap().clone() else { return };
     let data = wl_android_common::proto::encode(msg);
     let mut buf = Vec::with_capacity(4 + data.len());
@@ -493,5 +570,8 @@ extern "system" fn Java_com_wl_android_NativeBridge_nativeDestroy(
     _env: JNIEnv, _class: JClass, handle: jlong,
 ) {
     log::info!("nativeDestroy handle={handle}");
+    if let Some(state) = find(handle) {
+        state.lock().unwrap().stopped.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
     remove(handle);
 }
