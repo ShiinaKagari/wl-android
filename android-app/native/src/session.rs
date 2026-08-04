@@ -201,6 +201,7 @@ impl AppSession {
         read_stream: UnixStream,
         write_stream: UnixStream,
         slots: Vec<AhbSlot>,
+        server_caps: Arc<std::sync::atomic::AtomicU32>,
         on_frame: impl Fn(u64, u32, u32, u32, Option<OwnedFd>, &[u8]),
     ) -> io::Result<()> {
         dlog("land-native", "run_loop: entered");
@@ -213,11 +214,13 @@ impl AppSession {
         let (data, _fds) = Self::recv_raw_with_fds(&mut rd, &mut buf)?;
         let msg = proto::decode(&data, vec![])
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-        if !matches!(msg, Message::Hello(_)) {
+        if let Message::Hello(helo) = msg {
+            server_caps.store(helo.server_caps, std::sync::atomic::Ordering::Relaxed);
+            dlog("land-native", "HELO received");
+            log::info!("HELO received (caps={:#x})", helo.server_caps);
+        } else {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "expected HELO"));
         }
-        dlog("land-native", "HELO received");
-        log::info!("HELO received");
 
         // 2. Send CONF
         let conf_data = proto::encode(&Message::Config(proto::ConfigMessage::new(3392, 2400, 144000, 289, 0)));

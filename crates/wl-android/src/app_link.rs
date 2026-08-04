@@ -60,7 +60,12 @@ impl AppSession {
 
     pub fn do_handshake(&mut self) -> io::Result<bool> {
         if !self.sent_helo {
-            let helo = HelloMessage::default();
+            let mut helo = HelloMessage::default();
+            if crate::state::shm_path_enabled() {
+                // LAND_MODE=shm: advertise the SHM fallback cap so the App skips
+                // Vulkan swapchain init (CPU lock + swapchain conflict).
+                helo.server_caps |= proto::SERVER_CAP_SHM;
+            }
             self.server_caps = helo.server_caps;
             self.transport.send(&Message::Hello(helo))?;
             info!("sent HELO (v{} caps={:#x})", PROTOCOL_VERSION, self.server_caps);

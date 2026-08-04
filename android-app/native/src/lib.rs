@@ -39,6 +39,10 @@ struct Inner {
     render: RenderState,
     state: AppState,
     frame_queue: VecDeque<FrameData>,
+    /// Server capabilities from the handshake HELO (SERVER_CAP_*). The
+    /// recv thread writes it on HELO; nativeSetSurface reads it to decide
+    /// whether to init the Vulkan swapchain (SERVER_CAP_SHM ⇒ pure CPU path).
+    server_caps: Arc<std::sync::atomic::AtomicU32>,
     /// App-side bring-up gate (V-33): consecutive `present` failures. When a
     /// streak reaches [`PRESENT_FAIL_GATE`] the frame loop logs a clear
     /// "UBWC import failure suspected" message (the actual pixel read-back is
@@ -103,6 +107,7 @@ extern "system" fn Java_com_wl_android_NativeBridge_nativeInit(
             let inner = Arc::new(Mutex::new(Inner {
                 session: None, render: RenderState::new(),
                 state: AppState::Error, frame_queue: VecDeque::new(),
+                server_caps: Arc::new(std::sync::atomic::AtomicU32::new(0)),
                 consecutive_present_failures: 0,
             }));
             return register(inner);
@@ -114,6 +119,7 @@ extern "system" fn Java_com_wl_android_NativeBridge_nativeInit(
         render: RenderState::new(),
         state: AppState::Init,
         frame_queue: VecDeque::new(),
+        server_caps: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         consecutive_present_failures: 0,
     }));
 
@@ -134,7 +140,11 @@ extern "system" fn Java_com_wl_android_NativeBridge_nativeInit(
         // can't build them here). run_loop receives an empty list: its startup
         // registration warns and skips — the real TBUF+handle registration is
         // performed by `register_swapchain_slots` once the surface arrives.
-        let result = AppSession::run_loop(read_stream, write_clone, Vec::new(), move |serial, buffer_id, width, height, fence_fd: Option<OwnedFd>, pixel_data: &[u8]| {
+        let caps = {
+            let inner = state_clone.lock().unwrap();
+            inner.server_caps.clone()
+        };
+        let result = AppSession::run_loop(read_stream, write_clone, Vec::new(), caps, move |serial, buffer_id, width, height, fence_fd: Option<OwnedFd>, pixel_data: &[u8]| {
             log::info!("FRAME: serial={serial} {width}x{height} buf={buffer_id} data={}B fence={}", pixel_data.len(), if fence_fd.is_some() { "yes" } else { "no" });
             if let Some(fence) = fence_fd {
                 // Fence path (F-12, lane 30): the server already blitted into
@@ -183,6 +193,16 @@ extern "system" fn Java_com_wl_android_NativeBridge_nativeSetSurface(
         return;
     };
     let mut inner = state.lock().unwrap();
+
+    // LAND_MODE=shm fallback: the server advertises SERVER_CAP_SHM, frames
+    // carry pixel fds (no fence), and the App presents via the CPU path. Do
+    // NOT init the Vulkan swapchain — ANativeWindow_lock + a live Vulkan
+    // swapchain on the same window conflict (lock returns -22).
+    let caps = inner.server_caps.load(std::sync::atomic::Ordering::Relaxed);
+    if caps & wl_android_common::proto::SERVER_CAP_SHM != 0 {
+        log::info!("nativeSetSurface: SERVER_CAP_SHM — CPU presentation path (no Vulkan swapchain)");
+        return;
+    }
 
     if inner.render.initialized {
         log::warn!(

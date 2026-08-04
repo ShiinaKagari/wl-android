@@ -27,6 +27,11 @@ pub const PROTOCOL_VERSION: u32 = 2;
 // =============================================================================
 
 pub const SERVER_CAP_BLIT: u32 = 1 << 0;
+/// Server is in SHM/CPU fallback mode (LAND_MODE=shm): frames carry pixel
+/// fds (no fence), the App presents via the CPU path and must NOT init the
+/// Vulkan swapchain (CPU lock + Vulkan swapchain on one ANativeWindow
+/// conflict — ANativeWindow_lock returns -22).
+pub const SERVER_CAP_SHM: u32 = 1 << 1;
 pub const SERVER_CAP_FENCE: u32 = 1 << 1;
 
 pub const APP_CAP_DIRECT_IMPORT: u32 = 1 << 0;
