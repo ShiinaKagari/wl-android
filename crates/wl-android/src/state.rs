@@ -282,6 +282,9 @@ pub struct WlState {
     pub blit_engine: BlitEngine,
     pub app_session: Option<AppSession>,
     pub land_listener: Option<UnixListener>,
+    /// calloop source for the App session's land socket fd (event-driven
+    /// input). Replaced on App reconnect; None when no App is connected.
+    pub land_source: Option<calloop::RegistrationToken>,
     pub clock_epoch: std::time::Instant,
     pub screen_width: u32,
     pub screen_height: u32,
@@ -377,7 +380,7 @@ impl WlState {
             fractional_scale_state, presentation_state,
             xdg_shell_state, output_state, frame_router, frame_cache: None, blit_engine,
             dmabuf_state,
-            app_session: None, land_listener: None,
+            app_session: None, land_listener: None, land_source: None,
             clock_epoch: std::time::Instant::now(),
             screen_width: w, screen_height: h, refresh_millihz: refresh, dpi,
             output, toplevel: None, seat_state, seat, touch_injector,

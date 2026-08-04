@@ -4,15 +4,16 @@ mod ahb;
 mod jni_bridge;
 
 use std::collections::VecDeque;
+use std::io::Write;
 use std::os::fd::OwnedFd;
+use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use jni::objects::{JClass, JString, JObject};
-use jni::sys::{jfloat, jint, jlong, jobject};
+use jni::objects::{JClass, JString};
+use jni::sys::{jfloat, jint, jlong};
 use jni::JNIEnv;
 
-use crate::ahb::AhbSlot;
 use crate::session::AppSession;
 use crate::render::RenderState;
 
@@ -48,6 +49,10 @@ struct Inner {
     /// "UBWC import failure suspected" message (the actual pixel read-back is
     /// the server doctor's `import_ubwc_test`, lane 32).
     consecutive_present_failures: u32,
+    /// PERF-13: dedicated write path for input (Touch/Key) — a clone of the
+    /// session's write stream, guarded by its own mutex so UI-thread input
+    /// never contends with the recv thread's Inner lock (frame bookkeeping).
+    input_write: Mutex<Option<Arc<UnixStream>>>,
 }
 
 /// How many consecutive present failures trip the UBWC-suspicion gate.
@@ -109,6 +114,7 @@ extern "system" fn Java_com_wl_android_NativeBridge_nativeInit(
                 state: AppState::Error, frame_queue: VecDeque::new(),
                 server_caps: Arc::new(std::sync::atomic::AtomicU32::new(0)),
                 consecutive_present_failures: 0,
+                input_write: Mutex::new(None),
             }));
             return register(inner);
         }
@@ -121,9 +127,20 @@ extern "system" fn Java_com_wl_android_NativeBridge_nativeInit(
         frame_queue: VecDeque::new(),
         server_caps: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         consecutive_present_failures: 0,
+        input_write: Mutex::new(None),
     }));
 
     let handle = register(state.clone());
+
+    // PERF-13: publish the dedicated input write stream — a clone of the
+    // session's write end — so UI-thread Touch/Key sends never take the
+    // Inner lock that the recv thread holds for frame bookkeeping.
+    {
+        let inner = state.lock().unwrap();
+        if let Some(ws) = inner.session.as_ref().map(|s| s.write_stream.clone()) {
+            inner.input_write.lock().unwrap().replace(ws);
+        }
+    }
 
     let state_clone = state.clone();
     thread::spawn(move || {
@@ -408,15 +425,11 @@ extern "system" fn Java_com_wl_android_NativeBridge_nativeOnTouch(
     _env: JNIEnv, _class: JClass, handle: jlong,
     touch_id: jint, x: jfloat, y: jfloat, phase: jint, time_ms: jint,
 ) {
-    if let Some(state) = find(handle) {
-        let mut inner = state.lock().unwrap();
-        if let Some(ref mut session) = inner.session {
-            let msg = wl_android_common::proto::TouchMessage::new(
-                touch_id, x, y, phase as u32, time_ms as u32,
-            );
-            let _ = session.send_message(&wl_android_common::proto::Message::Touch(msg));
-        }
-    }
+    let Some(state) = find(handle) else { return };
+    let msg = wl_android_common::proto::TouchMessage::new(
+        touch_id, x, y, phase as u32, time_ms as u32,
+    );
+    send_input_message(&state, &wl_android_common::proto::Message::Touch(msg));
 }
 
 #[unsafe(no_mangle)]
@@ -424,15 +437,34 @@ extern "system" fn Java_com_wl_android_NativeBridge_nativeOnKey(
     _env: JNIEnv, _class: JClass, handle: jlong,
     keycode: jint, state: jint, time_ms: jint,
 ) {
-    if let Some(state_ref) = find(handle) {
-        let mut inner = state_ref.lock().unwrap();
-        if let Some(ref mut session) = inner.session {
-            let msg = wl_android_common::proto::KeyMessage::new(
-                keycode as u32, state as u32, time_ms as u32,
-            );
-            let _ = session.send_message(&wl_android_common::proto::Message::Key(msg));
-        }
-    }
+    let Some(state_ref) = find(handle) else { return };
+    let msg = wl_android_common::proto::KeyMessage::new(
+        keycode as u32, state as u32, time_ms as u32,
+    );
+    send_input_message(&state_ref, &wl_android_common::proto::Message::Key(msg));
+}
+
+/// PERF-13: send an input message over the dedicated input write stream —
+/// only the tiny `input_write` mutex is taken (a clone of the session's write
+/// end), never the Inner lock that the recv thread holds for frame handling.
+/// Drops the message when no session is connected (session: None or stream
+/// absent) — same observable behavior as the previous Inner-locked path.
+///
+/// The whole message (length prefix + payload) is written in ONE write()
+/// syscall: on SOCK_STREAM a single write is atomic, so this never interleaves
+/// with the recv thread's FACK writes on its own stream clone.
+fn send_input_message(state: &StateRef, msg: &wl_android_common::proto::Message) {
+    let Ok(mut inner) = state.lock() else { return };
+    let Some(ws) = inner.input_write.lock().unwrap().clone() else { return };
+    let data = wl_android_common::proto::encode(msg);
+    let mut buf = Vec::with_capacity(4 + data.len());
+    buf.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    buf.extend_from_slice(&data);
+    // Single write() call: on SOCK_STREAM the kernel treats one write as an
+    // atomic unit, so the message can never interleave with the recv thread's
+    // FACK writes on its own stream clone. The message is ~40B and the socket
+    // buffer is ≥64KiB, so the write completes in one call in practice.
+    let _ = ws.as_ref().write(&buf);
 }
 
 #[unsafe(no_mangle)]

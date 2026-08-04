@@ -1,7 +1,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use calloop::EventLoop;
+use calloop::generic::Generic;
+use calloop::{EventLoop, Interest, Mode};
 use smithay::wayland::socket::ListeningSocketSource;
 use tracing::{error, info, warn};
 
@@ -110,6 +111,8 @@ fn run_server() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    let event_handle = event_loop.handle();
+
     event_loop.run(Some(Duration::from_millis(16)), &mut state, |state| {
         // Dispatch pending Wayland client messages
         state.dispatch_wayland();
@@ -122,7 +125,7 @@ fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                 match listener.accept() {
                     Ok((stream, _)) => {
                         info!("App connected");
-                        if let Ok(transport) = Transport::new(stream) {
+                        if let Ok(transport) = Transport::new(stream.try_clone().expect("clone land stream")) {
                             if state.app_session.is_some() {
                                 // C-01: replacing the old session — release its slots.
                                 state.clear_blit_pipeline_state();
@@ -131,11 +134,62 @@ fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                                     crate::frame_router::RouterEvent::AppLost,
                                 );
                                 dispatch_router_actions(state, &connect_actions);
+                                // The old session's land source is removed by
+                                // dropping the source handle below (replace).
+                                if let Some(old_token) = state.land_source.take() {
+                                    event_handle.remove(old_token);
+                                }
                             }
                             state.app_session = Some(AppSession::new(transport));
                             connect_actions = state.frame_router.handle(
                                 crate::frame_router::RouterEvent::AppConnected,
                             );
+
+                            // PERF-13: register the land socket fd as an
+                            // event-driven source — App input (Touch/Key/Config/
+                            // Ack/Ready) wakes the loop immediately, independent
+                            // of the 16ms tick and of KWin frame processing.
+                            // The callback owns the session drain: it runs
+                            // handle_land_input once per readable fd state, and
+                            // returns Remove on session teardown so calloop
+                            // unregisters the source (the token is dropped too).
+                            let fd_clone = stream.try_clone().expect("clone land fd for source");
+                            let source = Generic::new(
+                                fd_clone,
+                                Interest::READ,
+                                Mode::Level,
+                            );
+                            let cb = |_readiness, _fd: &mut _, state: &mut WlState| -> std::io::Result<calloop::PostAction> {
+                                let lost = handle_land_input(state);
+                                if lost {
+                                    // C-02: blit mode — close all slot fds and
+                                    // destroy the VkImages.
+                                    state.clear_blit_pipeline_state();
+                                    state.blit_engine.clear_slots();
+                                    let actions = state.frame_router.handle(
+                                        crate::frame_router::RouterEvent::AppLost,
+                                    );
+                                    dispatch_router_actions(state, &actions);
+                                    state.app_session = None;
+                                    Ok(calloop::PostAction::Remove)
+                                } else {
+                                    Ok(calloop::PostAction::Continue)
+                                }
+                            };
+                            match event_handle.insert_source(source, cb) {
+                                Ok(token) => {
+                                    state.land_source = Some(token);
+                                    // Handshake is driven by the source's
+                                    // readiness (the App's HELO arrives right
+                                    // after connect); kick it here too so the
+                                    // first message is consumed even if the
+                                    // fd event raced ahead of insert_source.
+                                    let _ = handle_land_input(state);
+                                }
+                                Err(e) => {
+                                    error!(err = %e, "failed to register land source");
+                                }
+                            }
                         }
                     }
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
@@ -148,140 +202,6 @@ fn run_server() -> Result<(), Box<dyn std::error::Error>> {
         }
         state.land_listener = listener_opt;
         dispatch_router_actions(state, &connect_actions);
-
-        // ── Poll app session ──
-        let lost = if let Some(session) = &mut state.app_session {
-            match session.mode() {
-                SessionMode::Handshake => match session.do_handshake() {
-                    Ok(true) => {
-                        info!("handshake complete, mode={:?}", session.mode());
-                        // 握手完成后，把缓存的当前帧发给新客户端，避免黑屏。
-                        // H-04: blit waits for SLOT_COUNT TBUFs — only direct mode
-                        // (Active immediately) replays here; blit replays on activation.
-                        if session.mode() == SessionMode::Active
-                            && let Some(cache) = &state.frame_cache
-                            && let Some((fd, seq, cw, ch)) = cache.current_frame()
-                        {
-                            let _ = session.send_frame(
-                                seq, 0, state.screen_width, state.screen_height,
-                                cw, ch, Some(fd), None,
-                            );
-                        }
-                        false
-                    }
-                    Ok(false) => false,
-                    Err(e) => {
-                        warn!(err = %e, "handshake failed");
-                        true
-                    }
-                },
-                SessionMode::SlotRegistration => {
-                    // Wait for TBUF slot messages (H-04: SLOT_COUNT before frames)
-                    match session.recv_message(&mut state.blit_engine) {
-                        Ok(Some(Message::Slot(slot))) => {
-                            // Already counted in recv_message. F-14: registration
-                            // itself marks the slot ready for the FIRST blit — the
-                            // App cannot BRDY a slot it has not yet presented a
-                            // frame from, so without this implicit grant the first
-                            // frame would deadlock (server waits for BRDY, App
-                            // waits for a frame to present before BRDYing).
-                            // (Direct field borrow, not handle_brdy: `session` is
-                            // still live here, so a &mut self call cannot borrow.)
-                            state.brdy_ready.mark_ready(slot.slot);
-                            info!(count = session.slot_count(), "slot registered");
-                            // Check if all slots are registered
-                            if session.slot_count() >= proto::SLOT_COUNT as u32 {
-                                info!("all slots registered, activating");
-                                session.activate();
-                                // H-04: blit is now Active — replay the latest cached
-                                // frame so the App is not black until the next commit.
-                                if let Some(cache) = &state.frame_cache
-                                    && let Some((fd, seq, cw, ch)) = cache.current_frame()
-                                {
-                                    let _ = session.send_frame(
-                                        seq, 0, state.screen_width, state.screen_height,
-                                        cw, ch, Some(fd), None,
-                                    );
-                                }
-                            }
-                            false
-                        }
-                        Ok(None) => false,
-                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => false,
-                        Err(e) => {
-                            warn!(err = %e, "slot registration read error");
-                            true
-                        }
-                        _ => false,
-                    }
-                }
-                SessionMode::Active => {
-                    match session.recv_message(&mut state.blit_engine) {
-                        Ok(Some(msg)) => match msg {
-                            wl_android_common::proto::Message::Ack(ack) => {
-                                // F-11: freed slots (fences destroyed) before
-                                // dispatch — an unblocked frame may immediately
-                                // reuse a slot this ack just released.
-                                let freed = crate::state::free_slots_on_ack(
-                                    &mut state.slots_in_use, ack.serial,
-                                );
-                                for (slot, fence) in freed {
-                                    state.blit_engine.destroy_fence_handle(fence);
-                                    tracing::info!(slot, ack = ack.serial, "slot freed by cum-ack");
-                                }
-                                let actions = state.frame_router.handle(
-                                    crate::frame_router::RouterEvent::AppAck {
-                                        serial: ack.serial,
-                                    },
-                                );
-                                dispatch_router_actions(state, &actions);
-                                false
-                            }
-                            wl_android_common::proto::Message::Touch(tm) => {
-                                state.handle_touch(&tm);
-                                false
-                            }
-                            wl_android_common::proto::Message::Key(km) => {
-                                state.handle_key(&km);
-                                false
-                            }
-                            wl_android_common::proto::Message::Config(conf) => {
-                                state.apply_config(
-                                    conf.width, conf.height,
-                                    conf.refresh_millihz, conf.dpi,
-                                );
-                                false
-                            }
-                            wl_android_common::proto::Message::Ready(rdy) => {
-                                // F-14: App presented the slot's previous fence
-                                // frame and releases it for reuse — the slot
-                                // becomes eligible for the next blit.
-                                state.handle_brdy(rdy.slot);
-                                false
-                            }
-                            _ => false,
-                        },
-                        Ok(None) => false,
-                        Err(e) => {
-                            warn!(err = %e, "session read error");
-                            true
-                        }
-                    }
-                }
-            }
-        } else {
-            false
-        };
-        if lost {
-            // C-02: blit mode — close all slot fds and destroy the VkImages.
-            state.clear_blit_pipeline_state();
-            state.blit_engine.clear_slots();
-            let actions = state.frame_router.handle(
-                crate::frame_router::RouterEvent::AppLost,
-            );
-            dispatch_router_actions(state, &actions);
-            state.app_session = None;
-        }
     })?;
 
     // Cleanup on exit
@@ -290,6 +210,137 @@ fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     std::fs::remove_file(&land_socket_path).ok();
 
     Ok(())
+}
+
+/// Drain one App land-socket message (handshake / slot registration / active
+/// input) and apply it to the compositor state. Returns true when the session
+/// must be torn down (protocol error or disconnect).
+///
+/// Event-driven (PERF-13): called from the Generic land source readiness
+/// check inside the event loop, so App input is handled as soon as the fd is
+/// readable — not on the 16ms poll tick and not behind KWin frame processing.
+fn handle_land_input(state: &mut WlState) -> bool {
+    let Some(session) = &mut state.app_session else {
+        return false;
+    };
+    match session.mode() {
+        SessionMode::Handshake => match session.do_handshake() {
+            Ok(true) => {
+                info!("handshake complete, mode={:?}", session.mode());
+                // 握手完成后，把缓存的当前帧发给新客户端，避免黑屏。
+                // H-04: blit waits for SLOT_COUNT TBUFs — only direct mode
+                // (Active immediately) replays here; blit replays on activation.
+                if session.mode() == SessionMode::Active
+                    && let Some(cache) = &state.frame_cache
+                    && let Some((fd, seq, cw, ch)) = cache.current_frame()
+                {
+                    let _ = session.send_frame(
+                        seq, 0, state.screen_width, state.screen_height,
+                        cw, ch, Some(fd), None,
+                    );
+                }
+                false
+            }
+            Ok(false) => false,
+            Err(e) => {
+                warn!(err = %e, "handshake failed");
+                true
+            }
+        },
+        SessionMode::SlotRegistration => {
+            // Wait for TBUF slot messages (H-04: SLOT_COUNT before frames)
+            match session.recv_message(&mut state.blit_engine) {
+                Ok(Some(Message::Slot(slot))) => {
+                    // Already counted in recv_message. F-14: registration
+                    // itself marks the slot ready for the FIRST blit — the
+                    // App cannot BRDY a slot it has not yet presented a
+                    // frame from, so without this implicit grant the first
+                    // frame would deadlock (server waits for BRDY, App
+                    // waits for a frame to present before BRDYing).
+                    // (Direct field borrow, not handle_brdy: `session` is
+                    // still live here, so a &mut self call cannot borrow.)
+                    state.brdy_ready.mark_ready(slot.slot);
+                    info!(count = session.slot_count(), "slot registered");
+                    // Check if all slots are registered
+                    if session.slot_count() >= proto::SLOT_COUNT as u32 {
+                        info!("all slots registered, activating");
+                        session.activate();
+                        // H-04: blit is now Active — replay the latest cached
+                        // frame so the App is not black until the next commit.
+                        if let Some(cache) = &state.frame_cache
+                            && let Some((fd, seq, cw, ch)) = cache.current_frame()
+                        {
+                            let _ = session.send_frame(
+                                seq, 0, state.screen_width, state.screen_height,
+                                cw, ch, Some(fd), None,
+                            );
+                        }
+                    }
+                    false
+                }
+                Ok(None) => false,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => false,
+                Err(e) => {
+                    warn!(err = %e, "slot registration read error");
+                    true
+                }
+                _ => false,
+            }
+        }
+        SessionMode::Active => {
+            match session.recv_message(&mut state.blit_engine) {
+                Ok(Some(msg)) => match msg {
+                    wl_android_common::proto::Message::Ack(ack) => {
+                        // F-11: freed slots (fences destroyed) before
+                        // dispatch — an unblocked frame may immediately
+                        // reuse a slot this ack just released.
+                        let freed = crate::state::free_slots_on_ack(
+                            &mut state.slots_in_use, ack.serial,
+                        );
+                        for (slot, fence) in freed {
+                            state.blit_engine.destroy_fence_handle(fence);
+                            tracing::info!(slot, ack = ack.serial, "slot freed by cum-ack");
+                        }
+                        let actions = state.frame_router.handle(
+                            crate::frame_router::RouterEvent::AppAck {
+                                serial: ack.serial,
+                            },
+                        );
+                        dispatch_router_actions(state, &actions);
+                        false
+                    }
+                    wl_android_common::proto::Message::Touch(tm) => {
+                        state.handle_touch(&tm);
+                        false
+                    }
+                    wl_android_common::proto::Message::Key(km) => {
+                        state.handle_key(&km);
+                        false
+                    }
+                    wl_android_common::proto::Message::Config(conf) => {
+                        state.apply_config(
+                            conf.width, conf.height,
+                            conf.refresh_millihz, conf.dpi,
+                        );
+                        false
+                    }
+                    wl_android_common::proto::Message::Ready(rdy) => {
+                        // F-14: App presented the slot's previous fence
+                        // frame and releases it for reuse — the slot
+                        // becomes eligible for the next blit.
+                        state.handle_brdy(rdy.slot);
+                        false
+                    }
+                    _ => false,
+                },
+                Ok(None) => false,
+                Err(e) => {
+                    warn!(err = %e, "session read error");
+                    true
+                }
+            }
+        }
+    }
 }
 
 fn dispatch_router_actions(
