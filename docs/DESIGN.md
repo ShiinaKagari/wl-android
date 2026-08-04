@@ -1,6 +1,6 @@
 # DESIGN.md — wl-android 详细设计
 
-> 状态：v1 冻结稿。协议与状态机的任何修改必须先改本文件（含规则编号），再改代码。
+> 状态：v2 稿（swapchain 拉式解耦）。协议与状态机的任何修改必须先改本文件（含规则编号），再改代码。
 > 规则编号约定：`P-xx` 协议、`H-xx` 握手、`F-xx` fd/buffer 生命周期、`C-xx` 连接、
 > `T-xx` 触摸、`O-xx` 输出/动态配置、`X-xx` 可测性、`V-xx` 真机验收。测试用例必须在名称或注释中
 > 引用其验证的规则编号。
@@ -14,7 +14,8 @@
 │  KWin (startplasma-wayland, WAYLAND_DISPLAY=land-0)         │
 │    │ 标准 Wayland 协议 (xdg_shell / dmabuf v4 / seat / ...) │
 │    ▼                                                        │
-│  wl-android  ← Smithay 实现的最小合成器 (透明中间层)          │
+│  wl-android ← Smithay 最小合成器 (透明中间层)               │
+│    │  turnip blit + SYNC_FD 栅栏导出 (F-12/F-13)            │
 │    │ land.sock: 二进制协议 + SCM_RIGHTS                     │
 └────┼────────────────────────────────────────────────────────┘
      │ Droidspaces bind mount:
@@ -22,11 +23,12 @@
 ┌────┼────────────────────────────────────────────────────────┐
 │    ▼                                                        │
 │  wl-android-app (Kotlin UI + Rust JNI)                      │
-│    dmabuf 导入(直接模式) 或 AHB 池(blit 模式) → Vulkan →     │
-│    SurfaceView；MotionEvent → TouchMessage；                 │
+│    Vulkan swapchain 呈现（v2 主路径）；AHB slot 池 =        │
+│    swapchain 图像；BRDY 拉式节奏                            │
+│    SurfaceView；MotionEvent → TouchMessage；                │
 │    DisplayListener → ConfigMessage                          │
-│  Magisk 模块: 目录 + sepolicy（仅配置，无逻辑）              │
-└── Android 宿主机 (一加平板 3, 8 Elite) ──────────────────────┘
+│  Magisk 模块: 目录 + sepolicy（仅配置，无逻辑）             │
+└── Android 宿主机 (一加平板 3, 8 Elite) ──────────────────────
 ```
 
 角色约定：**wl-android 是 land.sock 的 listener**（容器内 root 绑定
@@ -49,8 +51,21 @@
 
 ## 3. 传输层
 
-- **P-01** 传输为 `AF_UNIX` + **`SOCK_SEQPACKET`**：内核保证消息边界，一条消息 = 一次
-  `sendmsg`/`recvmsg`；fd 经 `SCM_RIGHTS` 随所属消息一并到达。
+- **P-01** 传输为 `AF_UNIX` + **`SOCK_STREAM`** + u32 小端长度前缀：每条消息 = 4 字节
+  长度 + 载荷；fd 经 `SCM_RIGHTS` 随所属消息一并发送。SOCK_STREAM 不保证消息边界，
+  由传输层的**读前瞻 pending 缓冲**补偿（`Transport { pending: Vec<u8>,
+  pending_fds: Vec<OwnedFd> }`，crates/wl-android/src/transport.rs）——消息可合并、
+  尾部字节与 fd 不丢，见 P-18/P-19。
+- **P-18** 消息可在同一 `recvmsg` 内合并：`recv()` 优先从 `pending` 缓冲消费完整消息，
+  仅当缓冲中无完整消息时才发起新 `recvmsg`；一次读取的超量尾部字节与其 fd 保留在
+  `pending`/`pending_fds` 中供下一条消息使用，**绝不静默丢弃**。真机修复：App 背靠背
+  发送 [TBUF][native_handle] 时两者合并进一次 `recvmsg`，旧实现只消费 TBUF、丢掉了
+  handle 字节与其 fd → 断连。
+- **P-19** fd 顺序规则（FD-ORDERING）：SCM_RIGHTS 的 fd 按发送字节序随消息到达；消费
+  长度前缀消息时按消息声明的 fd 数取用（`msg_fd_count`：FRAME_CARRIES_FDS 的
+  num_planes 个 + FRAME_CARRIES_FENCE 的 1 个），多出的 fd 留在 `pending_fds`，属于
+  后续的原始块（native_handle，P-13）。[TBUF(0 fd) + native_handle(n fd)] 合并场景下
+  handle 的 fd 完整保留。
 - **P-02** 所有多字节字段为**小端序**（两端均为 aarch64 LE；测试端 x86_64 亦 LE）。
 - **P-03** 所有消息结构 `#[repr(C)]`、显式 padding、无隐式对齐洞；以 zerocopy
   `FromBytes/IntoBytes/Immutable/KnownLayout` derive 编解码，禁止手写 `transmute`。
@@ -58,10 +73,10 @@
   代码中常量定义为 `u32::from_le_bytes(*b"CONF")`。
 - **P-05** 收到未知 magic / 长度不符的消息：记录日志并**断开连接**（协议错误不可恢复）。
 - **P-06** 单会话内消息按 socket 顺序处理，无乱序语义。
-- **P-07** 协议版本 v1 要求两端**严格相等**；不匹配即断开（见 H-03）。字段演进规则：
+- **P-07** 协议版本 v2 要求两端**严格相等**；不匹配即断开（见 H-03）。字段演进规则：
   只追加不重排、不改语义；新能力走 caps 位；不兼容改动必须升 version。
 
-## 4. 消息定义（wire format v1）
+## 4. 消息定义（wire format v2）
 
 消息一览：
 
@@ -69,19 +84,21 @@
 |-------|------|------|---------|------|
 | `HELO` | Hello | server → App | 无 | 16 B |
 | `CONF` | Config | App → server | 无 | 32 B |
-| `LAND` | Frame | server → App | 首现时 num_planes 个 | 80 B |
+| `LAND` | Frame | server → App | 首现时 num_planes 个；FRAME_CARRIES_FENCE 置位时另加 1 个 fence fd | 80 B |
 | `FACK` | FrameAck | App → server | 无 | 16 B |
 | `TBUF` | SlotBuffer | App → server | 无（fd 走后续 native_handle 流，见 P-13） | 64 B |
 | `BGON` | BufferGone | server → App | 无 | 16 B |
 | `TOUC` | Touch | App → server | 无 | 24 B |
+| `KEYM` | Key | App → server | 无 | 16 B |
+| `BRDY` | BufferReady | App → server | 无 | 16 B |
 
 ### 4.1 Hello（server → App，连接建立后服务端首发）
 
 | 偏移 | 字段 | 类型 | 说明 |
 |------|------|------|------|
 | 0 | magic | u32 | `b"HELO"` |
-| 4 | protocol_version | u32 | = 1 |
-| 8 | server_caps | u32 | bit0 `SERVER_CAP_BLIT`：blit fallback 可用 |
+| 4 | protocol_version | u32 | = 2 |
+| 8 | server_caps | u32 | bit0 `SERVER_CAP_BLIT`：blit fallback 可用；bit1 `SERVER_CAP_FENCE`：server 支持 sync_file 栅栏同步 |
 | 12 | _reserved | u32 | = 0 |
 
 ### 4.2 Config（App → server，握手时 + 屏幕变化时）
@@ -89,12 +106,12 @@
 | 偏移 | 字段 | 类型 | 说明 |
 |------|------|------|------|
 | 0 | magic | u32 | `b"CONF"` |
-| 4 | protocol_version | u32 | = 1 |
+| 4 | protocol_version | u32 | = 2 |
 | 8 | width | u32 | 像素，App 渲染 surface 实际尺寸 |
 | 12 | height | u32 | 像素 |
 | 16 | refresh_millihz | u32 | 毫赫兹（与 `wl_output.mode` 单位一致），如 144000 |
 | 20 | dpi | u32 | `densityDpi` |
-| 24 | app_caps | u32 | bit0 `APP_CAP_DIRECT_IMPORT`：宿主驱动支持 dmabuf 直接导入 |
+| 24 | app_caps | u32 | bit0 `APP_CAP_DIRECT_IMPORT`：宿主驱动支持 dmabuf 直接导入；bit1 `APP_CAP_SWAPCHAIN`：App 走 Vulkan swapchain 呈现 |
 | 28 | _reserved | u32 | = 0 |
 
 ### 4.3 Frame（server → App）
@@ -108,12 +125,13 @@
 | 24 | width | u32 | |
 | 28 | height | u32 | |
 | 32 | drm_format | u32 | `DRM_FORMAT_*` fourcc |
-| 36 | flags | u32 | bit0 `FRAME_CARRIES_FDS`：本消息伴随 num_planes 个 fd（该 buffer_id 首次出现） |
+| 36 | flags | u32 | bit0 `FRAME_CARRIES_FDS`：本消息伴随 num_planes 个 fd（该 buffer_id 首次出现）；bit1 `FRAME_CARRIES_FENCE`：另伴随 1 个 fence fd（server blit 完成栅栏，sync_file） |
 | 40 | buffer_id | u32 | 稳定缓冲区标识；blit 模式 = slot 号 |
 | 44 | _reserved | u32 | = 0 |
 | 48 | planes[4] | {offset u32, stride u32} ×4 | 未用平面填 0 |
 
 - **P-08** `FRAME_CARRIES_FDS` 置位 ⇔ 消息伴随恰好 `num_planes` 个 fd（按平面序）。
+- **P-08b** `FRAME_CARRIES_FENCE` 置位 ⇔ 伴随恰好 1 个 fence fd（与 FRAME_CARRIES_FDS 的 num_planes 个 fd 可共存）。
 - **P-09** 同一 buffer_id 的复用帧（flags=0）其几何/格式/布局字段必须与注册时一致，
   App 校验不一致即视为协议错误（P-05）。
 - **P-10** 新会话开始时服务端清空"已注册"状态：所有 buffer_id 在该会话首现时必带 fd。
@@ -176,6 +194,25 @@
   pointer 后必须发送 FRAME。
 - **T-03** CANCEL 注入 `wl_touch.cancel`。
 
+### 4.8 KeyMessage（App → server，16 B）
+
+| 偏移 | 字段 | 类型 | 说明 |
+|------|------|------|------|
+| 0 | magic | u32 | `b"KEYM"` |
+| 4 | keycode | u32 | evdev scancode（`KeyEvent.getScanCode()`） |
+| 8 | state | u32 | 0=release 1=press |
+| 12 | time_ms | u32 | `KeyEvent.eventTime` 低 32 位 |
+
+- **T-04** 键盘消息按 evdev scancode 注入 `wl_keyboard`；keymap 由 xkbcommon 生成（v2 起，ADR #17）。
+
+### 4.9 BufferReady（App → server，16 B）
+
+| 偏移 | 字段 | 类型 | 说明 |
+|------|------|------|------|
+| 0 | magic | u32 | `b"BRDY"` |
+| 4 | slot | u32 | 0..SLOT_COUNT-1，宣告该 slot 可写 |
+| 8 | _reserved | u64 | = 0 |
+
 ---
 
 ## 5. 握手与模式选择
@@ -185,10 +222,12 @@
 - **H-03** 版本不匹配：App 侧展示明确错误并断开；服务端收到版本不匹配的 Config
   也断开并记日志。
 - **H-04** 模式选择（服务端执行，会话期内不变）：
-  1. `app_caps.DIRECT_IMPORT` 置位 → **direct**；
+  1. `app_caps.DIRECT_IMPORT` 置位 → **direct**（830 目标恒不成立，ADR #15）；
   2. 否则 `server_caps.BLIT` 置位 → **blit**（等待 SLOT_COUNT 条 TBUF 后才开始发帧）；
   3. 否则：记日志、断开。App 显示"无可用帧路径"。
-  调试覆盖：环境变量 `LAND_MODE=direct|blit` 可强制（默认 `auto`）。
+  4. caps 组合：`app_caps.SWAPCHAIN` 置位 → **swapchain 呈现路径**（App 侧 Vulkan swapchain 呈现，见 F-14）。
+  调试覆盖：`LAND_MODE=shm` 保留已退役的 SHM/CPU 调试帧路径（state.rs `shm_path_enabled`）；
+  其余取值（auto/blit/未设置）均走 blit + swapchain 主路径。
 - **H-05** 会话中途收到新 Config：仅更新输出参数（第 7 节），不重新选择模式。
 
 ```mermaid
@@ -196,8 +235,8 @@ sequenceDiagram
     participant App
     participant S as wl-android
     App->>S: connect(land.sock)
-    S->>App: HELO {v1, server_caps}
-    App->>S: CONF {v1, 3392x2400, 144000mHz, dpi, app_caps}
+    S->>App: HELO {v2, server_caps}
+    App->>S: CONF {v2, 3392x2400, 144000mHz, dpi, app_caps}
     alt direct 模式
         Note over S: mode=direct，等合成器出帧
     else blit 模式
@@ -212,7 +251,11 @@ sequenceDiagram
 
 ## 6. 帧循环与 buffer/fd 生命周期
 
-### 6.1 稳态帧循环（direct 模式）
+> 主路径：**blit + Vulkan swapchain**（§6.3，v2 拉式）。直接模式在 830 目标不可用
+> （ADR #15），§6.1/§6.2 为协议参考；SHM/CPU 帧路径（frame_cache memfd 像素拷贝）
+> 已退役，仅 `LAND_MODE=shm` 调试保留（state.rs `shm_path_enabled`）。
+
+### 6.1 稳态帧循环（direct 模式，协议参考）
 
 ```mermaid
 sequenceDiagram
@@ -231,7 +274,7 @@ sequenceDiagram
     Note over A: 缓存命中，零导入开销
 ```
 
-### 6.2 buffer 生命周期状态机（direct 模式，per wl_buffer）
+### 6.2 buffer 生命周期状态机（direct 模式，协议参考，per wl_buffer）
 
 ```mermaid
 stateDiagram-v2
@@ -265,13 +308,28 @@ fd 所有权规则：
 
 ### 6.3 blit 模式差异
 
-- **F-08** 服务端持有 slot 池（App 注册的 AHB dmabuf 导入为 VkImage 常驻）；
-  每帧：导入 KWin buffer（同样按 buffer_id 缓存）→ `vkCmdBlitImage` 到空闲 slot →
-  fence 完成后发 `LAND{buffer_id=slot, flags=0}`（slot 的 fd 在 TBUF 时已给过 App
-  ——本来就是 App 自己的 AHB，App 侧用 AHB 导入路径渲染，无需 fd）。
-- **F-09** slot 空闲判定：该 slot 上一帧已被 cum-ack。无空闲 slot → 等同 F-04 反压。
+- **F-08** 服务端持有 slot 池（App 注册的 AHB dmabuf 导入为 VkImage 常驻）。帧流水
+  （`state.rs::blit_and_send_frame`）：commit 提取的 dmabuf 按 wl_buffer 键存入
+  `pending_frames` → `frame_router` EnqueueFrame 驱动 → 按 buffer_id 导入 KWin buffer
+  （`frame_images` PERF-11 缓存，LRU 上限 8）→ `slot_blittable` 选定空闲 slot →
+  `blit_submit_with_fence` → `export_fence_syncfd` → 发 **fence-only**
+  `LAND{buffer_id=slot, FRAME_CARRIES_FENCE}`（伴随 1 个 sync_file 栅栏 fd）。slot 的
+  AHB 本就是 App 自己的 swapchain 图像，无需再传像素 fd。
+- **F-09** slot 可写判定（`slot_blittable` = 已注册 && ready && 无在途帧）：ready 由
+  TBUF 注册时的初始就绪或显式 BRDY（F-14）授予，blit 成功即消费；cum-ack 只清除该
+  slot 的在途帧标记，**不**重新授予 ready。无 ready slot → 等同 F-04 反压。
 - **F-10** KWin 侧 buffer 的 release 时机：blit 的 Vulkan fence signaled 即 release
-  （不等 App ack——App ack 只管 slot 归还）。
+  （不等 App ack——App ack 只清在途帧，slot 重新可写仍须 BRDY，F-14）。
+- **F-12** 栅栏 fd 生命周期：server 导出即转移——SCM_RIGHTS 内核 dup，server 保留副本至信号后销毁；App 导入后由驱动接管（F-02 同规则延伸）。
+- **F-13** -1-already-signaled：`vkGetFenceFdKHR` 在 fence 已信号时返回 -1，此时**不发 fd**，App 视为立即可呈现。
+- **F-14** BRDY 语义：App 仅在 vkAcquireNextImageKHR 返回且 acquire 完成后发送；server 收到后 blit，未收到 BRDY 的 slot 视为占用（等价 F-09 反压）。
+
+> 拉式模型已落地（P3）：F-14 的 BRDY 门控实现在 `state.rs`（`SlotReadySet` /
+> `slot_blittable`）——TBUF 注册即授予该 slot 初始 ready（deadlock 消解），每次 blit
+> 消费 ready，slot 复用须等 App 下一次 BRDY。App 侧 swapchain present 为 v2 主路径
+> （`render_frame` 已弃用，仅 CPU 回退保留）。
+
+- **F-15** 尺寸变更原子重建：frame_cache 尺寸变化时分配新 memfd 三缓冲并原子替换，禁止原地 ftruncate 缩小（frame_cache 属已退役 SHM/CPU 路径，仅 `LAND_MODE=shm` 调试保留）。
 
 ### 6.4 帧节拍
 
@@ -361,6 +419,11 @@ feedback 向客户端广播支持的 `DRM_FORMAT × modifier` 组合。v1 包含
 
 ### 9.2 Vulkan 格式映射（App 侧导入）
 
+> 注：swapchain 主路径（F-08）下 App 收到的帧是 fence-only，不导入 KWin 像素；本表是
+> 直接模式/旧路径的协议参考。swapchain 实际格式由设备协商——真机选
+> `R8G8B8A8_UNORM`（对应 blit slot 的 `ABGR8888` 行，TBUF 声明值一致），
+> `B8G8R8A8_UNORM` 仅为优先偏好。
+
 | DRM fourcc | 内存字节序 (LE) | Vulkan format | 说明 |
 |------------|----------------|---------------|------|
 | `XRGB8888` | B,G,R,X | `VK_FORMAT_B8G8R8A8_UNORM` | 忽略 alpha 分量 |
@@ -393,10 +456,12 @@ pub mod proto {
     pub fn decode(bytes: &[u8], fds: Vec<OwnedFd>) -> Result<Message, ProtoError>;
 }
 pub mod transport {
-    /// SEQPACKET + SCM_RIGHTS 的唯一 syscall 封装点（X-01 注入点）
+    /// syscall 封装点（X-01 注入点）
     pub trait Transport { fn send(&mut self, msg: &Message) -> io::Result<()>;
                           fn recv(&mut self) -> io::Result<Option<Message>>; }
-    pub struct UnixSeqpacket(..);   // 生产实现
+    // 生产实现位于 crates/wl-android/src/transport.rs：
+    // SOCK_STREAM + u32 长度前缀 + pending/pending_fds 读前瞻缓冲（P-18/P-19
+    // FD-ORDERING）；另提供 recv_raw/send_raw 承载 native_handle 原始字节流（P-13）。
 }
 pub mod testutil {   // 仅 cfg(test)/dev-dependency 暴露
     pub fn memfd_fake_dmabuf(len: usize) -> OwnedFd;   // fd 替身
@@ -442,6 +507,16 @@ Kotlin 侧：`MainActivity`（薄壳）/ `ScreenInfoCollector`（DisplayListener
 surfaceChanged 去抖后调 `nativeOnConfig`）/ `TouchForwarder`（MotionEvent 展开为
 per-pointer TOUC + FRAME，T-02）。
 
+App 渲染（`android-app/native/src/render.rs`）：Vulkan swapchain
+（`VK_KHR_android_surface` + `VK_KHR_swapchain`）。swapchain 图像即 AHB slot——
+经 `VK_ANDROID_external_memory_android_hardware_buffer` 导出 AHB，随 TBUF 的
+native_handle 注册（P-13）。**DEFERRED_MEMORY_ALLOCATION 陷阱**（真机修复）：未
+acquire 过的图像 `vkGetImageMemoryRequirements` 返回 `memory_type_bits=0`，init 时须
+先 acquire 每个图像、再查需求并绑定专属 AHB-exportable 内存，最后把全部图像 present
+回呈现引擎，否则帧循环首次 acquire 永久阻塞。栅栏经 `VK_KHR_external_semaphore_fd`
+（SYNC_FD）导入为 wait semaphore 后再 present；扩展缺失时回退 `wait_sync_fd` CPU
+轮询。swapchain 格式由设备协商（B8G8R8A8 优先，真机选 R8G8B8A8，见 §9.2）。
+
 ---
 
 ## 11. 可测性架构
@@ -472,7 +547,7 @@ per-pointer TOUC + FRAME，T-02）。
 | `WAYLAND_DISPLAY` | `land-0` | 服务端绑定 `$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY`；合成器以同名连接 |
 | `XDG_RUNTIME_DIR` | （必须已设置） | 未设置时警告并回退 `/tmp` |
 | `LAND_SOCKET` | `/run/wl-android/land.sock` | App 通信 socket（listener 侧路径） |
-| `LAND_MODE` | `auto` | `auto\|direct\|blit`，调试强制帧路径（H-04） |
+| `LAND_MODE` | `auto` | `auto\|blit\|shm`；`shm` 保留已退役的 SHM/CPU 调试帧路径（`shm_path_enabled`），其余取值走 blit + swapchain 主路径（H-04） |
 | `LAND_LOG` | `info` | `error\|info\|debug\|proto`（proto 含逐消息 serial 级 dump） |
 
 ---
@@ -484,7 +559,7 @@ per-pointer TOUC + FRAME，T-02）。
 | 1 | 容器侧 listen + bind mount，App 是 connector | Unix socket 无法由 Magisk `touch` 预创建；容器 root bind 最简且 sepolicy 面最小 |
 | 2 | Smithay 而非裸 wayland-server | dmabuf v4 feedback / xdg-shell / seat 现成实现；库使用不违反边界 |
 | 3 | 协议集含 xdg_wm_base/wl_shm/wl_subcompositor | 嵌套 KWin 是 xdg_toplevel 客户端；wl_shm 为事实强制 |
-| 4 | SOCK_SEQPACKET | 消息边界由内核维护，无需手写流式分帧 |
+| 4 | SOCK_STREAM + u32 长度前缀 + pending 读前瞻缓冲 | 内核不保证流式消息边界；以长度前缀分帧 + pending 缓冲吸收合并的尾部字节与 fd（P-18/P-19），fd 顺序由 SCM_RIGHTS 按发送序保证 |
 | 5 | ~~v1 强制 LINEAR modifier~~（已废除，见 #15） | ~~a830 新版 UBWC 布局互通风险~~；M0 确认 Adreno 830 仅 blit 路径可用，blit 管线全在 turnip 内，UBWC 互通无风险 |
 | 6 | direct + blit 双路径，运行时协商 | 宿主专有驱动 dma_buf 导入支持未知；AHB 路径 CDD 保证兜底 |
 | 7 | buffer_id 注册 + fd 只发一次 | 消除每帧 Vulkan 导入开销（稳态零导入） |
@@ -496,6 +571,8 @@ per-pointer TOUC + FRAME，T-02）。
 | 13 | 触摸坐标归一化 [0,1] | 旋转过渡期与分辨率解耦（配合 O-04） |
 | 14 | v1 仅触摸输入 | 键鼠留 v2（协议按 P-07 追加 KeyMessage/PointerMessage 即可） |
 | 15 | blit 路径启用 UBWC (QCOM_COMPRESSED) | M0 确认 Adreno 830 专有驱动不支持 `VK_EXT_external_memory_dma_buf`（direct 不可用）；blit 管线全在 turnip 同一 Vulkan instance 内，KGSL 内核层统一处理 UBWC 布局，无跨驱动 modifier 互通风险；3392×2400 分辨率下 UBWC 省带宽 ~50% |
+| 16 | swapchain 呈现 + sync_file 栅栏（v2 主路径） | anland 拉式解耦：Consumer 持有 swapchain 图像(AHB)，Producer 容器内 turnip blit + `VK_KHR_external_fence` SYNC_FD 导出；标准公开 API，禁 dlsym 隐藏 API |
+| 17 | 键盘 v2 不再推迟 | 新增 KeyMessage + xkbcommon keymap；ADR #14 的"键鼠留 v2"由本 ADR 实现 |
 
 ---
 
@@ -562,3 +639,12 @@ CI 层可测的部分由 X-xx 规则覆盖；V-xx 专指需要真机环境（设
 | V-27 | Weston 嵌套 | `weston --backend=wayland-backend.so` + weston-simple-dmabuf-egl 通过 |
 | V-28 | Hyprland 嵌套 | Hyprland 嵌套启动 + 基础渲染/触摸 |
 | V-29 | 1h 连续运行 | FPS/内存/fd 稳定；两端无 ANR/crash |
+
+### M8：P3 拉式解耦
+
+| 编号 | 验收项 | 方法 |
+|------|--------|------|
+| V-30 | App 侧 Vulkan swapchain 呈现 | `render:` 日志变为 `present: slot=N`，无 CPU 像素拷贝（PERF-01） |
+| V-31 | server 栅栏导出 | 容器 `wl-android doctor` 报告 FENCE 能力 true |
+| V-32 | BRDY 拉式节奏 | mock-app 回归断言 BRDY 驱动帧节奏，headless drain（F-06）不受影响 |
+| V-33 | UBWC 导入 | bring-up 门控 `import_ubwc_test` 通过（读回像素校验），失败则强制 LINEAR 并记录 |

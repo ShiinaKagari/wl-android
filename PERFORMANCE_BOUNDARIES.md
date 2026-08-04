@@ -20,7 +20,7 @@
 | PERF-10 | 容器侧 CPU | < 20%（单核，稳态 144Hz） | `top -p` 采样 |
 | PERF-11 | 稳态零导入 | 稳态下 App 每帧 Vulkan 导入次数 = 0（buffer_id 缓存命中） | 导入计数器：warmup 后增量为 0 |
 
-## 2. 带宽预算（v1 强制 linear 的代价核算）
+## 2. 带宽预算（blit + swapchain 主路径）
 
 单帧 3392×2400×4 B ≈ 31.1 MiB（linear）。UBWC 压缩典型压缩比 ~50%，
 实际传输量约 15.5 MiB per blit pass。
@@ -29,18 +29,18 @@
 |------|------|----------------------|------------------------|--------------|
 | KWin 渲染写出 | 4.7 GB/s | — | — | — |
 | direct | KWin 写 + App 采样读 + swapchain 写 | ≈ 14.1 GB/s | N/A（direct 不可用） | — |
-| **blit** (v1) | direct + blit 读写各一次 | ≈ 23.5 GB/s | **≈ 11.7 GB/s** | **≈ 15%** |
+| **blit** (v2 主路径) | KWin 渲染写 + blit 读 + blit 写（swapchain 图像即 AHB slot，present 零拷贝） | ≈ 14.1 GB/s | **≈ 7.0 GB/s** | **≈ 9%** |
 
-结论：blit 路径 UBWC 启用后带宽占用 ≤ 15%，充裕。UBWC 已是 v1 特性（非 v2），
-见 DESIGN.md ADR #15。
+结论：blit 路径 UBWC 启用后带宽占用 ≈ 9%，充裕。swapchain 呈现零额外拷贝（present
+即移交，App 不采样像素），带宽由 ADR #15 启用的 UBWC 压缩吸收。
 
 ## 3. 延迟预算分解（144Hz，帧预算 6.94 ms）
 
 | 段 | 预算 | 备注 |
 |----|------|------|
 | commit → sendmsg | < 0.5 ms | frame_router 纯逻辑 + 一次 syscall |
-| socket 传输（80 B + fd） | < 0.2 ms | SEQPACKET 本机 |
-| App 收帧 → 提交 GPU | < 0.7 ms | 稳态零导入（PERF-11），仅录制 blit cmd |
+| socket 传输（80 B + fd） | < 0.2 ms | SOCK_STREAM 本机（u32 长度前缀） |
+| App 收帧 → present | < 0.7 ms | fence-only 帧（F-08）：SYNC_FD 导入 semaphore + present，零像素拷贝（PERF-01） |
 | GPU blit + present 排队 | < 2.5 ms | 与合成器 GPU 工作并行 |
 | 余量（调度抖动） | ≈ 3 ms | |
 

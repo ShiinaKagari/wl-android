@@ -3,3 +3,5 @@ m0/**/target/
 android-app/native/target/
 *.snap.new
 soak-results/
+.omo/start-work/*/target/
+

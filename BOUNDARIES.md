@@ -21,9 +21,9 @@
 | 类别 | 内容 |
 |------|------|
 | Wayland | 以 server 角色实现标准协议：`wl_compositor` `wl_subcompositor` `wl_shm` `wl_output` `wl_seat` `xdg_wm_base` `zwp_linux_dmabuf_v1`(v4 feedback)；协议内协商（格式表、configure、frame callback 节拍） |
-| Vulkan | 公开扩展：`VK_EXT_external_memory_dma_buf`、`VK_KHR_external_memory_fd`、`VK_ANDROID_external_memory_android_hardware_buffer` 等 |
+| Vulkan | 公开扩展：`VK_EXT_external_memory_dma_buf`、`VK_KHR_external_memory_fd`、`VK_ANDROID_external_memory_android_hardware_buffer`、`VK_KHR_external_fence_fd`（server SYNC_FD 栅栏导出）、`VK_KHR_external_semaphore_fd`（App 栅栏导入）、`VK_KHR_android_surface`、`VK_KHR_swapchain`（App swapchain 呈现）等 |
 | Android | SDK / NDK 公开 API（含 `AHardwareBuffer_*` 全部公开函数）；JNI |
-| Linux | POSIX 与稳定内核 UAPI：Unix socket（`SOCK_SEQPACKET`）、`SCM_RIGHTS`、dmabuf、memfd |
+| Linux | POSIX 与稳定内核 UAPI：Unix socket（AF_UNIX `SOCK_STREAM` + u32 长度前缀 + `SCM_RIGHTS`）、dmabuf、memfd |
 | 配置 | 环境变量（`WAYLAND_DISPLAY` 等标准接口）；Magisk 官方机制内的**系统配置**（sepolicy 规则、目录创建） |
 | 依赖库 | 以库的公开 API 正常链接使用（使用库 ≠ 修改第三方代码） |
 
@@ -37,6 +37,7 @@
 - ❌ Magisk 模块中的代码注入或系统文件替换（仅允许配置类操作）
 - ❌ patch / fork 合成器、Mesa、内核、Wayland 库
 - ❌ 依赖任何合成器插件 API
+- ❌ 非 git 方式的源码同步进测试后端（tarball / 手工拷贝源码进容器）；源码进入测试后端只能走 `git pull`
 
 ## 3. 灰区登记表（非公开契约但非 hook 的依赖）
 
@@ -44,7 +45,7 @@
 
 | 编号 | 依赖内容 | 性质说明 | 隔离与防护 | 使用范围 |
 |------|----------|----------|------------|----------|
-| **GZ-001** | ① gralloc handle 内含 dmabuf fd（gralloc4 / Android 12+ 事实标准）② libcutils `native_handle_t` 线格式（`AHardwareBuffer_sendHandleToUnixSocket` 的发送格式：numFds/numInts/ints + SCM_RIGHTS） | 非 hook：仅解析发送到自有 socket 的字节流，不介入任何第三方进程；发送端使用的是公开 NDK API | 隔离到 `crates/wl-android/src/ahb_handle.rs` 单一模块；契约测试；doctor 启动自检，解析异常时**明确报错**而非静默 | 仅 blit fallback 路径 |
+| **GZ-001** | ① gralloc handle 内含 dmabuf fd（gralloc4 / Android 12+ 事实标准）② libcutils `native_handle_t` 线格式（`AHardwareBuffer_sendHandleToUnixSocket` 的发送格式：numFds/numInts/ints + SCM_RIGHTS） | 非 hook：仅解析 App 经公开 NDK API `AHardwareBuffer_sendHandleToUnixSocket` 发送到自有 socket 的字节流，不介入任何第三方进程 | 隔离到 `crates/wl-android/src/ahb_handle.rs` 单一模块；契约测试；doctor 启动自检，解析异常时**明确报错**而非静默 | blit + swapchain 路径（v2 主路径，slot 注册） |
 
 当前灰区总数：**1**。除登记项外，全项目为 100% 公开契约。
 
@@ -87,3 +88,16 @@ android_logger、insta、proptest、cargo-ndk。
 - 修改"禁止清单"：不允许。
 - 新增灰区项：必须先在本文件登记（编号 GZ-xxx）并说明隔离方案。
 - 新增依赖：按第 4 节标准审查，通过后追加到已批准列表。
+
+## 8. 环境拓扑与代码流转
+
+| 端 | 定义 | 职责边界 |
+|---|---|---|
+| **开发机** (dev machine) | 当前主开发环境（运行 agent 的机器），git 仓库在此维护 | **代码改动只允许在此进行**；`git push` 的唯一来源 |
+| **测试后端** (test backend) | 安卓设备上的容器（Droidspaces `--name=arch`） | server（wl-android）构建/运行/日志、Plasma/KWin 会话、doctor、soak；**除 App 测试外的一切** |
+| **测试前端** (test frontend) | 安卓机本身（设备 376627b8） | **仅 App 测试**：安装、启动、logcat 观察、触摸/键盘交互验证 |
+
+**源码流转只走 git**：开发机 `git push` → 测试后端 `git pull` 后构建/运行。
+禁止 tarball / 手工拷贝等非 git 源码同步（见 §2 禁止清单）。部署产物（编译出的二进制）
+例外：可按既有机制经 bind mount（`/data/local/tmp/wl-android` ↔ `/run/wl-android`）传递，
+但源码必须走 git。

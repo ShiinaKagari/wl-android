@@ -4,10 +4,12 @@
 GPU 硬件加速、零 CPU 像素拷贝、触摸交互、旋转/刷新率动态适配。
 
 ```bash
-# 容器内 (Droidspaces)
-wl-android &
+# 容器内 (Droidspaces) — 顺序有讲究：dbus 必须先于 Plasma（见 docs/TESTING.md §3）
+chmod 700 $XDG_RUNTIME_DIR
+dbus-daemon --session --address=unix:path=$XDG_RUNTIME_DIR/bus --fork
+wl-android &            # 需带 KGSL 环境变量（见下方"环境变量"）
 export WAYLAND_DISPLAY=land-0
-startplasma-wayland
+startplasma-wayland &
 
 # 安卓端：打开 wl-android-app → 桌面出现在屏幕上
 ```
@@ -22,20 +24,24 @@ Wayland 合成器；对 Android 表现为一个普通 App。零 hook、不修改
 
 ```
 KWin ──标准 Wayland 协议(land-0)──▶ wl-android (容器内, Rust/Smithay)
-                                        │  land.sock: 二进制协议 + SCM_RIGHTS(dmabuf fd)
+                                        │  turnip blit + SYNC_FD 栅栏导出
+                                        │  land.sock: 二进制协议 + SCM_RIGHTS(AHB slot)
                                         ▼
                               wl-android-app (Kotlin + Rust JNI)
-                                        │  Vulkan 导入 → SurfaceView 上屏
+                                        │  Vulkan swapchain 呈现（BRDY 拉式，v2 主路径）
                                         │  MotionEvent → 触摸回注
                                         ▼
                               Magisk 模块（仅目录 + sepolicy）
 ```
 
-帧路径双模式（运行时协商，见 docs/DESIGN.md §5）：
+帧路径（v2 主路径：blit + Vulkan swapchain，见 docs/DESIGN.md §5/§6.3）：
 
-- **direct**：KWin 的 dmabuf fd 直达 App，Vulkan `VK_EXT_external_memory_dma_buf` 导入；
-- **blit**：App 预注册 AHardwareBuffer 池，容器侧 Vulkan blit（宿主驱动不支持
-  dma_buf 导入时的兜底，仍零 CPU 拷贝）。
+- **blit（主路径）**：App 预注册 AHardwareBuffer slot 池（即 swapchain 图像），容器侧
+  turnip 将 KWin 帧 blit 进 slot，经 `VK_KHR_external_fence` SYNC_FD 栅栏同步后由 App
+  Vulkan swapchain 呈现；BRDY 拉式节奏，零 CPU 像素拷贝。
+- **direct**：KWin 的 dmabuf fd 直达 App 导入。ADR #15 确认 830 宿主驱动不支持
+  `VK_EXT_external_memory_dma_buf`，该路径在目标设备上不可用。
+- **SHM/CPU**：frame_cache memfd 像素拷贝路径，已退役，仅 `LAND_MODE=shm` 调试保留。
 
 ## 文档索引
 
@@ -81,6 +87,18 @@ wl-android/
 
 ## 开发范式
 
+### 三端拓扑
+
+项目涉及三个环境，术语全局统一：
+
+- **开发机** (dev machine)：运行 agent 的主机，git 仓库所在；**代码改动只允许在此进行**。
+- **测试后端** (test backend)：安卓设备容器 Droidspaces `--name=arch`；除 App 测试外的一切（server 构建/运行/日志、Plasma/KWin 会话、doctor、soak）。
+- **测试前端** (test frontend)：安卓机本身（设备 376627b8）；仅 App 测试（安装/启动/logcat/交互验证）。
+
+源码流转只走 git：开发机 `git push` → 测试后端 `git pull` 后构建/运行，禁止
+tarball/手工拷贝等非 git 源码同步；部署产物（编译出的二进制）例外，可经既有 bind
+mount 传递。详见 [docs/AGENTS.md](docs/AGENTS.md)。
+
 - **分层 TDD**：协议/状态机/fd 生命周期严格红绿重构；Wayland 行为用 FakeCompositor
   （wayland-client 无头客户端）测试先行；驱动相关薄壳真机验证后以 doctor 断言固化。
   规则编号（P/H/F/C/T/O/X/PERF-xx）与测试一一对应，见 docs/DESIGN.md。
@@ -94,7 +112,7 @@ wl-android/
 | M0 | 宿主 Vulkan 探测 + 容器环境诊断 + socket fd 冒烟 | 手动 adb 运行 probe / 脚本跑 probe-container.sh | — | ✅ 完成 |
 | M1 | `wl-android-common`：协议 + golden bytes + proptest + 测试基建 | 无需真机 | `cargo test` 35/35 绿 | ✅ 完成 |
 | M2 | Smithay 起 land-0；FakeCompositor 帧到达 | `M2-verify.sh`: weston-info 协议对象枚举、doctor 自检 | mock-app 集成回归 | [ ] |
-| M3 | App 上屏 + cum-ack 回压 | `M3-verify.sh`: socket 连接、slot 注册、帧循环、视觉正确 | FakeCompositor 帧到达 | [ ] |
+| M3 | App Vulkan swapchain 上屏 + BRDY 拉式回压 | `M3-verify.sh`: socket 连接、slot 注册、帧循环、视觉正确 | FakeCompositor 帧到达 | [ ] |
 | M4 | 多点触控注入 | `M4-verify.sh`: 单点/拖拽/多点/边缘/FRAME sentinel | TouchMessage 单元测试 | [ ] |
 | M5 | 旋转 / 144Hz / 分辨率变化动态适配 | `M5-verify.sh`: 旋转→桌面跟随、`wm size`→适配、刷新率切换 | MockClock 节拍验证 | [ ] |
 | M6 | KWin/Plasma 拉起；Weston/Hyprland 兼容 | `M6-verify.sh`: Plasma 可见、触摸交互、窗口操作、旋转+Plasma | 协议缺失扫描 | [ ] |
@@ -106,10 +124,29 @@ wl-android/
 |------|--------|------|
 | `WAYLAND_DISPLAY` | `land-0` | 服务端绑定 `$XDG_RUNTIME_DIR/land-0`（与系统 wayland-0 隔离） |
 | `LAND_SOCKET` | `/run/wl-android/land.sock` | 与 App 通信的 socket（服务端 listen） |
-| `LAND_MODE` | `auto` | `auto\|direct\|blit` 调试强制帧路径 |
+| `LAND_MODE` | `auto` | `auto\|blit\|shm`；`shm` 启用已退役的 SHM/CPU 调试帧路径，其余取值走 blit + swapchain 主路径 |
 | `LAND_LOG` | `info` | `error\|info\|debug\|proto` |
+
+> **KGSL 环境（KWin/server 启动必需，deploy-test.sh 内联设置）**：
+> `VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/freedreno_icd.aarch64.json`、
+> `MESA_LOADER_DRIVER_OVERRIDE=kgsl`、`vblank_mode=3`、
+> `MESA_VK_WSI_PRESENT_MODE=mailbox`。缺任一都会导致 KWin 走 SHM 回退、帧被丢弃
+> （blit 主路径要求 dmabuf）。
 
 ## 排障
 
 `wl-android doctor`（容器）与 App 内调试页：自检 socket 权限、协议版本、caps、
 fd 往返、Vulkan 能力，并输出延迟/帧率统计。跨端问题按日志中的 `serial` 对齐定位。
+
+真机踩坑（均为已验证事实）：
+
+- **startplasma-wayland 必须先有 dbus**：`dbus-daemon --session
+  --address=unix:path=$XDG_RUNTIME_DIR/bus --fork` 之后再 `startplasma-wayland &`；
+  单独 `plasmashell &` 缺 session bus 直接崩。序列见 docs/TESTING.md §3。
+- **swapchain 延迟分配（DEFERRED_MEMORY_ALLOCATION）**：未 acquire 过的 swapchain
+  图像 `vkGetImageMemoryRequirements` 返回 `memory_type_bits=0`（无后备存储），初始化
+  必须先把每个图像 acquire 一次，再查需求并绑定专属 AHB-exportable 内存，最后把全部
+  图像 present 回呈现引擎，否则帧循环首次 acquire 永久阻塞。真机修复。
+- **SOCK_STREAM 消息合并（已修复）**：App 背靠背发送 TBUF + native_handle 会在一次
+  recvmsg 内合并；transport 的 pending 读前瞻缓冲保留合并的尾部字节与 fd
+  （FD-ORDERING），旧实现丢 handle 字节导致断连，现已修复并有回归测试（P-18/P-19）。
