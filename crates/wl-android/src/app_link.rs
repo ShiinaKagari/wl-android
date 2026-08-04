@@ -277,6 +277,15 @@ impl AppSession {
                     }
                     return Some((handle_data, handle_fds));
                 }
+                if std::time::Instant::now() >= deadline {
+                    tracing::warn!(
+                        n = data.len(),
+                        fds = fds.len(),
+                        first = data.iter().take(8).map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" "),
+                        "flat handle timeout: header incomplete or no fd"
+                    );
+                    return Some((data, fds));
+                }
                 let remaining = deadline.saturating_duration_since(std::time::Instant::now());
                 let want_fds = if fds.is_empty() { 1 } else { 0 };
                 match self.transport.recv_raw_with_fd_wait(want_fds, remaining) {
