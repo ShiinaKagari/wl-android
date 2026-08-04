@@ -79,6 +79,12 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
 
         collector.start()
 
+        // SURFACE-REARM: if the surface callback raced ahead of nativeInit
+        // (or was consumed by a restart), re-assert the window here.
+        if (nativeHandle != 0L && surfaceView.holder.surface != null && surfaceView.holder.surface.isValid) {
+            NativeBridge.nativeSetSurface(nativeHandle, surfaceView.holder.surface)
+        }
+
         // Focus can be stolen (e.g. keyguard dismissal, dialog), re-grab after resume.
         surfaceView.post { surfaceView.requestFocus() }
     }
@@ -113,6 +119,14 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     }
 
     override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
+        // SURFACE-REARM: on process restart (e.g. install -r) Android may
+        // re-deliver an existing surface via surfaceChanged without a fresh
+        // surfaceCreated — the SurfaceView was created before nativeInit
+        // finished, or the surface survived the restart. Re-assert the
+        // window so the CPU render path is armed even then (idempotent).
+        if (nativeHandle != 0L) {
+            NativeBridge.nativeSetSurface(nativeHandle, holder.surface)
+        }
         collector.emit()
     }
 
