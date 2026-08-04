@@ -1,5 +1,5 @@
 use std::io;
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::net::UnixListener;
 
 use tracing::{debug, info, warn};
@@ -166,6 +166,17 @@ impl AppSession {
                         Some(handle) => {
                             debug!(slot = slot.slot, num_fds = handle.num_fds, "native_handle parsed");
                             if let Some(fd) = handle.fds.into_iter().next() {
+                                // Validate the fd is a live dma-buf before handing
+                                // it to the driver (a bad fd crashes turnip).
+                                let mut st = unsafe { std::mem::zeroed::<libc::stat>() };
+                                let rc = unsafe { libc::fstat(fd.as_raw_fd(), &mut st) };
+                                if rc != 0 || st.st_mode & libc::S_IFMT != libc::S_IFCHR {
+                                    warn!(
+                                        slot = slot.slot, rc, mode = st.st_mode,
+                                        "slot fd is not a usable dma-buf; slot unavailable",
+                                    );
+                                    return Ok(Some(Message::Slot(slot)));
+                                }
                                 match blit.register_slot(
                                     slot.slot,
                                     fd,
@@ -309,8 +320,19 @@ impl AppSession {
                     );
                     return Some((data, fds));
                 }
+                // Wait for the FULL declared fd count (word 10), not just one.
                 let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-                let want_fds = if data.len() >= header_len { 1 } else { 0 };
+                let want_fds = if data.len() >= header_len {
+                    let nf = i32::from_le_bytes([
+                        data[num_fds_off],
+                        data[num_fds_off + 1],
+                        data[num_fds_off + 2],
+                        data[num_fds_off + 3],
+                    ]);
+                    nf.max(0) as usize
+                } else {
+                    0
+                };
                 match self.transport.recv_raw_with_fd_wait(want_fds, remaining) {
                     Ok(Some((d, f))) => {
                         data.extend_from_slice(&d);
