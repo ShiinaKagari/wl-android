@@ -80,10 +80,17 @@ impl AppSession {
                 if conf.app_caps & proto::APP_CAP_DIRECT_IMPORT != 0 {
                     info!("mode: direct");
                     self.mode = SessionMode::Active;
-                } else if self.server_caps & proto::SERVER_CAP_BLIT != 0 {
+                } else if self.server_caps & proto::SERVER_CAP_BLIT != 0
+                    && !crate::state::shm_path_enabled()
+                {
                     // H-04 v2: blit waits for SLOT_COUNT TBUFs before sending frames.
                     info!("mode: blit (waiting for {} TBUF registrations)", proto::SLOT_COUNT);
                     self.mode = SessionMode::SlotRegistration;
+                } else if self.server_caps & proto::SERVER_CAP_BLIT != 0 {
+                    // LAND_MODE=shm: SHM/CPU fallback — no slots needed, go Active
+                    // so SHM frames flow (the App presents them via the CPU path).
+                    info!("mode: blit→shm (LAND_MODE=shm — Active immediately, no slot registration)");
+                    self.mode = SessionMode::Active;
                 } else {
                     warn!("no available frame path");
                     return Err(io::Error::other("no available frame path"));
@@ -165,6 +172,14 @@ impl AppSession {
                     match crate::ahb_handle::parse_native_handle(&data, fds) {
                         Some(handle) => {
                             debug!(slot = slot.slot, num_fds = handle.num_fds, "native_handle parsed");
+                            // LAND_MODE=shm (SHM/CPU fallback): the App may still
+                            // register slots, but the server must NOT import them —
+                            // turnip cannot import the App's AHB dma-buf (SIGSEGV,
+                            // device-verified). Skip the import entirely.
+                            if crate::state::shm_path_enabled() {
+                                debug!(slot = slot.slot, "shm mode: slot import skipped");
+                                return Ok(Some(Message::Slot(slot)));
+                            }
                             if let Some(fd) = handle.fds.into_iter().next() {
                                 // Validate the fd is live before handing it to the
                                 // driver (a bad fd crashes turnip). dma-buf fds
