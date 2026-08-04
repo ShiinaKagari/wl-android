@@ -488,6 +488,23 @@ impl WlState {
             return;
         };
 
+        // KEY-FOCUS: ensure the keyboard focus points at the toplevel (KWin's
+        // surface) before injecting. smithay's keyboard.input() only delivers
+        // to the focused surface; the pointer path sets focus via
+        // pointer.motion(Some((surface, ...))) on touch, but the keyboard
+        // never got one — so key events were silently dropped (no text input).
+        // Setting focus on every key is idempotent (Enter is only re-sent when
+        // the focus actually changes).
+        if let Some(ref toplevel) = self.toplevel {
+            let surface = toplevel.wl_surface().clone();
+            let serial = {
+                let s = Serial::from(self.next_serial);
+                self.next_serial += 1;
+                s
+            };
+            keyboard.set_focus(self, Some(surface), serial);
+        }
+
         let serial = {
             let s = Serial::from(self.next_serial);
             self.next_serial += 1;
