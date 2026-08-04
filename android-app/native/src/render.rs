@@ -171,6 +171,15 @@ pub struct RenderState {
     semaphore_fd_loader: Option<ash::khr::external_semaphore_fd::Device>,
     queue: vk::Queue,
     queue_family_index: u32,
+    command_pool: vk::CommandPool,
+    command_buffer: vk::CommandBuffer,
+    /// Imported AHB images (route-1 slots): opaque handle -> VkImage. The
+    /// App allocates LINEAR AHardwareBuffers (route 1) so the server's turnip
+    /// can import them without crashing; each frame we GPU-blit the AHB into
+    /// the acquired swapchain image before presenting.
+    ahb_images: std::collections::HashMap<u32, vk::Image>,
+    /// AHB image backing memory (freed in Drop alongside the image).
+    ahb_memories: std::collections::HashMap<u32, vk::DeviceMemory>,
     images: Vec<vk::Image>,
     image_memories: Vec<vk::DeviceMemory>,
     image_format: vk::Format,
@@ -195,6 +204,10 @@ impl RenderState {
             swapchain: vk::SwapchainKHR::null(),
             queue: vk::Queue::null(),
             queue_family_index: 0,
+            command_pool: vk::CommandPool::null(),
+            command_buffer: vk::CommandBuffer::null(),
+            ahb_images: std::collections::HashMap::new(),
+            ahb_memories: std::collections::HashMap::new(),
             images: Vec::new(),
             image_memories: Vec::new(),
             image_format: vk::Format::UNDEFINED,
@@ -314,6 +327,16 @@ impl RenderState {
         }
         .map_err(|e| format!("render: vkCreateDevice: {e}"))?;
         let queue = unsafe { device.get_device_queue(queue_family_index, 0) };
+        let pool_info = vk::CommandPoolCreateInfo::default()
+            .queue_family_index(queue_family_index)
+            .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+        let command_pool = unsafe { device.create_command_pool(&pool_info, None) }
+            .map_err(|e| format!("render: vkCreateCommandPool: {e}"))?;
+        let cmd_alloc = vk::CommandBufferAllocateInfo::default()
+            .command_pool(command_pool)
+            .command_buffer_count(1);
+        let command_buffers = unsafe { device.allocate_command_buffers(&cmd_alloc) }
+            .map_err(|e| format!("render: vkAllocateCommandBuffers: {e}"))?;
         let swapchain_loader = ash::khr::swapchain::Device::new(&instance, &device);
         let semaphore_fd_loader = if has_fd_ext {
             Some(ash::khr::external_semaphore_fd::Device::new(&instance, &device))
@@ -332,6 +355,8 @@ impl RenderState {
         self.semaphore_fd_loader = semaphore_fd_loader;
         self.queue = queue;
         self.queue_family_index = queue_family_index;
+        self.command_pool = command_pool;
+        self.command_buffer = command_buffers[0];
 
         // --- Swapchain (initial extent comes from the surface caps) ---
         self.create_swapchain_and_images()?;
@@ -741,6 +766,235 @@ impl RenderState {
         }
     }
 
+    /// Import an App-allocated AHardwareBuffer as a `VkImage` (route 1: the
+    /// App allocates LINEAR AHBs via `AHardwareBuffer_allocate` so the
+    /// server's turnip can import the dma-buf without crashing; the App then
+    /// GPU-blits the AHB into the swapchain each frame). Uses the
+    /// `VK_ANDROID_external_memory_android_hardware_buffer` import path:
+    /// create an image, then allocate its memory with
+    /// `VkImportAndroidHardwareBufferInfoANDROID` (the AHB import struct
+    /// extends `VkMemoryAllocateInfo`, not `VkImageCreateInfo`) and bind.
+    ///
+    /// The image is `SAMPLED | TRANSFER_SRC` (blit source). The slot -> image
+    /// mapping is stored in `self.ahb_images`.
+    pub fn import_ahb_image(
+        &mut self,
+        slot: u32,
+        ahb: *mut ndk_sys::AHardwareBuffer,
+        width: u32,
+        height: u32,
+    ) -> Result<u64, String> {
+        let device = self.device.as_ref().ok_or("render: import_ahb before init")?;
+        let image_info = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(vk::Format::R8G8B8A8_UNORM)
+            .extent(vk::Extent3D { width, height, depth: 1 })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::SAMPLED)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::UNDEFINED);
+        let image = unsafe { device.create_image(&image_info, None) }
+            .map_err(|e| format!("render: vkCreateImage(ahb slot {slot}): {e}"))?;
+        let reqs = unsafe { device.get_image_memory_requirements(image) };
+        let instance = self.instance.as_ref().ok_or("render: no instance")?;
+        let mem_props =
+            unsafe { instance.get_physical_device_memory_properties(self.physical_device) };
+        let mem_type_index = (0..mem_props.memory_type_count)
+            .find(|&i| (reqs.memory_type_bits & (1 << i)) != 0)
+            .ok_or("render: no memory type for AHB image")?;
+        let mut import = vk::ImportAndroidHardwareBufferInfoANDROID::default()
+            .buffer(ahb as *mut vk::AHardwareBuffer);
+        let alloc_info = vk::MemoryAllocateInfo::default()
+            .allocation_size(reqs.size)
+            .memory_type_index(mem_type_index)
+            .push_next(&mut import);
+        let memory = unsafe { device.allocate_memory(&alloc_info, None) }
+            .map_err(|e| format!("render: vkAllocateMemory(ahb slot {slot}): {e}"))?;
+        if let Err(e) = unsafe { device.bind_image_memory(image, memory, 0) } {
+            unsafe { device.free_memory(memory, None) };
+            unsafe { device.destroy_image(image, None) };
+            return Err(format!("render: vkBindImageMemory(ahb slot {slot}): {e}"));
+        }
+        // Track memory alongside the image so Drop can free both.
+        self.ahb_memories.insert(slot, memory);
+        self.ahb_images.insert(slot, image);
+        Ok(slot as u64)
+    }
+
+    /// GPU-blit the App's LINEAR AHB slot image into the acquired swapchain
+    /// image, then present. Waits on `fence_sem` (the server's SYNC_FD blit
+    /// fence imported as a semaphore) before the blit so we never sample the
+    /// AHB before the server finished writing it. Returns the present result.
+    pub fn blit_ahb_to_swapchain(
+        &mut self,
+        slot: u32,
+        swapchain_index: u32,
+        fence_sem: Option<vk::Semaphore>,
+    ) -> Result<(), String> {
+        if !self.initialized {
+            return Err("render: blit before init".into());
+        }
+        let device = self.device.as_ref().expect("device set");
+        let src = *self
+            .ahb_images
+            .get(&slot)
+            .ok_or_else(|| format!("render: slot {slot} AHB not imported"))?;
+        let dst = *self
+            .images
+            .get(swapchain_index as usize)
+            .ok_or_else(|| format!("render: swapchain image {swapchain_index} missing"))?;
+
+        // Wait for the server blit fence (if provided) BEFORE sampling.
+        if let Some(sem) = fence_sem {
+            let wait = [sem];
+            let submit = vk::SubmitInfo::default().wait_semaphores(&wait).wait_dst_stage_mask(
+                &[vk::PipelineStageFlags::TRANSFER],
+            );
+            unsafe {
+                device.queue_submit(self.queue, &[submit], vk::Fence::null())
+                    .map_err(|e| format!("render: queue_submit (fence wait): {e}"))?;
+            }
+        }
+
+        unsafe {
+            device
+                .reset_command_buffer(self.command_buffer, vk::CommandBufferResetFlags::empty())
+                .map_err(|e| format!("render: reset_cmd: {e}"))?;
+        }
+        let begin = vk::CommandBufferBeginInfo::default()
+            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        unsafe {
+            device
+                .begin_command_buffer(self.command_buffer, &begin)
+                .map_err(|e| format!("render: begin_cmd: {e}"))?;
+        }
+
+        // src: UNDEFINED -> TRANSFER_SRC_OPTIMAL; dst: UNDEFINED -> TRANSFER_DST_OPTIMAL
+        let barrier_src = vk::ImageMemoryBarrier::default()
+            .image(src)
+            .old_layout(vk::ImageLayout::UNDEFINED)
+            .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+            .src_access_mask(vk::AccessFlags::empty())
+            .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+            .subresource_range(vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            });
+        let barrier_dst = vk::ImageMemoryBarrier::default()
+            .image(dst)
+            .old_layout(vk::ImageLayout::UNDEFINED)
+            .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .src_access_mask(vk::AccessFlags::empty())
+            .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .subresource_range(vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            });
+        unsafe {
+            device.cmd_pipeline_barrier(
+                self.command_buffer,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[barrier_src, barrier_dst],
+            );
+        }
+
+        let region = vk::ImageBlit::default()
+            .src_subresource(vk::ImageSubresourceLayers {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                mip_level: 0,
+                base_array_layer: 0,
+                layer_count: 1,
+            })
+            .src_offsets([
+                vk::Offset3D { x: 0, y: 0, z: 0 },
+                vk::Offset3D {
+                    x: self.extent.width as i32,
+                    y: self.extent.height as i32,
+                    z: 1,
+                },
+            ])
+            .dst_subresource(vk::ImageSubresourceLayers {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                mip_level: 0,
+                base_array_layer: 0,
+                layer_count: 1,
+            })
+            .dst_offsets([
+                vk::Offset3D { x: 0, y: 0, z: 0 },
+                vk::Offset3D {
+                    x: self.extent.width as i32,
+                    y: self.extent.height as i32,
+                    z: 1,
+                },
+            ]);
+        unsafe {
+            device.cmd_blit_image(
+                self.command_buffer,
+                src,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                dst,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &[region],
+                vk::Filter::LINEAR,
+            );
+        }
+
+        // dst -> PRESENT_SRC (must be COLOR_ATTACHMENT_OPTIMAL or PRESENT_SRC)
+        let present_barrier = vk::ImageMemoryBarrier::default()
+            .image(dst)
+            .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)
+            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .dst_access_mask(vk::AccessFlags::empty())
+            .subresource_range(vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            });
+        unsafe {
+            device.cmd_pipeline_barrier(
+                self.command_buffer,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[present_barrier],
+            );
+        }
+
+        unsafe {
+            device
+                .end_command_buffer(self.command_buffer)
+                .map_err(|e| format!("render: end_cmd: {e}"))?;
+        }
+        let cmd_bufs = [self.command_buffer];
+        let submit = vk::SubmitInfo::default().command_buffers(&cmd_bufs);
+        unsafe {
+            device
+                .queue_submit(self.queue, &[submit], vk::Fence::null())
+                .map_err(|e| format!("render: queue_submit (blit): {e}"))?;
+        }
+
+        // Present (OUT_OF_DATE/SUBOPTIMAL recreate handled inside present).
+        self.present(swapchain_index, &[])
+    }
+
     /// Destroy the current swapchain and re-create it against the same
     /// surface, re-fetching the images (anti-stale-state: image list, extent
     /// and format are all re-queried). Needed for rotation/resize (M5 dynamic
@@ -850,6 +1104,16 @@ impl Drop for RenderState {
                     device.free_memory(mem, None);
                 }
                 self.image_memories.clear();
+                for (_, img) in self.ahb_images.drain() {
+                    device.destroy_image(img, None);
+                }
+                for (_, mem) in self.ahb_memories.drain() {
+                    device.free_memory(mem, None);
+                }
+                if self.command_pool != vk::CommandPool::null() {
+                    device.destroy_command_pool(self.command_pool, None);
+                    self.command_pool = vk::CommandPool::null();
+                }
             }
         }
         if let Some(device) = self.device.take() {

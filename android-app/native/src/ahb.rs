@@ -150,9 +150,16 @@ impl AhbSlot {
     /// (no `VK_EXT_swapchain_maintenance1` / no AHB extension on the host
     /// driver). GPU usage flags cover both the server rendering into the
     /// buffer via dma-buf import and the App sampling it for presentation.
+    ///
+    /// CPU_READ_OFTEN is included to force a LINEAR (uncompressed) layout on
+    /// Adreno gralloc: the server's turnip must import this dma-buf, and
+    /// turnip crashes (SIGSEGV) when handed a UBWC-compressed gralloc buffer
+    /// (device-verified). LINEAR costs ~2x bandwidth vs UBWC but stays within
+    /// the PERFORMANCE_BOUNDARIES §2 budget.
     pub fn allocate(slot: u32, width: u32, height: u32) -> Result<Self, String> {
         let usage = (ndk_sys::AHardwareBuffer_UsageFlags::AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE.0
-            | ndk_sys::AHardwareBuffer_UsageFlags::AHARDWAREBUFFER_USAGE_GPU_COLOR_OUTPUT.0)
+            | ndk_sys::AHardwareBuffer_UsageFlags::AHARDWAREBUFFER_USAGE_GPU_COLOR_OUTPUT.0
+            | ndk_sys::AHardwareBuffer_UsageFlags::AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN.0)
             as u64;
         let desc = ndk_sys::AHardwareBuffer_Desc {
             width,
@@ -301,6 +308,13 @@ impl AhbSlot {
     /// slot without one can never be registered).
     pub fn has_ahb(&self) -> bool {
         self.ahb.is_some()
+    }
+
+    /// The raw `AHardwareBuffer*` for renderer-side import (route 1: the
+    /// App imports its own AHB as a VkImage and GPU-blits it into the
+    /// swapchain each frame).
+    pub fn raw_ahb_ptr(&self) -> Option<*mut ndk_sys::AHardwareBuffer> {
+        self.ahb.as_ref().map(|h| h.0.as_ptr())
     }
 }
 

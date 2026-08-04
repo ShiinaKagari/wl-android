@@ -245,8 +245,10 @@ extern "system" fn Java_com_wl_android_NativeBridge_nativeSetSurface(
 /// server re-arms it via BRDY only after a successful present path).
 ///
 /// Bring-up gate (V-33): a streak of [`PRESENT_FAIL_GATE`] present failures
-/// logs a clear "UBWC import failure suspected" message — pixel verification
-/// is the server doctor's `import_ubwc_test` (lane 32).
+/// Route-1 present: on a fence frame (server blitted into the App's LINEAR
+/// AHB slot), import the sync_file fence, GPU-blit the AHB into the acquired
+/// swapchain image, then present. The blit waits on the fence so we never
+/// sample the AHB before the server finished writing it.
 fn present_fence_frame(state: &StateRef, serial: u64, buffer_id: u32, fence: &OwnedFd) {
     let mut inner = match state.lock() {
         Ok(i) => i,
@@ -257,24 +259,31 @@ fn present_fence_frame(state: &StateRef, serial: u64, buffer_id: u32, fence: &Ow
     };
     if !inner.render.initialized {
         log::warn!(
-            "present: fence frame for slot {buffer_id} (serial={serial}) but swapchain uninitialized — dropped (no present target; fence frame carries no pixels for the CPU path)"
+            "present: fence frame for slot {buffer_id} (serial={serial}) but swapchain uninitialized — dropped"
         );
         return;
     }
-    let present_result = match inner.render.import_sync_fd_as_semaphore(fence) {
-        Ok(sem) => {
-            let r = inner.render.present(buffer_id, &[sem]);
-            inner.render.destroy_semaphore(sem);
-            r
+    // The swapchain image to blit into. The server's buffer_id == slot number;
+    // acquire a free swapchain image (u64::MAX = block until available).
+    let swapchain_index = match inner.render.acquire_next_image(u64::MAX, None, None) {
+        Ok(i) => i,
+        Err(e) => {
+            inner.consecutive_present_failures += 1;
+            log::warn!("present: acquire for slot {buffer_id} failed: {e}");
+            return;
         }
+    };
+
+    let sem = match inner.render.import_sync_fd_as_semaphore(fence) {
+        Ok(s) => Some(s),
         Err(import_err) => {
             log::warn!(
-                "present: SYNC_FD import failed for slot {buffer_id}: {import_err} — fallback: wait_sync_fd + present without wait"
+                "present: SYNC_FD import failed for slot {buffer_id}: {import_err} — fallback: wait_sync_fd"
             );
             match inner.render.wait_sync_fd(fence, 1000) {
-                Ok(true) => inner.render.present(buffer_id, &[]),
+                Ok(true) => None,
                 Ok(false) => {
-                    log::warn!("present: fence wait timed out (1s) for slot {buffer_id} (serial={serial}) — frame dropped, slot stays occupied");
+                    log::warn!("present: fence wait timed out (1s) for slot {buffer_id} (serial={serial}) — frame dropped");
                     return;
                 }
                 Err(e) => {
@@ -284,9 +293,14 @@ fn present_fence_frame(state: &StateRef, serial: u64, buffer_id: u32, fence: &Ow
             }
         }
     };
+
+    let present_result = inner.render.blit_ahb_to_swapchain(buffer_id, swapchain_index, sem);
+    if let Some(s) = sem {
+        inner.render.destroy_semaphore(s);
+    }
     match present_result {
         Ok(()) => {
-            log::info!("present: slot={buffer_id} (serial={serial}, fence-waited) — swapchain present path OK");
+            log::info!("present: slot={buffer_id} (serial={serial}, fence-waited) — AHB blit + swapchain present OK");
             inner.consecutive_present_failures = 0;
         }
         Err(e) => {
@@ -294,7 +308,7 @@ fn present_fence_frame(state: &StateRef, serial: u64, buffer_id: u32, fence: &Ow
             log::warn!("present: slot={buffer_id} failed: {e}");
             if inner.consecutive_present_failures == PRESENT_FAIL_GATE {
                 log::error!(
-                    "UBWC IMPORT FAILURE SUSPECTED: {n} consecutive present failures on slot {buffer_id} (serial={serial}) — run server doctor `import_ubwc_test` (lane 32); on failure force LINEAR modifier or pause P3",
+                    "PRESENT FAILURE SUSPECTED: {n} consecutive present failures on slot {buffer_id} (serial={serial})",
                     n = inner.consecutive_present_failures,
                 );
             }
@@ -302,10 +316,12 @@ fn present_fence_frame(state: &StateRef, serial: u64, buffer_id: u32, fence: &Ow
     }
 }
 
-/// P-13/P-14 slot registration, run on the JNI thread in `nativeSetSurface`:
-/// export each swapchain image's backing AHardwareBuffer
-/// ([`AhbSlot::from_swapchain_image`]), then for each slot send the TBUF
-/// message followed IMMEDIATELY by the AHB native_handle
+/// P-13/P-14 slot registration (route 1), run on the JNI thread in
+/// `nativeSetSurface`: allocate SLOT_COUNT standalone LINEAR AHardwareBuffers
+/// ([`AhbSlot::allocate`] — CPU_READ_OFTEN forces LINEAR so the server's
+/// turnip can import the dma-buf without crashing), import each into the
+/// renderer's AHB image table, then for each slot send the TBUF message
+/// followed IMMEDIATELY by the AHB native_handle
 /// ([`AhbSlot::send_registration`]) on the session socket — order is
 /// load-bearing (the server decodes TBUF and treats the very next bytes as
 /// the handle, mirroring `AppSession::send_tbuf_then_handle`).
@@ -320,28 +336,21 @@ fn present_fence_frame(state: &StateRef, serial: u64, buffer_id: u32, fence: &Ow
 /// traffic can exist before these TBUFs flush. Full single-writer discipline
 /// (one lock for ALL sends) is a follow-up (M7).
 fn register_swapchain_slots(inner: &mut Inner) -> Result<u32, String> {
-    let (Some(instance), Some(device)) = (inner.render.raw_instance(), inner.render.raw_device_ref())
-    else {
-        return Err("render instance/device not available".into());
-    };
-    let loader = ash::android::external_memory_android_hardware_buffer::Device::new(instance, device);
     let extent = inner.render.extent();
-    let image_count = inner.render.images().len();
-    let mut slots = Vec::with_capacity(image_count);
-    for i in 0..image_count {
-        let memory = inner.render.image_memory(i as u32)
-            .ok_or_else(|| format!("swapchain image {i} has no bound VkDeviceMemory"))?;
-        slots.push(AhbSlot::from_swapchain_image(
-            &loader,
-            i as u32,
-            memory,
-            extent.width,
-            extent.height,
-        )?);
+    let slots = crate::ahb::allocate_slots(extent.width, extent.height)?;
+    for slot in &slots {
+        let ahb = slot.raw_ahb_ptr().ok_or_else(|| {
+            format!("slot {} has no AHB pointer", slot.slot)
+        })?;
+        inner
+            .render
+            .import_ahb_image(slot.slot, ahb, extent.width, extent.height)
+            .map_err(|e| format!("import AHB slot {}: {e}", slot.slot))?;
     }
-    if image_count != wl_android_common::proto::SLOT_COUNT {
+    if slots.len() != wl_android_common::proto::SLOT_COUNT {
         log::warn!(
-            "swapchain has {image_count} images but server gates blit on {} TBUFs — blit may stall",
+            "allocated {} slots but server gates blit on {} TBUFs — blit may stall",
+            slots.len(),
             wl_android_common::proto::SLOT_COUNT,
         );
     }
