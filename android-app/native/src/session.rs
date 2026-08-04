@@ -1,5 +1,5 @@
 use std::ffi::CString;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
@@ -8,6 +8,93 @@ use wl_android_common::proto;
 use wl_android_common::proto::Message;
 
 use crate::ahb::AhbSlot;
+
+/// Read-ahead buffered reader for the App side of the land socket.
+///
+/// The transport is SOCK_STREAM (DESIGN.md P-01 deviation): the kernel may
+/// split one length-prefixed message across recvmsg calls, or coalesce
+/// several (a frame's FACK + a Touch/Key from the JNI path) into one. The
+/// server's Transport buffers with `pending`; this mirrors that so the App
+/// recv thread never sees a partial length prefix ("recv too short" crash —
+/// previously triggered once input sends gained their own write path and
+/// could interleave with FACK bytes).
+struct PendingReader {
+    stream: UnixStream,
+    buf: Vec<u8>,
+    pending: Vec<u8>,
+    pending_fds: Vec<OwnedFd>,
+}
+
+impl PendingReader {
+    fn new(stream: UnixStream) -> Self {
+        Self {
+            stream,
+            buf: vec![0u8; 65536],
+            pending: Vec::new(),
+            pending_fds: Vec::new(),
+        }
+    }
+
+    /// Read one complete length-prefixed message. Blocks until a full message
+    /// is available (the caller drives the recv thread's loop). Returns the
+    /// message body (length prefix stripped) plus any SCM_RIGHTS fds that
+    /// belong to it — fds are delivered in byte order on SOCK_STREAM, and a
+    /// message's fds arrive with or before its final bytes, so the first
+    /// message in `pending` owns the leading fds.
+    fn next_message(&mut self) -> io::Result<(Vec<u8>, Vec<OwnedFd>)> {
+        loop {
+            if let Some((body, fds)) = Self::take_message(&mut self.pending, &mut self.pending_fds) {
+                return Ok((body, fds));
+            }
+            // Not enough bytes for a full message — pull more from the socket.
+            let (n_bytes, fds) = {
+                let mut cmsg_space = nix::cmsg_space!([std::os::fd::RawFd; 4]);
+                let mut iov = [std::io::IoSliceMut::new(&mut self.buf)];
+                let msg = nix::sys::socket::recvmsg::<()>(
+                    self.stream.as_raw_fd(),
+                    &mut iov,
+                    Some(&mut cmsg_space),
+                    nix::sys::socket::MsgFlags::empty(),
+                )?;
+                let fds: Vec<OwnedFd> = msg
+                    .cmsgs()
+                    .map(|iter| {
+                        iter.flat_map(|c| match c {
+                            nix::sys::socket::ControlMessageOwned::ScmRights(fds) => fds,
+                            _ => vec![],
+                        })
+                        .map(|fd| unsafe { OwnedFd::from_raw_fd(fd) })
+                        .collect()
+                    })
+                    .unwrap_or_default();
+                (msg.bytes, fds)
+            };
+            if n_bytes == 0 {
+                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "socket closed"));
+            }
+            self.pending.extend_from_slice(&self.buf[..n_bytes]);
+            self.pending_fds.extend(fds);
+            // Loop: the recvmsg may have coalesced several messages, and the
+            // first complete one is served now.
+        }
+    }
+
+    /// Pop one complete length-prefixed message from the pending buffer.
+    /// Returns None when the buffer holds fewer than 4 bytes or a partial body.
+    fn take_message(pending: &mut Vec<u8>, pending_fds: &mut Vec<OwnedFd>) -> Option<(Vec<u8>, Vec<OwnedFd>)> {
+        if pending.len() < 4 {
+            return None;
+        }
+        let msg_len = u32::from_le_bytes([pending[0], pending[1], pending[2], pending[3]]) as usize;
+        if pending.len() < 4 + msg_len {
+            return None;
+        }
+        let body = pending[4..4 + msg_len].to_vec();
+        let fds = std::mem::take(pending_fds);
+        pending.drain(..4 + msg_len);
+        Some((body, fds))
+    }
+}
 
 #[allow(unused)]
 fn dlog(tag: &str, msg: &str) {
@@ -138,7 +225,6 @@ fn send_fack_and_maybe_brdy(wr: &mut UnixStream, fm: &proto::FrameMessage) -> io
 
 pub struct AppSession {
     pub write_stream: Arc<UnixStream>,
-    recv_buf: Vec<u8>,
 }
 
 impl AppSession {
@@ -149,7 +235,7 @@ impl AppSession {
         stream.set_nonblocking(false)?;
         let write_stream = Arc::new(stream.try_clone()?);
         let read_stream = stream;
-        Ok((Self { write_stream, recv_buf: vec![0u8; 65536] }, read_stream))
+        Ok((Self { write_stream }, read_stream))
     }
 
     pub fn socket_fd(&self) -> std::os::raw::c_int {
@@ -205,13 +291,12 @@ impl AppSession {
         on_frame: impl Fn(u64, u32, u32, u32, Option<OwnedFd>, &[u8]),
     ) -> io::Result<()> {
         dlog("land-native", "run_loop: entered");
-        let mut buf = vec![0u8; 65536];
-        let mut rd = read_stream;
+        let mut reader = PendingReader::new(read_stream);
         let mut wr = write_stream;
 
         // 1. Receive HELO
         dlog("land-native", "recv_thread: waiting for HELO...");
-        let (data, _fds) = Self::recv_raw_with_fds(&mut rd, &mut buf)?;
+        let (data, _fds) = reader.next_message()?;
         let msg = proto::decode(&data, vec![])
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
         if let Message::Hello(helo) = msg {
@@ -260,10 +345,10 @@ impl AppSession {
 
         // 3. Frame ← Ack loop
         loop {
-            let (data, fds) = match Self::recv_raw_with_fds(&mut rd, &mut buf) {
+            let (data, fds) = match reader.next_message() {
                 Ok(v) => v,
                 Err(e) => {
-                    let err_msg = format!("recv_raw_with_fds failed: {e}");
+                    let err_msg = format!("next_message failed: {e}");
                     dlog("land-native", &err_msg);
                     log::error!("{err_msg}");
                     return Err(e);
@@ -332,52 +417,6 @@ impl AppSession {
     ) -> io::Result<()> {
         Self::write_msg_on(wr, tbuf_data)?;
         handle_sender(wr.as_raw_fd()).map_err(|e| io::Error::new(io::ErrorKind::Other, e))
-    }
-
-    fn recv_raw_with_fds(
-        stream: &mut UnixStream,
-        buf: &mut Vec<u8>,
-    ) -> io::Result<(Vec<u8>, Vec<OwnedFd>)> {
-        use std::os::fd::AsRawFd;
-        use std::io::IoSliceMut;
-
-        let mut cmsg_space = nix::cmsg_space!([std::os::fd::RawFd; 4]);
-        let (n_bytes, fds) = {
-            let mut iov = [IoSliceMut::new(buf)];
-            let msg = nix::sys::socket::recvmsg::<()>(
-                stream.as_raw_fd(),
-                &mut iov,
-                Some(&mut cmsg_space),
-                nix::sys::socket::MsgFlags::empty(),
-            )?;
-            let fds: Vec<OwnedFd> = msg
-                .cmsgs()
-                .map(|iter| {
-                    iter.flat_map(|c| match c {
-                        nix::sys::socket::ControlMessageOwned::ScmRights(fds) => fds,
-                        _ => vec![],
-                    })
-                    .map(|fd| unsafe { OwnedFd::from_raw_fd(fd) })
-                    .collect()
-                })
-                .unwrap_or_default();
-            (msg.bytes, fds)
-        };
-
-        let info_msg = format!("recv_raw: {n_bytes} bytes, {} fds", fds.len());
-        dlog("land-native", &info_msg);
-        log::info!("{info_msg}");
-
-        if n_bytes < 4 {
-            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "recv too short"));
-        }
-        let msg_len = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
-        if msg_len + 4 > n_bytes {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "recv truncated"));
-        }
-
-        let data = buf[4..4 + msg_len].to_vec();
-        Ok((data, fds))
     }
 }
 
