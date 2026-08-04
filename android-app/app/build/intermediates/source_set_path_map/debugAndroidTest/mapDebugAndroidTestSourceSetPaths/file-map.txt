@@ -1,4 +1,0 @@
-com.wl.android.test.app-androidTest-0 /home/kagari/Projects/wl-android/android-app/app/build/generated/res/resValues/androidTest/debug
-com.wl.android.test.app-mergeDebugAndroidTestResources-1 /home/kagari/Projects/wl-android/android-app/app/build/intermediates/incremental/debugAndroidTest/mergeDebugAndroidTestResources/merged.dir
-com.wl.android.test.app-mergeDebugAndroidTestResources-2 /home/kagari/Projects/wl-android/android-app/app/build/intermediates/incremental/debugAndroidTest/mergeDebugAndroidTestResources/stripped.dir
-com.wl.android.test.app-debugAndroidTest-3 /home/kagari/Projects/wl-android/android-app/app/build/intermediates/merged_res/debugAndroidTest/mergeDebugAndroidTestResources

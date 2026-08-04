@@ -5,3 +5,7 @@ android-app/native/target/
 soak-results/
 .omo/start-work/*/target/
 
+android-app/.gradle/
+android-app/app/build/
+android-app/build/
+android-app/local.properties
