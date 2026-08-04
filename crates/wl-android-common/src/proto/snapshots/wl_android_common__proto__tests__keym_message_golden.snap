@@ -3,11 +3,11 @@ source: crates/wl-android-common/src/proto/tests.rs
 expression: "&bytes"
 ---
 [
-    72,
+    75,
     69,
-    76,
-    79,
-    2,
+    89,
+    77,
+    30,
     0,
     0,
     0,
@@ -15,8 +15,8 @@ expression: "&bytes"
     0,
     0,
     0,
-    0,
-    0,
+    57,
+    48,
     0,
     0,
 ]

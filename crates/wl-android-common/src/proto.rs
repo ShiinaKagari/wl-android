@@ -13,26 +13,31 @@ pub const MAGIC_FACK: u32 = u32::from_le_bytes(*b"FACK");
 pub const MAGIC_TBUF: u32 = u32::from_le_bytes(*b"TBUF");
 pub const MAGIC_BGON: u32 = u32::from_le_bytes(*b"BGON");
 pub const MAGIC_TOUC: u32 = u32::from_le_bytes(*b"TOUC");
+pub const MAGIC_KEYM: u32 = u32::from_le_bytes(*b"KEYM");
+pub const MAGIC_BRDY: u32 = u32::from_le_bytes(*b"BRDY");
 
 // =============================================================================
 // Version
 // =============================================================================
 
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 // =============================================================================
 // Caps bits
 // =============================================================================
 
 pub const SERVER_CAP_BLIT: u32 = 1 << 0;
+pub const SERVER_CAP_FENCE: u32 = 1 << 1;
 
 pub const APP_CAP_DIRECT_IMPORT: u32 = 1 << 0;
+pub const APP_CAP_SWAPCHAIN: u32 = 1 << 1;
 
 // =============================================================================
 // Frame flags
 // =============================================================================
 
 pub const FRAME_CARRIES_FDS: u32 = 1 << 0;
+pub const FRAME_CARRIES_FENCE: u32 = 1 << 1;
 
 // =============================================================================
 // Touch phases
@@ -166,6 +171,18 @@ impl FrameMessage {
             self.flags &= !FRAME_CARRIES_FDS;
         }
     }
+
+    pub fn carries_fence(&self) -> bool {
+        self.flags & FRAME_CARRIES_FENCE != 0
+    }
+
+    pub fn set_carries_fence(&mut self, v: bool) {
+        if v {
+            self.flags |= FRAME_CARRIES_FENCE;
+        } else {
+            self.flags &= !FRAME_CARRIES_FENCE;
+        }
+    }
 }
 
 // =============================================================================
@@ -278,6 +295,52 @@ impl TouchMessage {
 }
 
 // =============================================================================
+// 4.8 KeyMessage (App → server, 16 B) — T-04
+// =============================================================================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout)]
+#[repr(C)]
+pub struct KeyMessage {
+    pub magic: u32,
+    pub keycode: u32,
+    pub state: u32,
+    pub time_ms: u32,
+}
+
+impl KeyMessage {
+    pub fn new(keycode: u32, state: u32, time_ms: u32) -> Self {
+        Self {
+            magic: MAGIC_KEYM,
+            keycode,
+            state,
+            time_ms,
+        }
+    }
+}
+
+// =============================================================================
+// 4.9 BufferReady (App → server, 16 B) — F-14
+// =============================================================================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout)]
+#[repr(C)]
+pub struct BufferReady {
+    pub magic: u32,
+    pub slot: u32,
+    pub _reserved: u64,
+}
+
+impl BufferReady {
+    pub fn new(slot: u32) -> Self {
+        Self {
+            magic: MAGIC_BRDY,
+            slot,
+            _reserved: 0,
+        }
+    }
+}
+
+// =============================================================================
 // Message enum (decode output)
 // =============================================================================
 
@@ -290,6 +353,8 @@ pub enum Message {
     Slot(SlotBuffer),
     Gone(BufferGone),
     Touch(TouchMessage),
+    Key(KeyMessage),
+    Ready(BufferReady),
 }
 
 impl PartialEq for Message {
@@ -302,6 +367,8 @@ impl PartialEq for Message {
             (Self::Slot(a), Self::Slot(b)) => a == b,
             (Self::Gone(a), Self::Gone(b)) => a == b,
             (Self::Touch(a), Self::Touch(b)) => a == b,
+            (Self::Key(a), Self::Key(b)) => a == b,
+            (Self::Ready(a), Self::Ready(b)) => a == b,
             _ => false,
         }
     }
@@ -346,6 +413,8 @@ const _: () = {
     assert!(size_of::<SlotBuffer>() == 64);
     assert!(size_of::<BufferGone>() == 16);
     assert!(size_of::<TouchMessage>() == 24);
+    assert!(size_of::<KeyMessage>() == 16);
+    assert!(size_of::<BufferReady>() == 16);
     assert!(size_of::<PlaneDesc>() == 8);
 };
 
@@ -364,13 +433,20 @@ pub fn encode(msg: &Message) -> Vec<u8> {
         Message::Slot(m) => m.as_bytes().to_vec(),
         Message::Gone(m) => m.as_bytes().to_vec(),
         Message::Touch(m) => m.as_bytes().to_vec(),
+        Message::Key(m) => m.as_bytes().to_vec(),
+        Message::Ready(m) => m.as_bytes().to_vec(),
     }
 }
 
 /// Returns the number of fds that must accompany this message via SCM_RIGHTS.
 pub fn fd_count(msg: &Message) -> usize {
     match msg {
-        Message::Frame(m, _) if m.carries_fds() => m.num_planes as usize,
+        // P-08: CARRIES_FDS → num_planes fds
+        // P-08b: CARRIES_FENCE → +1 fence fd (coexistable)
+        Message::Frame(m, _) => {
+            (if m.carries_fds() { m.num_planes as usize } else { 0 })
+                + (if m.carries_fence() { 1 } else { 0 })
+        }
         _ => 0,
     }
 }
@@ -396,7 +472,8 @@ pub fn decode(buf: &[u8], fds: Vec<OwnedFd>) -> Result<Message, ProtoError> {
         MAGIC_LAND => {
             check_len::<FrameMessage>(buf)?;
             let (m, _) = FrameMessage::read_from_prefix(buf).unwrap();
-            let expected = if m.carries_fds() { m.num_planes as usize } else { 0 };
+            let expected = (if m.carries_fds() { m.num_planes as usize } else { 0 })
+                + (if m.carries_fence() { 1 } else { 0 });
             if fds.len() != expected {
                 return Err(ProtoError::FdMismatch { expected, got: fds.len() });
             }
@@ -421,6 +498,16 @@ pub fn decode(buf: &[u8], fds: Vec<OwnedFd>) -> Result<Message, ProtoError> {
             check_len::<TouchMessage>(buf)?;
             let (m, _) = TouchMessage::read_from_prefix(buf).unwrap();
             Ok(Message::Touch(m))
+        }
+        MAGIC_KEYM => {
+            check_len::<KeyMessage>(buf)?;
+            let (m, _) = KeyMessage::read_from_prefix(buf).unwrap();
+            Ok(Message::Key(m))
+        }
+        MAGIC_BRDY => {
+            check_len::<BufferReady>(buf)?;
+            let (m, _) = BufferReady::read_from_prefix(buf).unwrap();
+            Ok(Message::Ready(m))
         }
         _ => Err(ProtoError::BadMagic { got: magic }),
     }
