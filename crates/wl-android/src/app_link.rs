@@ -8,6 +8,11 @@ use crate::blit::BlitEngine;
 use crate::transport::Transport;
 use wl_android_common::proto::{self, HelloMessage, Message, PROTOCOL_VERSION};
 
+/// How long recv_native_handle_follow_up waits for a native_handle's trailing
+/// SCM_RIGHTS fds (which can arrive in a later recvmsg than the bytes on
+/// SOCK_STREAM) before giving up. Mirrors the pre-fix poll budget (~100 ms).
+const HANDLE_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
+
 // ── Listener ──
 
 pub fn create_listener(path: &str) -> io::Result<UnixListener> {
@@ -208,17 +213,93 @@ impl AppSession {
     }
 
     /// P-13 follow-up: the native_handle raw message immediately follows each
-    /// TBUF. A bounded non-blocking poll absorbs socket-scheduling gaps so the
-    /// unframed bytes are never mistaken for a length-prefixed protocol message.
+    /// TBUF. Consumes exactly ONE native_handle: the 12-byte header drives how
+    /// many bytes and fds to wait for (on SOCK_STREAM the kernel can deliver a
+    /// handle's bytes in one recvmsg and its SCM_RIGHTS fds in a later one, so
+    /// an fd-short first chunk must wait instead of bailing). Any bytes/fds
+    /// that followed the handle inside the same coalesced recvmsg (the slot-
+    /// registration burst) are pushed back into the transport so the next
+    /// message decodes intact instead of being silently dropped.
     fn recv_native_handle_follow_up(&mut self) -> Option<(Vec<u8>, Vec<OwnedFd>)> {
-        for _ in 0..100 {
+        let deadline = std::time::Instant::now() + HANDLE_WAIT_TIMEOUT;
+
+        // First raw chunk — serves pending (the handle coalesced right after the
+        // TBUF) or one recvmsg. Bounded poll absorbs socket-scheduling gaps.
+        let (mut data, mut fds) = loop {
             match self.transport.recv_raw() {
-                Ok(Some(raw)) => return Some(raw),
-                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(1)),
+                Ok(Some((d, f))) => break (d, f),
+                Ok(None) => {
+                    if std::time::Instant::now() >= deadline {
+                        return None;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
                 Err(_) => return None,
             }
+        };
+
+        loop {
+            if data.len() < 12 {
+                // Split header — accumulate more bytes (and any fds riding along).
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                match self.transport.recv_raw_with_fd_wait(0, remaining) {
+                    Ok(Some((d, f))) => {
+                        data.extend_from_slice(&d);
+                        fds.extend(f);
+                    }
+                    Ok(None) => return Some((data, fds)), // timeout — parse reports it
+                    Err(_) => return None,
+                }
+                continue;
+            }
+            let num_fds = i32::from_le_bytes([data[4], data[5], data[6], data[7]]);
+            let num_ints = i32::from_le_bytes([data[8], data[9], data[10], data[11]]);
+            if num_fds < 0 || num_ints < 0 {
+                return None; // malformed header
+            }
+            let (num_fds, num_ints) = (num_fds as usize, num_ints as usize);
+            let expected_len = 12 + num_ints * 4;
+
+            if fds.len() < num_fds {
+                // fd-short: the SCM_RIGHTS fds trail the bytes on SOCK_STREAM.
+                // Wait (bounded) instead of failing — this was the device's
+                // "malformed native_handle for slot 0".
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                match self.transport.recv_raw_with_fd_wait(num_fds, remaining) {
+                    Ok(Some((d, f))) => {
+                        data.extend_from_slice(&d);
+                        fds.extend(f);
+                    }
+                    Ok(None) => return Some((data, fds)), // timeout — parse fails fd-short
+                    Err(_) => return None,
+                }
+                continue;
+            }
+            if data.len() < expected_len {
+                // Bytes short — accumulate the rest of the handle.
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                match self.transport.recv_raw_with_fd_wait(0, remaining) {
+                    Ok(Some((d, f))) => {
+                        data.extend_from_slice(&d);
+                        fds.extend(f);
+                    }
+                    Ok(None) => return Some((data, fds)), // timeout — parse fails short
+                    Err(_) => return None,
+                }
+                continue;
+            }
+
+            // Complete handle: take exactly its bytes + fds and preserve any
+            // bytes/fds that followed it in the same recvmsg (coalesced burst).
+            let handle_data = data[..expected_len].to_vec();
+            let handle_fds: Vec<OwnedFd> = fds.drain(..num_fds).collect();
+            let leftover_data = data[expected_len..].to_vec();
+            let leftover_fds = fds;
+            if !leftover_data.is_empty() || !leftover_fds.is_empty() {
+                self.transport.unrecv_raw(leftover_data, leftover_fds);
+            }
+            return Some((handle_data, handle_fds));
         }
-        None
     }
 
     pub fn slot_count(&self) -> u32 {

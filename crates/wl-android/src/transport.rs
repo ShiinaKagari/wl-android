@@ -6,6 +6,13 @@ use std::os::unix::net::UnixStream;
 use nix::sys::socket::{self, MsgFlags, ControlMessage, ControlMessageOwned};
 use wl_android_common::proto::{self, Message};
 
+/// Max fds a single recvmsg must be able to carry. The App registers all its
+/// slots back-to-back (5 TBUF+handle pairs → 5 SCM_RIGHTS fds coalescing into
+/// one recvmsg); a frame may add a fence fd on top. cmsg space is ~24 B/fd, so
+/// 16 is cheap headroom. (`cmsg_space!([RawFd; 4])` truncated the burst —
+/// MSG_CTRUNC silently dropped the excess fds.)
+const MAX_RECV_FDS: usize = 16;
+
 /// Message transport over a SOCK_STREAM unix socket.
 ///
 /// DESIGN.md P-01 mandates SOCK_SEQPACKET so the kernel preserves message
@@ -138,6 +145,69 @@ impl Transport {
         }
     }
 
+    /// Raw receive that waits (bounded) until `min_fds` SCM_RIGHTS fds are
+    /// buffered, then returns the pending blob (bytes + fds). On SOCK_STREAM
+    /// the kernel can deliver a native_handle's bytes in one recvmsg and its
+    /// fds in a later one, so the P-13 consumer must not give up when the
+    /// first raw chunk comes up fd-short — it keeps pulling recvmsgs into
+    /// `pending` until the trailing fds arrive (or `timeout` elapses).
+    ///
+    /// With `min_fds == 0` it serves the next byte-carrying recvmsg instead
+    /// (used to accumulate a split native_handle header). Never returns an
+    /// empty blob: Ok(None) means the socket closed or the timeout expired.
+    pub fn recv_raw_with_fd_wait(
+        &mut self,
+        min_fds: usize,
+        timeout: std::time::Duration,
+    ) -> io::Result<Option<(Vec<u8>, Vec<OwnedFd>)>> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            // With min_fds > 0, serve once that many fds are buffered (bytes
+            // ride along); with min_fds == 0, serve the next byte-carrying
+            // recvmsg (used to accumulate a split native_handle header).
+            let serve_fds = min_fds > 0 && self.pending_fds.len() >= min_fds;
+            let serve_bytes = !self.pending.is_empty();
+            if serve_fds || (min_fds == 0 && serve_bytes) {
+                let data = mem::take(&mut self.pending);
+                let fds = mem::take(&mut self.pending_fds);
+                return Ok(Some((data, fds)));
+            }
+            match self.recv_raw_inner(MsgFlags::MSG_DONTWAIT) {
+                Ok((data, fds)) => {
+                    if data.is_empty() && fds.is_empty() {
+                        return Ok(None); // peer closed
+                    }
+                    self.pending.extend_from_slice(&data);
+                    self.pending_fds.extend(fds);
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    if std::time::Instant::now() >= deadline {
+                        return Ok(None);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// Put raw bytes + fds back at the FRONT of `pending`. The P-13 consumer
+    /// uses this to preserve whatever followed a native_handle inside the same
+    /// coalesced recvmsg (e.g. the next [len][TBUF][handle] unit) so the next
+    /// recv()/recv_raw() sees it instead of it being silently dropped.
+    pub fn unrecv_raw(&mut self, data: Vec<u8>, fds: Vec<OwnedFd>) {
+        if !data.is_empty() {
+            let mut combined = data;
+            combined.extend_from_slice(&self.pending);
+            self.pending = combined;
+        }
+        if !fds.is_empty() {
+            let mut combined = fds;
+            combined.append(&mut self.pending_fds);
+            self.pending_fds = combined;
+        }
+    }
+
     /// Send raw bytes + fds (no length prefix). Used for native_handle forwarding.
     #[allow(dead_code)]
     pub fn send_raw(&mut self, data: &[u8], fds: &[RawFd]) -> io::Result<()> {
@@ -219,7 +289,12 @@ impl Transport {
 
     fn recv_raw_inner(&mut self, flags: MsgFlags) -> io::Result<(Vec<u8>, Vec<OwnedFd>)> {
         use std::io::IoSliceMut;
-        let mut cmsg_space = nix::cmsg_space!([RawFd; 4]);
+        // One recvmsg can coalesce the whole slot-registration burst: the App
+        // sends all TBUF+handle pairs back-to-back, so all 5 SCM_RIGHTS fds
+        // land in a single cmsg block (a frame may add a fence fd on top). The
+        // old `[RawFd; 4]` truncated anything with 5 fds (MSG_CTRUNC drops the
+        // excess), and 16 fds cost only ~400 B of cmsg space.
+        let mut cmsg_space = nix::cmsg_space!([RawFd; MAX_RECV_FDS]);
 
         let (n_bytes, fds) = {
             let mut iov = [IoSliceMut::new(&mut self.recv_buf)];
@@ -461,6 +536,180 @@ mod tests {
         assert_eq!(data, native_handle_bytes());
         assert_eq!(fds.len(), 1);
         assert_valid_fd(&fds[0]);
+    }
+
+    // THE device-verified blocker (multi-slot registration burst). The real App
+    // registers ALL its slots back-to-back in the same millisecond; the 5
+    // TBUF+handle pairs coalesce into ONE recvmsg carrying 5 SCM_RIGHTS fds.
+    // The pre-fix transport had cmsg room for only 4 fds (MSG_CTRUNC dropped
+    // the 5th) and recv_raw() drained the WHOLE coalesced blob — it consumed
+    // handle0 but silently discarded the trailing [len][TBUF1..4][handle1..4]
+    // bytes + their fds, so slot 0 registered and then the session desynced
+    // (the App's remaining TBUFs never arrived → stall → ECONNRESET).
+    #[test]
+    fn slot_registration_five_pair_burst_tight_loop() {
+        use crate::app_link::AppSession;
+        use crate::blit::BlitEngine;
+
+        let _lock = fd_guard_lock().lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = FdCountGuard::new("slot-burst-5-pair");
+
+        let (srv, cli) = socketpair();
+        let mut session = AppSession::new(Transport::new(srv).unwrap());
+        let mut client = Transport::new(cli).unwrap();
+        let mut blit = BlitEngine::new(); // uninitialized → import errors, flow continues
+
+        let fake_fds: Vec<OwnedFd> = (0..5).map(|_| fake_dmabuf_fd()).collect();
+        let raw_fds: Vec<RawFd> = fake_fds.iter().map(|fd| fd.as_raw_fd()).collect();
+
+        let handle = std::thread::spawn(move || {
+            loop {
+                match client.recv().unwrap() {
+                    Some(Message::Hello(_)) => break,
+                    None => std::thread::sleep(std::time::Duration::from_millis(5)),
+                    _ => {}
+                }
+            }
+            client
+                .send(&Message::Config(proto::ConfigMessage::new(
+                    100, 100, 60000, 96, 0,
+                )))
+                .unwrap();
+
+            // The device burst: ALL pairs in one write, 5 fds coalescing into a
+            // single server recvmsg. Interleaved wire:
+            // [len][TBUF0][handle0][len][TBUF1][handle1] ... [len][TBUF4][handle4]
+            let mut wire = Vec::new();
+            for slot in 0..5u32 {
+                let tb = proto::encode(&Message::Slot(proto::SlotBuffer::new(
+                    slot, 100, 100, proto::DRM_FORMAT_ABGR8888, 400,
+                )));
+                wire.extend_from_slice(&(tb.len() as u32).to_le_bytes());
+                wire.extend_from_slice(&tb);
+                wire.extend_from_slice(&native_handle_bytes());
+            }
+            client.send_raw(&wire, &raw_fds).unwrap();
+        });
+
+        loop {
+            match session.do_handshake().unwrap() {
+                true => break,
+                false => std::thread::sleep(std::time::Duration::from_millis(5)),
+            }
+        }
+
+        // All 5 TBUFs must be delivered in order, each followed by a parseable
+        // native_handle. The pre-fix transport stalls at slot 1 (trailing
+        // handles were dropped), so this loop times out → RED.
+        for slot in 0..5u32 {
+            let mut attempts = 0;
+            let msg = loop {
+                attempts += 1;
+                if attempts > 400 {
+                    panic!("burst: slot {slot} never arrived — transport dropped coalesced trailing handles");
+                }
+                match session.recv_message(&mut blit).unwrap() {
+                    Some(m) => break m,
+                    None => std::thread::sleep(std::time::Duration::from_millis(5)),
+                }
+            };
+            assert!(
+                matches!(msg, Message::Slot(s) if s.slot == slot),
+                "slots delivered out of order: expected {slot}, got {msg:?}"
+            );
+        }
+        assert_eq!(session.slot_count(), 5);
+
+        handle.join().unwrap();
+    }
+
+    // fd-bytes misalignment on SOCK_STREAM (root cause #2): the kernel can
+    // deliver a handle's bytes in one recvmsg and its SCM_RIGHTS fd in a LATER
+    // recvmsg. The pre-fix recv_native_handle_follow_up gave up the moment
+    // recv_raw() returned bytes without the fd → parse_native_handle saw
+    // fds.len() < num_fds → "malformed native_handle for slot 0". The fix
+    // waits (bounded) for the trailing fd instead of bailing.
+    #[test]
+    fn recv_native_handle_waits_for_fd_in_later_recvmsg() {
+        use crate::app_link::AppSession;
+        use crate::blit::BlitEngine;
+
+        let _lock = fd_guard_lock().lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = FdCountGuard::new("slot-fd-late");
+
+        let (srv, cli) = socketpair();
+        let mut session = AppSession::new(Transport::new(srv).unwrap());
+        let mut client = Transport::new(cli).unwrap();
+        let mut blit = BlitEngine::new();
+        let fake_fd0 = fake_dmabuf_fd();
+        let fake_fd1 = fake_dmabuf_fd();
+
+        let handle = std::thread::spawn(move || {
+            loop {
+                match client.recv().unwrap() {
+                    Some(Message::Hello(_)) => break,
+                    None => std::thread::sleep(std::time::Duration::from_millis(5)),
+                    _ => {}
+                }
+            }
+            client
+                .send(&Message::Config(proto::ConfigMessage::new(
+                    100, 100, 60000, 96, 0,
+                )))
+                .unwrap();
+            // TBUF0
+            client
+                .send(&Message::Slot(proto::SlotBuffer::new(
+                    0, 100, 100, proto::DRM_FORMAT_ABGR8888, 400,
+                )))
+                .unwrap();
+            // handle0 bytes WITHOUT its fd — the fd is delivered later, riding
+            // on the next message's bytes (separate recvmsg).
+            client.send_raw(&native_handle_bytes(), &[]).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(30));
+
+            // fd0 (for handle0) + fd1 (for the following handle1) arrive late,
+            // attached to a subsequent length-prefixed TBUF1 + its handle.
+            let tb1 = proto::encode(&Message::Slot(proto::SlotBuffer::new(
+                1, 100, 100, proto::DRM_FORMAT_ABGR8888, 400,
+            )));
+            let mut wire = Vec::new();
+            wire.extend_from_slice(&(tb1.len() as u32).to_le_bytes());
+            wire.extend_from_slice(&tb1);
+            wire.extend_from_slice(&native_handle_bytes());
+            let late_fds = [fake_fd0.as_raw_fd(), fake_fd1.as_raw_fd()];
+            client.send_raw(&wire, &late_fds).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        });
+
+        loop {
+            match session.do_handshake().unwrap() {
+                true => break,
+                false => std::thread::sleep(std::time::Duration::from_millis(5)),
+            }
+        }
+
+        // Slot 0 must register — the pre-fix code returns Err("malformed
+        // native_handle for slot 0") here (fd-short) → RED.
+        let msg0 = loop {
+            match session.recv_message(&mut blit).unwrap() {
+                Some(m) => break m,
+                None => std::thread::sleep(std::time::Duration::from_millis(5)),
+            }
+        };
+        assert!(matches!(msg0, Message::Slot(s) if s.slot == 0));
+
+        // The message that carried the late fd must still decode cleanly.
+        let msg1 = loop {
+            match session.recv_message(&mut blit).unwrap() {
+                Some(m) => break m,
+                None => std::thread::sleep(std::time::Duration::from_millis(5)),
+            }
+        };
+        assert!(matches!(msg1, Message::Slot(s) if s.slot == 1));
+        assert_eq!(session.slot_count(), 2);
+
+        handle.join().unwrap();
     }
 
     // A second recv() must be served from `pending` without a new recvmsg (the
