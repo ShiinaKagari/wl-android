@@ -9,9 +9,19 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 // to the App. In the default (blit) mode the SHM branch is gated off and this
 // cache stays None — KWin must produce dmabufs (the doctor/deploy scripts set
 // the env). Do not extend; the production path is blit.rs.
+//
+// PERF: the three memfds are mapped ONCE at pool build time and kept mapped
+// for the pool's lifetime (PERF-12). The previous implementation mmap'd +
+// munmap'd 32MB per push, which cost ~20ms/frame on top of the memcpy itself
+// (page-table churn, TLB shootdowns). Writing straight into the resident
+// mapping cuts the push cost to the raw memcpy; `push_from` additionally lets
+// the caller copy directly from the SHM pool (single copy, no intermediate
+// Vec).
 
 pub struct FrameCache {
     buffers: Vec<OwnedFd>,
+    /// Resident RW mappings of each memfd (same order as `buffers`).
+    maps: Vec<*mut u8>,
     sizes: Vec<usize>,
     next: usize,
     current: usize,
@@ -20,10 +30,15 @@ pub struct FrameCache {
     height: u32,
 }
 
+// SAFETY: `maps` are pointers into private memfds; FrameCache is not Send/Sync
+// by default because of them, and it is only used from the compositor thread.
+unsafe impl Send for FrameCache {}
+
 impl FrameCache {
     pub fn new(width: u32, height: u32) -> Result<Self, String> {
         let size = width as usize * height as usize * 4;
         let mut buffers = Vec::with_capacity(3);
+        let mut maps = Vec::with_capacity(3);
         let mut sizes = Vec::with_capacity(3);
 
         for _ in 0..3 {
@@ -35,12 +50,15 @@ impl FrameCache {
             .map_err(|e| format!("memfd_create failed: {e}"))?;
             nix::unistd::ftruncate(&memfd, size as _)
                 .map_err(|e| format!("ftruncate failed: {e}"))?;
+            let ptr = Self::map_fd(&memfd, size)?;
             buffers.push(memfd);
+            maps.push(ptr);
             sizes.push(size);
         }
 
         Ok(Self {
             buffers,
+            maps,
             sizes,
             next: 0,
             current: 0,
@@ -50,50 +68,102 @@ impl FrameCache {
         })
     }
 
+    fn map_fd(fd: &OwnedFd, size: usize) -> Result<*mut u8, String> {
+        // SAFETY: nix wraps mmap(2); the returned pointer is checked against
+        // MAP_FAILED by nix itself and handed to the caller for ownership.
+        let ptr = unsafe {
+            nix::sys::mman::mmap(
+                None,
+                NonZeroUsize::new(size).unwrap(),
+                nix::sys::mman::ProtFlags::PROT_READ | nix::sys::mman::ProtFlags::PROT_WRITE,
+                nix::sys::mman::MapFlags::MAP_SHARED,
+                fd,
+                0,
+            )
+        }
+        .map_err(|e| format!("mmap failed: {e}"))?;
+        Ok(ptr.as_ptr() as *mut u8)
+    }
+
+    fn unmap(idx: usize, ptr: *mut u8, size: usize) {
+        // SAFETY: `ptr` was produced by map_fd for this same size and is still
+        // owned by the pool (callers unmap exactly once per live mapping).
+        unsafe {
+            nix::sys::mman::munmap(
+                std::ptr::NonNull::new(ptr as *mut std::ffi::c_void).unwrap(),
+                size,
+            )
+            .ok();
+        }
+        let _ = idx;
+    }
+
+    /// Grow buffer `idx` in place: unmap, ftruncate larger, remap. Shrinking
+    /// is never done here (F-15 forbids in-place shrink — outstanding App
+    /// mmaps would extend past EOF and SIGBUS).
+    fn ensure_size(&mut self, idx: usize, needed: usize) -> bool {
+        if needed <= self.sizes[idx] {
+            return true;
+        }
+        if nix::unistd::ftruncate(&self.buffers[idx], needed as _).is_err() {
+            return false;
+        }
+        match Self::map_fd(&self.buffers[idx], needed) {
+            Ok(ptr) => {
+                Self::unmap(idx, self.maps[idx], self.sizes[idx]);
+                self.maps[idx] = ptr;
+                self.sizes[idx] = needed;
+                true
+            }
+            Err(e) => {
+                tracing::warn!(err = %e, "remap failed during grow");
+                false
+            }
+        }
+    }
+
+    /// Push pixel data into the next buffer of the triple-buffer rotation.
+    /// Returns a dup'd fd for SCM_RIGHTS transfer (the caller owns it).
     pub fn push(&mut self, data: &[u8], width: u32, height: u32) -> Option<OwnedFd> {
         let needed = width as usize * height as usize * 4;
         if data.len() != needed {
             tracing::warn!(data_len = data.len(), needed, "frame data size mismatch");
             return None;
         }
-        // F-15: grow-in-place is kept here (rather than a full rebuild) because
-        // ftruncate can only enlarge the file in this path — needed > current size —
-        // and any outstanding App mmap of the smaller old size stays fully within
-        // EOF. SIGBUS only arises from ftruncate-SHRINK, which set_dimensions no
-        // longer performs.
-        if needed > self.sizes[self.next] {
-            if nix::unistd::ftruncate(&self.buffers[self.next], needed as _).is_err() {
-                return None;
-            }
-            self.sizes[self.next] = needed;
+        if !self.ensure_size(self.next, needed) {
+            return None;
         }
-
-        let ptr = unsafe {
-            nix::sys::mman::mmap(
-                None,
-                NonZeroUsize::new(needed).unwrap(),
-                nix::sys::mman::ProtFlags::PROT_READ | nix::sys::mman::ProtFlags::PROT_WRITE,
-                nix::sys::mman::MapFlags::MAP_SHARED,
-                &self.buffers[self.next],
-                0,
-            )
-        };
-
-        let ptr = match ptr {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::warn!(err = %e, "mmap failed in push");
-                return None;
-            }
-        };
-
+        // SAFETY: maps[next] is a valid mapping of at least `needed` bytes.
         unsafe {
-            std::ptr::copy_nonoverlapping(data.as_ptr(), ptr.as_ptr() as *mut u8, needed);
+            std::ptr::copy_nonoverlapping(data.as_ptr(), self.maps[self.next], needed);
         }
-        unsafe {
-            nix::sys::mman::munmap(ptr, needed).ok();
-        }
+        self.rotate(needed)
+    }
 
+    /// Push with a writer closure: the caller copies the frame into the
+    /// resident mapping itself (e.g. directly out of the SHM pool), so the
+    /// intermediate Vec allocation + second memcpy are eliminated (PERF-12).
+    ///
+    /// The closure receives the full `width * height * 4` writable slice.
+    /// On size mismatch the frame is dropped (None) like `push`.
+    pub fn push_from<F: FnOnce(&mut [u8])>(
+        &mut self,
+        width: u32,
+        height: u32,
+        write: F,
+    ) -> Option<OwnedFd> {
+        let needed = width as usize * height as usize * 4;
+        if !self.ensure_size(self.next, needed) {
+            return None;
+        }
+        // SAFETY: maps[next] is a valid mapping of at least `needed` bytes.
+        let dst = unsafe { std::slice::from_raw_parts_mut(self.maps[self.next], needed) };
+        write(dst);
+        self.rotate(needed)
+    }
+
+    /// Advance the rotation after a successful write and hand out a dup'd fd.
+    fn rotate(&mut self, _needed: usize) -> Option<OwnedFd> {
         let prev_next = self.next;
         self.current = prev_next;
         self.next = (self.next + 1) % 3;
@@ -131,11 +201,13 @@ impl FrameCache {
     /// mapping extending past EOF, and a read SIGBUSes (the root cause this fixes).
     ///
     /// The rebuild is all-or-nothing: the new pool is built fully on the side, and
-    /// only committed to `self` once every memfd is created and truncated. On any
-    /// allocation failure the old pool, sizes and dimensions are left untouched, so
-    /// outstanding App mmaps stay valid. `seq` is intentionally NOT reset — it stays
-    /// monotonic across resizes. `next`/`current` reset to 0 so the new pool is used
-    /// from buffer 0. Old pool fds drop naturally once replaced.
+    /// only committed to `self` once every memfd is created, truncated AND mapped.
+    /// On any allocation failure the old pool, sizes and dimensions are left
+    /// untouched, so outstanding App mmaps stay valid. `seq` is intentionally NOT
+    /// reset — it stays monotonic across resizes. `next`/`current` reset to 0 so
+    /// the new pool is used from buffer 0. Old pool fds drop naturally once
+    /// replaced (their mappings are unmapped here; App-held dup'd fds remain
+    /// valid — munmap of our mapping does not affect theirs).
     pub fn set_dimensions(&mut self, width: u32, height: u32) {
         if self.width == width && self.height == height {
             return;
@@ -143,6 +215,7 @@ impl FrameCache {
 
         let size = width as usize * height as usize * 4;
         let mut buffers = Vec::with_capacity(3);
+        let mut maps = Vec::with_capacity(3);
         let mut sizes = Vec::with_capacity(3);
 
         for _ in 0..3 {
@@ -161,18 +234,39 @@ impl FrameCache {
                 tracing::warn!("ftruncate failed during resize; keeping old pool");
                 return;
             }
-            buffers.push(memfd);
-            sizes.push(size);
+            match Self::map_fd(&memfd, size) {
+                Ok(ptr) => {
+                    buffers.push(memfd);
+                    maps.push(ptr);
+                    sizes.push(size);
+                }
+                Err(e) => {
+                    tracing::warn!(err = %e, "mmap failed during resize; keeping old pool");
+                    return;
+                }
+            }
         }
 
         // Atomic commit: only now that the whole pool is ready do we touch self.
+        for i in 0..self.maps.len() {
+            Self::unmap(i, self.maps[i], self.sizes[i]);
+        }
         self.buffers = buffers;
+        self.maps = maps;
         self.sizes = sizes;
         self.next = 0;
         self.current = 0;
         self.width = width;
         self.height = height;
         // seq deliberately not reset: monotonic across resizes (F-15).
+    }
+}
+
+impl Drop for FrameCache {
+    fn drop(&mut self) {
+        for i in 0..self.maps.len() {
+            Self::unmap(i, self.maps[i], self.sizes[i]);
+        }
     }
 }
 
@@ -357,5 +451,73 @@ mod tests {
         assert_eq!(cache.seq(), 2, "resize must not reset seq");
         cache.push(&frame_data(200, 200, 3), 200, 200).unwrap();
         assert_eq!(cache.seq(), 3, "seq strictly monotonic across resizes");
+    }
+
+    // PERF-12: push_from writes through the resident mapping — the returned
+    // fd must expose exactly the bytes the closure wrote (no intermediate Vec).
+    #[test]
+    fn push_from_writes_through_resident_mapping() {
+        let _serial = fd_guard_lock().lock().unwrap();
+        let _guard = FdCountGuard::new("push_from_writes_through_resident_mapping");
+        let mut cache = FrameCache::new(4, 4).unwrap();
+
+        let fd = cache
+            .push_from(4, 4, |dst| {
+                assert_eq!(dst.len(), 4 * 4 * 4);
+                // Fill with a recognizable pattern: each row = row index.
+                for y in 0..4u8 {
+                    for x in 0..16usize {
+                        dst[y as usize * 16 + x] = y;
+                    }
+                }
+            })
+            .expect("push_from");
+
+        // Read back through the dup'd fd and verify the pattern.
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                64,
+                libc::PROT_READ,
+                libc::MAP_SHARED,
+                fd.as_raw_fd(),
+                0,
+            )
+        };
+        assert_ne!(ptr, libc::MAP_FAILED);
+        let bytes = unsafe { std::slice::from_raw_parts(ptr as *const u8, 64) };
+        for y in 0..4u8 {
+            for x in 0..16usize {
+                assert_eq!(bytes[y as usize * 16 + x], y, "row {} col {}", y, x);
+            }
+        }
+        unsafe { libc::munmap(ptr, 64) };
+    }
+
+    // PERF-12: the resident mapping must stay writable across rotations
+    // (buffer 0 gets reused on the 4th push and must not be stale-locked).
+    #[test]
+    fn push_from_rotation_wraps_cleanly() {
+        let _serial = fd_guard_lock().lock().unwrap();
+        let _guard = FdCountGuard::new("push_from_rotation_wraps_cleanly");
+        let mut cache = FrameCache::new(2, 2).unwrap();
+
+        let mut inos = Vec::new();
+        for i in 0..5u8 {
+            let fd = cache
+                .push_from(2, 2, |dst| {
+                    for b in dst.iter_mut() {
+                        *b = i;
+                    }
+                })
+                .expect("push_from");
+            inos.push(fstat_ino(&fd));
+            assert_eq!(cache.seq(), (i + 1) as u64);
+        }
+
+        // 4th push wraps to buffer 0; 5th to buffer 1 — inos repeat in rotation.
+        assert_eq!(inos[3], inos[0], "4th push must reuse buffer 0");
+        assert_eq!(inos[4], inos[1], "5th push must reuse buffer 1");
+        assert_eq!(cache.seq(), 5, "seq counts every push");
     }
 }
