@@ -251,6 +251,14 @@ impl AppSession {
             four.len() == 4 && u32::from_le_bytes([four[0], four[1], four[2], four[3]])
                 == crate::ahb_handle::FLAT_MAGIC
         };
+        if data.len() < 32 {
+            tracing::debug!(
+                n = data.len(),
+                fds = fds.len(),
+                first = data.iter().take(8).map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" "),
+                "handle follow-up: short first chunk"
+            );
+        }
 
         if is_flat {
             // GraphicBuffer::flatten: 32-byte fixed header + SCM_RIGHTS fds.
