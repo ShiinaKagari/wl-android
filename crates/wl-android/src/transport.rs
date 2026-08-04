@@ -382,12 +382,19 @@ mod tests {
         socketpair().0.into()
     }
 
-    // native_handle wire format with numFds=1, numInts=0 (P-13)
+    // GraphicBuffer::flatten wire format (what AHardwareBuffer_sendHandleToUnixSocket
+    // actually sends): [GBFR magic][w][h][format][layers][usageLo][usageHi][stride],
+    // 32 bytes fixed header; fds travel as SCM_RIGHTS. numFds=1 for one image.
     fn native_handle_bytes() -> Vec<u8> {
         let mut data = Vec::new();
-        data.extend_from_slice(&(-1i32).to_le_bytes()); // version placeholder
-        data.extend_from_slice(&1i32.to_le_bytes());    // numFds
-        data.extend_from_slice(&0i32.to_le_bytes());    // numInts
+        data.extend_from_slice(&crate::ahb_handle::FLAT_MAGIC.to_le_bytes()); // 'GBFR'
+        data.extend_from_slice(&100i32.to_le_bytes()); // width
+        data.extend_from_slice(&100i32.to_le_bytes()); // height
+        data.extend_from_slice(&1i32.to_le_bytes());   // format RGBA_8888
+        data.extend_from_slice(&1i32.to_le_bytes());   // layerCount
+        data.extend_from_slice(&0x100u32.to_le_bytes()); // usageLo GPU_SAMPLED
+        data.extend_from_slice(&0i32.to_le_bytes());   // usageHi
+        data.extend_from_slice(&400i32.to_le_bytes()); // stride (pixels)
         data
     }
 

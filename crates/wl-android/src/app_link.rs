@@ -213,13 +213,20 @@ impl AppSession {
     }
 
     /// P-13 follow-up: the native_handle raw message immediately follows each
-    /// TBUF. Consumes exactly ONE native_handle: the 12-byte header drives how
-    /// many bytes and fds to wait for (on SOCK_STREAM the kernel can deliver a
-    /// handle's bytes in one recvmsg and its SCM_RIGHTS fds in a later one, so
-    /// an fd-short first chunk must wait instead of bailing). Any bytes/fds
-    /// that followed the handle inside the same coalesced recvmsg (the slot-
-    /// registration burst) are pushed back into the transport so the next
-    /// message decodes intact instead of being silently dropped.
+    /// TBUF. Consumes exactly ONE handle message.
+    ///
+    /// The wire format is `GraphicBuffer::flatten()` output (32-byte `'GBFR'`
+    /// header, fds via SCM_RIGHTS) — NOT the libcutils native_handle layout.
+    /// AOSP's `AHardwareBuffer_sendHandleToUnixSocket` sends the flattened
+    /// bytes and the fds as SCM_RIGHTS ancillary data. The flatten header has
+    /// NO fd count — the fd count is whatever the cmsg delivered.
+    ///
+    /// On SOCK_STREAM the kernel can deliver a handle's bytes in one recvmsg
+    /// and its SCM_RIGHTS fds in a later one, so an fd-short first chunk must
+    /// wait instead of bailing. Any bytes/fds that followed the handle inside
+    /// the same coalesced recvmsg (the slot-registration burst) are pushed
+    /// back into the transport so the next message decodes intact instead of
+    /// being silently dropped.
     fn recv_native_handle_follow_up(&mut self) -> Option<(Vec<u8>, Vec<OwnedFd>)> {
         let deadline = std::time::Instant::now() + HANDLE_WAIT_TIMEOUT;
 
@@ -238,6 +245,44 @@ impl AppSession {
             }
         };
 
+        // Decide the format from the magic once we have >= 4 bytes.
+        let is_flat = {
+            let four = &data[..data.len().min(4)];
+            four.len() == 4 && u32::from_le_bytes([four[0], four[1], four[2], four[3]])
+                == crate::ahb_handle::FLAT_MAGIC
+        };
+
+        if is_flat {
+            // GraphicBuffer::flatten: 32-byte fixed header + SCM_RIGHTS fds.
+            // The header has no fd count — one image carries exactly one
+            // dma-buf fd (P-12). Wait for the full header + at least one fd,
+            // then take exactly one fd and preserve any surplus bytes/fds.
+            loop {
+                if data.len() >= 32 && !fds.is_empty() {
+                    let handle_data = data[..32].to_vec();
+                    let mut fds = fds;
+                    let handle_fds: Vec<OwnedFd> = fds.drain(..1).collect();
+                    let leftover_data = data[32..].to_vec();
+                    let leftover_fds = fds;
+                    if !leftover_data.is_empty() || !leftover_fds.is_empty() {
+                        self.transport.unrecv_raw(leftover_data, leftover_fds);
+                    }
+                    return Some((handle_data, handle_fds));
+                }
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                let want_fds = if fds.is_empty() { 1 } else { 0 };
+                match self.transport.recv_raw_with_fd_wait(want_fds, remaining) {
+                    Ok(Some((d, f))) => {
+                        data.extend_from_slice(&d);
+                        fds.extend(f);
+                    }
+                    Ok(None) => return Some((data, fds)), // timeout — parse reports it
+                    Err(_) => return None,
+                }
+            }
+        }
+
+        // Legacy libcutils native_handle layout: header-driven byte/fd counts.
         loop {
             if data.len() < 12 {
                 // Split header — accumulate more bytes (and any fds riding along).
