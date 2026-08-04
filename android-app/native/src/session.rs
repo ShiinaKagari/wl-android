@@ -273,6 +273,7 @@ impl AppSession {
         write_stream: UnixStream,
         slots: Vec<AhbSlot>,
         server_caps: Arc<std::sync::atomic::AtomicU32>,
+        on_connected: impl FnOnce(),
         on_frame: impl Fn(u64, u32, u32, u32, Option<OwnedFd>, Option<OwnedFd>),
     ) -> io::Result<()> {
         dlog("land-native", "run_loop: entered");
@@ -300,6 +301,10 @@ impl AppSession {
         wr.flush()?;
         log::info!("CONF sent, entering frame loop");
         dlog("land-native", "CONF sent, entering frame loop");
+        // CONN-STATE: the handshake is complete — the session is live even
+        // before any frame arrives (KWin may be idle). Mark Active so the
+        // status overlay hides immediately on reconnect.
+        on_connected();
 
         // 2.5 Slot registration (P-13, TODO 28): the server gates frames on
         // SLOT_COUNT TBUFs. For each slot, send the length-prefixed TBUF

@@ -148,6 +148,10 @@ extern "system" fn Java_com_wl_android_NativeBridge_nativeInit(
     let state_clone = state.clone();
     thread::spawn(move || {
         log::info!("recv_thread: started (connection loop)");
+        // CONN-STATE: true once a session has been established. A later
+        // disconnect shows "Disconnected"; never having connected (initial
+        // server-down) shows "Reconnection" while retrying.
+        let mut had_session = false;
         loop {
             if state_clone.lock().unwrap().stopped.load(std::sync::atomic::Ordering::Relaxed) {
                 log::info!("recv_thread: stopped by destroy");
@@ -155,6 +159,7 @@ extern "system" fn Java_com_wl_android_NativeBridge_nativeInit(
             }
             match AppSession::connect(&path) {
                 Ok((session, read_stream)) => {
+                    had_session = true;
                     // Publish session + input write stream atomically.
                     {
                         let mut inner = state_clone.lock().unwrap();
@@ -169,6 +174,7 @@ extern "system" fn Java_com_wl_android_NativeBridge_nativeInit(
                         inner.server_caps.clone()
                     };
                     let on_frame_state = state_clone.clone();
+                    let on_connected_state = state_clone.clone();
                     let result = AppSession::run_loop(
                         read_stream,
                         {
@@ -178,6 +184,13 @@ extern "system" fn Java_com_wl_android_NativeBridge_nativeInit(
                         },
                         Vec::new(),
                         caps,
+                        move || {
+                            // CONN-STATE: handshake complete — the session is
+                            // live even without frames (KWin may be idle).
+                            if let Ok(mut inner) = on_connected_state.lock() {
+                                inner.state = AppState::Active;
+                            }
+                        },
                         move |serial, buffer_id, width, height, fence_fd: Option<OwnedFd>, pixel_fd: Option<OwnedFd>| {
                             log::info!("FRAME: serial={serial} {width}x{height} buf={buffer_id} fence={} pixels={}", fence_fd.is_some(), pixel_fd.is_some());
                             if let Some(fence) = fence_fd {
@@ -218,28 +231,23 @@ extern "system" fn Java_com_wl_android_NativeBridge_nativeInit(
                 }
                 Err(e) => {
                     log::error!("connect failed: {e}");
-                    // CONN-STATE: still disconnected — the reconnect loop is
-                    // retrying; Init maps to "Reconnection" in the overlay
-                    // (Distinguished from Disconnected: the run_loop failed,
-                    // i.e. we HAD a session and lost it).
+                    // CONN-STATE: reconnect retry. If we HAD a session, the
+                    // overlay keeps showing "Disconnected" (a session was
+                    // lost); never having connected shows "Reconnection".
                     let mut inner = state_clone.lock().unwrap();
-                    inner.state = AppState::Init;
+                    inner.state = if had_session { AppState::Disconnected } else { AppState::Init };
                 }
             }
             // Tear down the dead session so JNI sends drop their messages,
             // then retry after a short backoff.
             //
-            // CONN-STATE: after a connect failure (state already Init =
-            // "Reconnection") this must NOT overwrite it with Disconnected —
-            // we never had a session. After a run_loop failure (state was
-            // set to Disconnected above) it stays Disconnected.
+            // CONN-STATE: after a run_loop failure the state was already set
+            // to Disconnected above; after a connect failure it was set by
+            // had_session. Do not overwrite either here.
             {
                 let mut inner = state_clone.lock().unwrap();
                 inner.session = None;
                 inner.input_write.lock().unwrap().take();
-                if inner.state != AppState::Init {
-                    inner.state = AppState::Disconnected;
-                }
             }
             log::info!("reconnecting in 1s...");
             std::thread::sleep(std::time::Duration::from_millis(1000));
