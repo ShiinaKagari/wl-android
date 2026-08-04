@@ -383,18 +383,23 @@ mod tests {
     }
 
     // GraphicBuffer::flatten wire format (what AHardwareBuffer_sendHandleToUnixSocket
-    // actually sends): [GBFR magic][w][h][format][layers][usageLo][usageHi][stride],
-    // 32 bytes fixed header; fds travel as SCM_RIGHTS. numFds=1 for one image.
+    // actually sends on Android 15+): 13-int 'GB01' header + ints; fds via
+    // SCM_RIGHTS. transportNumFds at word 10, transportNumInts at word 11.
     fn native_handle_bytes() -> Vec<u8> {
         let mut data = Vec::new();
-        data.extend_from_slice(&crate::ahb_handle::FLAT_MAGIC.to_le_bytes()); // 'GBFR'
+        data.extend_from_slice(&crate::ahb_handle::FLAT_MAGIC.to_le_bytes()); // 'GB01' LE
         data.extend_from_slice(&100i32.to_le_bytes()); // width
         data.extend_from_slice(&100i32.to_le_bytes()); // height
+        data.extend_from_slice(&400i32.to_le_bytes()); // stride
         data.extend_from_slice(&1i32.to_le_bytes());   // format RGBA_8888
         data.extend_from_slice(&1i32.to_le_bytes());   // layerCount
-        data.extend_from_slice(&0x100u32.to_le_bytes()); // usageLo GPU_SAMPLED
-        data.extend_from_slice(&0i32.to_le_bytes());   // usageHi
-        data.extend_from_slice(&400i32.to_le_bytes()); // stride (pixels)
+        data.extend_from_slice(&0x100u32.to_le_bytes()); // usage low
+        data.extend_from_slice(&0i32.to_le_bytes());   // mId >> 32
+        data.extend_from_slice(&0i32.to_le_bytes());   // mId & 0xFFFFFFFF
+        data.extend_from_slice(&0i32.to_le_bytes());   // generation
+        data.extend_from_slice(&1i32.to_le_bytes());   // transportNumFds = 1
+        data.extend_from_slice(&0i32.to_le_bytes());   // transportNumInts = 0
+        data.extend_from_slice(&0i32.to_le_bytes());   // usage high
         data
     }
 

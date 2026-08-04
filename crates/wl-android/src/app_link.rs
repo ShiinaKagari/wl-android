@@ -259,33 +259,58 @@ impl AppSession {
         };
 
         if is_flat {
-            // GraphicBuffer::flatten: 32-byte fixed header + SCM_RIGHTS fds.
-            // The header has no fd count — one image carries exactly one
-            // dma-buf fd (P-12). Wait for the full header + at least one fd,
-            // then take exactly one fd and preserve any surplus bytes/fds.
+            // GraphicBuffer::flatten: fixed header + SCM_RIGHTS fds. The header
+            // is 13 ints ('GB01', 52 B) or 12 ints ('GBFR', 48 B); word 10
+            // holds transportNumFds and word 11 transportNumInts. Wait for the
+            // full header + the declared fd count, then take exactly that many
+            // fds and preserve any surplus bytes/fds.
+            let is_gb01 = {
+                let four = &data[..data.len().min(4)];
+                four.len() == 4 && u32::from_le_bytes([four[0], four[1], four[2], four[3]])
+                    == crate::ahb_handle::FLAT_MAGIC
+            };
+            let header_len = if is_gb01 { 52 } else { 48 };
+            let num_fds_off = 10 * 4;
             loop {
-                if data.len() >= 32 && !fds.is_empty() {
-                    let handle_data = data[..32].to_vec();
-                    let mut fds = fds;
-                    let handle_fds: Vec<OwnedFd> = fds.drain(..1).collect();
-                    let leftover_data = data[32..].to_vec();
-                    let leftover_fds = fds;
-                    if !leftover_data.is_empty() || !leftover_fds.is_empty() {
-                        self.transport.unrecv_raw(leftover_data, leftover_fds);
+                if data.len() >= header_len {
+                    let num_fds = i32::from_le_bytes([
+                        data[num_fds_off],
+                        data[num_fds_off + 1],
+                        data[num_fds_off + 2],
+                        data[num_fds_off + 3],
+                    ]);
+                    let num_fds = num_fds.max(0) as usize;
+                    let num_ints = if is_gb01 {
+                        let o = 11 * 4;
+                        i32::from_le_bytes([data[o], data[o + 1], data[o + 2], data[o + 3]])
+                            .max(0) as usize
+                    } else {
+                        0
+                    };
+                    let expected_len = header_len + num_ints * 4;
+                    if data.len() >= expected_len && fds.len() >= num_fds {
+                        let handle_data = data[..expected_len].to_vec();
+                        let mut fds = fds;
+                        let handle_fds: Vec<OwnedFd> = fds.drain(..num_fds).collect();
+                        let leftover_data = data[expected_len..].to_vec();
+                        let leftover_fds = fds;
+                        if !leftover_data.is_empty() || !leftover_fds.is_empty() {
+                            self.transport.unrecv_raw(leftover_data, leftover_fds);
+                        }
+                        return Some((handle_data, handle_fds));
                     }
-                    return Some((handle_data, handle_fds));
                 }
                 if std::time::Instant::now() >= deadline {
                     tracing::warn!(
                         n = data.len(),
                         fds = fds.len(),
                         first = data.iter().take(8).map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" "),
-                        "flat handle timeout: header incomplete or no fd"
+                        "flat handle timeout: header incomplete or fd-short"
                     );
                     return Some((data, fds));
                 }
                 let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-                let want_fds = if fds.is_empty() { 1 } else { 0 };
+                let want_fds = if data.len() >= header_len { 1 } else { 0 };
                 match self.transport.recv_raw_with_fd_wait(want_fds, remaining) {
                     Ok(Some((d, f))) => {
                         data.extend_from_slice(&d);

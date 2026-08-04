@@ -5,37 +5,46 @@
 /// underlying dmabuf fds over the land.sock. The container side does NOT have
 /// libandroid, so we parse the wire format manually.
 ///
-/// WIRE FORMAT (verified against AOSP — this is NOT a raw native_handle_t!):
+/// WIRE FORMAT (verified against AOSP GraphicBuffer::flatten — this is NOT a
+/// raw native_handle_t!):
 ///
 /// `AHardwareBuffer_sendHandleToUnixSocket` (frameworks/native/libs/nativewindow/
-/// AHardwareBuffer.cpp) does NOT send the libcutils native_handle layout. It
-/// flattens the buffer via `GraphicBuffer::flatten()` (frameworks/native/libs/
-/// ui/GraphicBuffer.cpp) and sends THAT byte blob over the socket with the fds
-/// as SCM_RIGHTS ancillary data:
+/// AHardwareBuffer.cpp) flattens the buffer via `GraphicBuffer::flatten()`
+/// (frameworks/native/libs/ui/GraphicBuffer.cpp) and sends THAT byte blob over
+/// the socket with the fds as SCM_RIGHTS ancillary data. The flatten layout
+/// (main branch — Android 15/16):
 ///
-///   struct flat_header {           // 32 bytes, 8 x int32 (little-endian)
-///       int32 magic;               // 'GBFR' (0x52464247 LE)
-///       int32 width;
-///       int32 height;
-///       int32 format;              // PixelFormat
-///       int32 layerCount;
-///       int32 usageLo;             // (uint64 usage) & 0xffffffff
-///       int32 usageHi;             // (uint64 usage) >> 32
-///       int32 stride;              // pixels
-///   };
-///   // NO ints follow the header. The dmabuf fd(s) arrive via SCM_RIGHTS.
+///   buf[0]  = 'GB01'   // NEW magic (LE bytes on the wire: 31 30 42 47)
+///   buf[1]  = width
+///   buf[2]  = height
+///   buf[3]  = stride
+///   buf[4]  = format
+///   buf[5]  = layerCount
+///   buf[6]  = int(usage)          // low 32 bits
+///   buf[7]  = int(mId >> 32)
+///   buf[8]  = int(mId & 0xFFFFFFFF)
+///   buf[9]  = int(mGenerationNumber)
+///   buf[10] = int(transportNumFds)  // ← fd count lives here!
+///   buf[11] = int(transportNumInts)
+///   buf[12] = int(usage >> 32)      // high 32 bits
+///   // transportNumInts ints follow; the fds arrive via SCM_RIGHTS.
 ///
-/// There is NO fd count in the header — the number of fds is exactly what the
-/// cmsg delivered. A one-image AHB carries one fd (the dma-buf).
-///
-/// (The libcutils native_handle layout [version][numFds][numInts][ints...] is
-/// still parsed as a fallback for robustness/tests.)
+/// flattenedSize = (13 + transportNumInts) * 4. The legacy 'GBFR' magic
+/// (12 ints, 32-bit usage) is kept as a fallback for older Android.
 use std::os::fd::OwnedFd;
 
-/// `'GBFR'` little-endian — GraphicBuffer::flatten magic (AOSP).
-pub const FLAT_MAGIC: u32 = 0x5246_4247; // = u32::from_le_bytes(*b"GBFR")
-/// Flat header is 8 x i32 = 32 bytes.
-const FLAT_HEADER_LEN: usize = 32;
+/// `'GB01'` — GraphicBuffer::flatten magic, LE bytes on the wire (Android 15+).
+pub const FLAT_MAGIC: u32 = 0x3130_4247; // bytes on wire: 31 30 42 47 ("10BG" LE = 'GB01')
+/// Legacy `'GBFR'` magic (pre-Android-15 flatten, 32-bit usage).
+pub const FLAT_MAGIC_LEGACY: u32 = 0x5246_4247; // wire bytes: 47 42 46 52
+/// New flatten header: 13 x i32 = 52 bytes.
+const FLAT_HEADER_LEN: usize = 52;
+/// Legacy flatten header: 12 x i32 = 48 bytes.
+const FLAT_HEADER_LEN_LEGACY: usize = 48;
+/// Offset of transportNumFds in the new (13-int) header.
+const FLAT_NUM_FDS_OFFSET: usize = 10 * 4;
+/// Offset of transportNumFds in the legacy (12-int) header.
+const FLAT_NUM_FDS_OFFSET_LEGACY: usize = 10 * 4;
 
 #[allow(dead_code)]
 #[derive(Debug)]
@@ -55,29 +64,70 @@ pub fn parse_native_handle(data: &[u8], fds: Vec<OwnedFd>) -> Option<ParsedHandl
         return None; // need at least the magic to decide the format
     }
     let magic = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
-    if magic == FLAT_MAGIC {
-        parse_flat_handle(data, fds)
+    if magic == FLAT_MAGIC || magic == FLAT_MAGIC_LEGACY {
+        parse_flat_handle(data, fds, magic == FLAT_MAGIC)
     } else {
         parse_legacy_native_handle(data, fds)
     }
 }
 
-/// GraphicBuffer::flatten format: 32-byte fixed header + SCM_RIGHTS fds.
-/// The fd count is whatever the cmsg delivered (no count in the header).
-fn parse_flat_handle(data: &[u8], fds: Vec<OwnedFd>) -> Option<ParsedHandle> {
-    if data.len() < FLAT_HEADER_LEN {
+/// GraphicBuffer::flatten format: fixed header + SCM_RIGHTS fds.
+/// `new_format` selects the 13-int ('GB01') vs 12-int ('GBFR') header; the fd
+/// count is read from header word 10 (transportNumFds) in both.
+fn parse_flat_handle(data: &[u8], fds: Vec<OwnedFd>, new_format: bool) -> Option<ParsedHandle> {
+    let header_len = if new_format { FLAT_HEADER_LEN } else { FLAT_HEADER_LEN_LEGACY };
+    let num_fds_offset = if new_format { FLAT_NUM_FDS_OFFSET } else { FLAT_NUM_FDS_OFFSET_LEGACY };
+    if data.len() < header_len {
         return None; // truncated header
     }
-    let num_fds = fds.len() as i32;
-    if num_fds < 1 {
-        return None; // a buffer handle without any fd is unusable
+    let num_fds = i32::from_le_bytes([
+        data[num_fds_offset],
+        data[num_fds_offset + 1],
+        data[num_fds_offset + 2],
+        data[num_fds_offset + 3],
+    ]);
+    let num_ints = if new_format {
+        i32::from_le_bytes([
+            data[11 * 4],
+            data[11 * 4 + 1],
+            data[11 * 4 + 2],
+            data[11 * 4 + 3],
+        ])
+    } else {
+        0
+    };
+    if num_fds < 0 || num_ints < 0 {
+        return None;
     }
+    if fds.len() < num_fds as usize {
+        return None; // not enough fds received
+    }
+    if data.len() < header_len + (num_ints as usize) * 4 {
+        return None;
+    }
+
+    let mut ints = Vec::with_capacity(num_ints as usize);
+    for i in 0..num_ints as usize {
+        let offset = header_len + i * 4;
+        let val = i32::from_le_bytes([
+            data[offset],
+            data[offset + 1],
+            data[offset + 2],
+            data[offset + 3],
+        ]);
+        ints.push(val);
+    }
+
+    // Take ownership of exactly num_fds fds
+    let mut fds = fds;
+    let handle_fds: Vec<OwnedFd> = fds.drain(..num_fds as usize).collect();
+
     Some(ParsedHandle {
         version: 0, // flat format has no version field
         num_fds,
-        num_ints: 0,
-        ints: Vec::new(),
-        fds,
+        num_ints,
+        ints,
+        fds: handle_fds,
     })
 }
 
@@ -138,17 +188,22 @@ mod tests {
         a.into()
     }
 
-    /// GraphicBuffer::flatten wire bytes: [GBFR][w][h][fmt][layers][usageLo][usageHi][stride].
+    /// GraphicBuffer::flatten wire bytes (Android 15+ 'GB01', 13 ints).
     fn flat_bytes(w: i32, h: i32) -> Vec<u8> {
         let mut data = Vec::new();
-        data.extend_from_slice(&0x5246_4247u32.to_le_bytes()); // 'GBFR'
-        data.extend_from_slice(&w.to_le_bytes());
-        data.extend_from_slice(&h.to_le_bytes());
+        data.extend_from_slice(&0x3130_4247u32.to_le_bytes()); // 'GB01' LE
+        data.extend_from_slice(&w.to_le_bytes()); // width
+        data.extend_from_slice(&h.to_le_bytes()); // height
+        data.extend_from_slice(&(w * 4).to_le_bytes()); // stride
         data.extend_from_slice(&1i32.to_le_bytes()); // format RGBA_8888
         data.extend_from_slice(&1i32.to_le_bytes()); // layerCount
-        data.extend_from_slice(&0x100u32.to_le_bytes()); // usageLo GPU_SAMPLED
-        data.extend_from_slice(&0i32.to_le_bytes()); // usageHi
-        data.extend_from_slice(&(w * 4).to_le_bytes()); // stride (pixels)
+        data.extend_from_slice(&0x100u32.to_le_bytes()); // usage low
+        data.extend_from_slice(&0i32.to_le_bytes()); // mId high
+        data.extend_from_slice(&0i32.to_le_bytes()); // mId low
+        data.extend_from_slice(&0i32.to_le_bytes()); // generation
+        data.extend_from_slice(&1i32.to_le_bytes()); // transportNumFds
+        data.extend_from_slice(&0i32.to_le_bytes()); // transportNumInts
+        data.extend_from_slice(&0i32.to_le_bytes()); // usage high
         data
     }
 
@@ -156,7 +211,7 @@ mod tests {
     fn parse_flat_handle_real_aosp_format() {
         let fd = make_test_fd();
         let data = flat_bytes(3392, 2400);
-        assert_eq!(data.len(), 32);
+        assert_eq!(data.len(), 52);
 
         let result = parse_native_handle(&data, vec![fd]).unwrap();
         assert_eq!(result.num_fds, 1);
@@ -169,7 +224,7 @@ mod tests {
     fn parse_flat_handle_truncated_header() {
         let fd = make_test_fd();
         let mut data = flat_bytes(100, 100);
-        data.truncate(20); // cut inside the 32-byte header
+        data.truncate(40); // cut inside the 52-byte header
         assert!(parse_native_handle(&data, vec![fd]).is_none());
     }
 
@@ -177,6 +232,29 @@ mod tests {
     fn parse_flat_handle_no_fd_rejected() {
         let data = flat_bytes(100, 100);
         assert!(parse_native_handle(&data, vec![]).is_none());
+    }
+
+    #[test]
+    fn parse_flat_handle_legacy_gbfr_format() {
+        let fd = make_test_fd();
+        let mut data = Vec::new();
+        data.extend_from_slice(&0x5246_4247u32.to_le_bytes()); // 'GBFR' LE
+        data.extend_from_slice(&100i32.to_le_bytes()); // width
+        data.extend_from_slice(&100i32.to_le_bytes()); // height
+        data.extend_from_slice(&400i32.to_le_bytes()); // stride
+        data.extend_from_slice(&1i32.to_le_bytes()); // format
+        data.extend_from_slice(&1i32.to_le_bytes()); // layerCount
+        data.extend_from_slice(&0x100u32.to_le_bytes()); // usage
+        data.extend_from_slice(&0i32.to_le_bytes()); // mId high
+        data.extend_from_slice(&0i32.to_le_bytes()); // mId low
+        data.extend_from_slice(&0i32.to_le_bytes()); // generation
+        data.extend_from_slice(&1i32.to_le_bytes()); // transportNumFds
+        data.extend_from_slice(&0i32.to_le_bytes()); // transportNumInts
+
+        let result = parse_native_handle(&data, vec![fd]).unwrap();
+        assert_eq!(result.num_fds, 1);
+        assert_eq!(result.num_ints, 0);
+        assert_eq!(result.fds.len(), 1);
     }
 
     #[test]
