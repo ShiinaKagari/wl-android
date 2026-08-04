@@ -1,0 +1,17 @@
+   Compiling jni-render-harness v0.1.0 (/home/kagari/Projects/wl-android/.omo/start-work/jni-render-harness)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.07s
+     Running unittests src/lib.rs (target/debug/deps/jni_render_harness-1c479ee94c6e6eec)
+
+running 3 tests
+test render::tests::row_copy_matches_per_pixel_loop ... ok
+test render::tests::row_copy_respects_strides ... ok
+test render::tests::row_copy_clamps_truncated_source ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests jni_render_harness
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

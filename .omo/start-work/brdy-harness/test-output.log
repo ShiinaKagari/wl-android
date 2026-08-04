@@ -1,0 +1,20 @@
+   Compiling brdy-harness v0.1.0 (/home/kagari/Projects/wl-android/.omo/start-work/brdy-harness)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.14s
+     Running unittests src/lib.rs (target/debug/deps/brdy_harness-919f7ed94eba5f42)
+
+running 6 tests
+test tests::slot_blittable_after_consume_is_false ... ok
+test tests::shm_path_enabled_requires_exact_env ... ok
+test tests::slot_ready_clear_empties ... ok
+test tests::slot_ready_consume_removes ... ok
+test tests::slot_ready_double_consume_is_false ... ok
+test tests::slot_blittable_requires_registered_ready_and_free ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests brdy_harness
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

@@ -1,0 +1,78 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.00s
+     Running unittests src/lib.rs (target/debug/deps/doctor_harness-2dabf86065071e87)
+
+running 7 tests
+test tests::auto_maps_to_blit_default ... FAILED
+test tests::blit_maps_to_explicit ... FAILED
+test tests::direct_maps_to_unavailable_note ... FAILED
+test tests::case_and_whitespace_tolerated ... FAILED
+test tests::unset_maps_to_auto_default ... FAILED
+test tests::garbage_maps_to_auto_default ... FAILED
+test tests::shm_maps_to_debug_cpu_path ... FAILED
+
+failures:
+
+---- tests::auto_maps_to_blit_default stdout ----
+
+thread 'tests::auto_maps_to_blit_default' (96972) panicked at src/lib.rs:33:9:
+assertion `left == right` failed
+  left: "blit (Adreno 830 — direct dmabuf import unavailable)"
+ right: "blit (default: dmabuf blit path)"
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- tests::blit_maps_to_explicit stdout ----
+
+thread 'tests::blit_maps_to_explicit' (96973) panicked at src/lib.rs:57:9:
+assertion `left == right` failed
+  left: "blit (Adreno 830 — direct dmabuf import unavailable)"
+ right: "blit (explicit dmabuf blit path)"
+
+---- tests::direct_maps_to_unavailable_note stdout ----
+
+thread 'tests::direct_maps_to_unavailable_note' (96975) panicked at src/lib.rs:49:9:
+assertion `left == right` failed
+  left: "blit (Adreno 830 — direct dmabuf import unavailable)"
+ right: "direct (unavailable on Adreno 830 — dmabuf import unsupported by host driver)"
+
+---- tests::case_and_whitespace_tolerated stdout ----
+
+thread 'tests::case_and_whitespace_tolerated' (96974) panicked at src/lib.rs:69:9:
+assertion `left == right` failed
+  left: "blit (Adreno 830 — direct dmabuf import unavailable)"
+ right: "shm (debug CPU path)"
+
+---- tests::unset_maps_to_auto_default stdout ----
+
+thread 'tests::unset_maps_to_auto_default' (96978) panicked at src/lib.rs:39:9:
+assertion `left == right` failed
+  left: "blit (Adreno 830 — direct dmabuf import unavailable)"
+ right: "blit (default: dmabuf blit path)"
+
+---- tests::garbage_maps_to_auto_default stdout ----
+
+thread 'tests::garbage_maps_to_auto_default' (96976) panicked at src/lib.rs:63:9:
+assertion `left == right` failed
+  left: "blit (Adreno 830 — direct dmabuf import unavailable)"
+ right: "blit (default: dmabuf blit path)"
+
+---- tests::shm_maps_to_debug_cpu_path stdout ----
+
+thread 'tests::shm_maps_to_debug_cpu_path' (96977) panicked at src/lib.rs:44:9:
+assertion `left == right` failed
+  left: "blit (Adreno 830 — direct dmabuf import unavailable)"
+ right: "shm (debug CPU path)"
+
+
+failures:
+    tests::auto_maps_to_blit_default
+    tests::blit_maps_to_explicit
+    tests::case_and_whitespace_tolerated
+    tests::direct_maps_to_unavailable_note
+    tests::garbage_maps_to_auto_default
+    tests::shm_maps_to_debug_cpu_path
+    tests::unset_maps_to_auto_default
+
+test result: FAILED. 0 passed; 7 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `--lib`
+EXIT=101

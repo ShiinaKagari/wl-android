@@ -1,0 +1,36 @@
+assertion `left == right` failed
+  left: FIFO
+ right: MAILBOX
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    tests::present_mode_prefers_mailbox
+
+test result: FAILED. 11 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `--lib`
+
+=== GREEN phase (mutation restored, TODO 26 final helpers) ===
+running 12 tests
+test tests::composite_alpha_prefers_opaque ... ok
+test tests::extent_uses_current_when_valid ... ok
+test tests::extent_clamps_when_sentinel ... ok
+test tests::format_empty_list_means_unconstrained ... ok
+test tests::format_prefers_bgra_over_rgba ... ok
+test tests::format_falls_back_to_rgba ... ok
+test tests::format_takes_first_when_neither_preferred ... ok
+test tests::format_undefined_list_means_unconstrained ... ok
+test tests::image_count_triple_buffered_and_clamped ... ok
+test tests::present_mode_falls_back_to_fifo ... ok
+test tests::present_mode_prefers_mailbox ... ok
+test tests::usage_masks_unsupported_bits ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests render_harness
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

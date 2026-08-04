@@ -1,0 +1,12 @@
+136 |         send_brdy_on(&mut app, 0).unwrap();
+    |         ^^^^^^^^^^^^ not found in this scope
+
+error[E0425]: cannot find function `send_brdy_on` in this scope
+   --> src/lib.rs:137:9
+    |
+137 |         send_brdy_on(&mut app, 2).unwrap();
+    |         ^^^^^^^^^^^^ not found in this scope
+
+For more information about this error, try `rustc --explain E0425`.
+warning: `session-brdy-harness` (lib test) generated 1 warning
+error: could not compile `session-brdy-harness` (lib test) due to 5 previous errors; 1 warning emitted
