@@ -9,13 +9,34 @@ import android.view.SurfaceView
 import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.WindowManager
+import android.widget.TextView
 
 class MainActivity : Activity(), SurfaceHolder.Callback {
     private lateinit var surfaceView: SurfaceView
+    private lateinit var statusText: TextView
     private lateinit var collector: ScreenInfoCollector
     private lateinit var touchForwarder: TouchForwarder
     private var nativeHandle: Long = 0
     private val socketPath = "/data/local/tmp/wl-android/land.sock"
+
+    // CONN-STATE: poll interval for the status overlay (nativeGetState).
+    private val statusPollHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    private val statusPoll = object : Runnable {
+        override fun run() {
+            updateStatusOverlay()
+            statusPollHandler.postDelayed(this, 200)
+        }
+    }
+
+    private fun updateStatusOverlay() {
+        if (nativeHandle == 0L) return
+        val state = NativeBridge.nativeGetState(nativeHandle)
+        when (state) {
+            2 -> statusText.visibility = android.view.View.GONE // Active: normal display
+            4 -> { statusText.text = "Disconnected"; statusText.visibility = android.view.View.VISIBLE }
+            else -> { statusText.text = "Reconnection"; statusText.visibility = android.view.View.VISIBLE }
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -34,7 +55,30 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         surfaceView = SurfaceView(this).apply {
             holder.addCallback(this@MainActivity)
         }
-        setContentView(surfaceView)
+
+        // CONN-STATE overlay: a semi-transparent black layer with the
+        // Disconnected / Reconnection status text, shown above the SurfaceView
+        // whenever nativeGetState is not Active. The native side blanks the
+        // actual surface; this layer only carries the text.
+        statusText = TextView(this).apply {
+            setTextColor(android.graphics.Color.WHITE)
+            textSize = 24f
+            gravity = android.view.Gravity.CENTER
+            background = android.graphics.drawable.ColorDrawable(android.graphics.Color.argb(180, 0, 0, 0))
+            visibility = android.view.View.GONE
+        }
+        setContentView(
+            android.widget.FrameLayout(this).apply {
+                addView(surfaceView, android.widget.FrameLayout.LayoutParams(
+                    android.widget.FrameLayout.LayoutParams.MATCH_PARENT,
+                    android.widget.FrameLayout.LayoutParams.MATCH_PARENT
+                ))
+                addView(statusText, android.widget.FrameLayout.LayoutParams(
+                    android.widget.FrameLayout.LayoutParams.MATCH_PARENT,
+                    android.widget.FrameLayout.LayoutParams.MATCH_PARENT
+                ))
+            }
+        )
 
         // SurfaceView must be focusable to receive hardware key events.
         // isFocusableInTouchMode lets the surface grab focus on first tap,
@@ -79,6 +123,9 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
 
         collector.start()
 
+        // CONN-STATE: start polling nativeGetState for the status overlay.
+        statusPollHandler.post(statusPoll)
+
         // Focus can be stolen (e.g. keyguard dismissal, dialog), re-grab after resume.
         surfaceView.post { surfaceView.requestFocus() }
     }
@@ -102,6 +149,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     }
 
     override fun onPause() {
+        statusPollHandler.removeCallbacks(statusPoll)
         collector.stop()
         super.onPause()
     }

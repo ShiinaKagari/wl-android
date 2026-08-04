@@ -23,6 +23,10 @@ pub enum AppState {
     Handshake = 1,
     Active = 2,
     Error = 3,
+    /// CONN-STATE: the recv thread's run_loop failed (server died / socket
+    /// error). Java's status overlay maps this to "Disconnected"; while the
+    /// reconnect loop is retrying it stays Disconnected ("Reconnection").
+    Disconnected = 4,
 }
 
 #[derive(Debug)]
@@ -204,9 +208,20 @@ extern "system" fn Java_com_wl_android_NativeBridge_nativeInit(
                         Ok(()) => log::info!("run_loop exited cleanly"),
                         Err(ref e) => log::error!("run_loop failed: {e}"),
                     }
+                    // CONN-STATE: run_loop ended (clean or error) — the server
+                    // side is gone. Mark Disconnected so the Java overlay shows
+                    // "Disconnected" (and "Reconnection" during the retries).
+                    {
+                        let mut inner = state_clone.lock().unwrap();
+                        inner.state = AppState::Disconnected;
+                    }
                 }
                 Err(e) => {
                     log::error!("connect failed: {e}");
+                    // CONN-STATE: still disconnected — reconnect loop is
+                    // retrying, Java overlay shows "Reconnection".
+                    let mut inner = state_clone.lock().unwrap();
+                    inner.state = AppState::Disconnected;
                 }
             }
             // Tear down the dead session so JNI sends drop their messages,
@@ -215,7 +230,7 @@ extern "system" fn Java_com_wl_android_NativeBridge_nativeInit(
                 let mut inner = state_clone.lock().unwrap();
                 inner.session = None;
                 inner.input_write.lock().unwrap().take();
-                inner.state = AppState::Init;
+                inner.state = AppState::Disconnected;
             }
             log::info!("reconnecting in 1s...");
             std::thread::sleep(std::time::Duration::from_millis(1000));
@@ -231,6 +246,9 @@ extern "system" fn Java_com_wl_android_NativeBridge_nativeInit(
         let render_state = state.clone();
         thread::spawn(move || {
             log::info!("render_thread: started");
+            // CONN-STATE: cleared on Disconnected so the screen is blanked
+            // once, not repeatedly while parked on the condvar.
+            let mut blanked_while_disconnected = false;
             loop {
                 let frame = loop {
                     let mut guard = render_state.lock().unwrap();
@@ -244,12 +262,28 @@ extern "system" fn Java_com_wl_android_NativeBridge_nativeInit(
                             // their pixel fds would otherwise leak and the
                             // server's 3-buffer rotation would be overrun.
                             guard.frame_queue.clear();
+                            blanked_while_disconnected = false;
                             break f;
                         }
                         None => {
-                            // Condvar::wait consumes the guard by value; the
-                            // re-lock below is the idiomatic park loop.
-                            guard = crate::FRAME_CV.wait(guard).unwrap();
+                            // CONN-STATE: no frame pending and the session is
+                            // gone → blank the screen once (disconnect shows
+                            // black instead of a stale frozen frame). The
+                            // Java overlay adds the Disconnected/Reconnection
+                            // text on top.
+                            let disconnected =
+                                guard.state != AppState::Active && guard.state != AppState::Handshake;
+                            if disconnected && !blanked_while_disconnected {
+                                blanked_while_disconnected = true;
+                                crate::jni_bridge::blank_screen();
+                            }
+                            // Timed park: re-check state even without a new
+                            // frame (a reconnect that never delivers a frame
+                            // would otherwise leave a stale blank on resume).
+                            guard = crate::FRAME_CV
+                                .wait_timeout(guard, std::time::Duration::from_millis(100))
+                                .unwrap()
+                                .0;
                         }
                     }
                 };

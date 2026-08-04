@@ -261,3 +261,33 @@ pub fn render_frame_fd(
     unsafe { libc::munmap(ptr, map_len); }
     result
 }
+
+/// CONN-STATE: blank the ANativeWindow to pure black. Called by the render
+/// thread when the session is Disconnected (server died) so the display does
+/// not keep showing a stale frozen frame. No-op when no window is set.
+pub fn blank_screen() {
+    let guard = WINDOW.lock().unwrap();
+    let window = match *guard {
+        Some(w) if w != 0 => w,
+        _ => return,
+    };
+    let mut buf: ndk_sys::ANativeWindow_Buffer = unsafe { std::mem::zeroed() };
+    if unsafe { wl_lock_window(window as _, &mut buf) } != 0 {
+        return;
+    }
+    if buf.width == 0 || buf.height == 0 {
+        unsafe { wl_unlock_and_post(window as _); }
+        return;
+    }
+    let bpp = match buf.format {
+        4 => 2,
+        _ => 4,
+    };
+    let stride = buf.stride as usize * bpp;
+    let bits = buf.bits as *mut u8;
+    let total = stride * buf.height as usize;
+    // SAFETY: bits is the locked window buffer of `total` bytes.
+    unsafe { std::ptr::write_bytes(bits, 0, total); }
+    unsafe { wl_unlock_and_post(window as _); }
+    log::info!("blank_screen: display blanked (disconnected)");
+}
