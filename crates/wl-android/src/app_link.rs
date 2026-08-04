@@ -1,8 +1,10 @@
 use std::io;
+use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixListener;
 
 use tracing::{debug, info, warn};
 
+use crate::blit::BlitEngine;
 use crate::transport::Transport;
 use wl_android_common::proto::{self, HelloMessage, Message, PROTOCOL_VERSION};
 
@@ -74,10 +76,9 @@ impl AppSession {
                     info!("mode: direct");
                     self.mode = SessionMode::Active;
                 } else if self.server_caps & proto::SERVER_CAP_BLIT != 0 {
-                    // v1: Skip SlotRegistration — go Active immediately.
-                    // TBUF registration will be handled asynchronously via recv_message.
-                    info!("mode: blit (active immediately)");
-                    self.mode = SessionMode::Active;
+                    // H-04 v2: blit waits for SLOT_COUNT TBUFs before sending frames.
+                    info!("mode: blit (waiting for {} TBUF registrations)", proto::SLOT_COUNT);
+                    self.mode = SessionMode::SlotRegistration;
                 } else {
                     warn!("no available frame path");
                     return Err(io::Error::other("no available frame path"));
@@ -93,9 +94,14 @@ impl AppSession {
         }
     }
 
+    /// P-08/P-08b: plane fds first (FRAME_CARRIES_FDS), then at most one
+    /// fence fd (FRAME_CARRIES_FENCE). Blit frames pass `pixel_fd: None` —
+    /// the App owns the slot buffer and only needs the sync_file fence (F-08).
+    #[allow(clippy::too_many_arguments)] // mirrors the wire fields 1:1
     pub fn send_frame(
         &mut self, frame_serial: u64, buffer_id: u32, _screen_w: u32, _screen_h: u32,
         buf_w: u32, buf_h: u32, pixel_fd: Option<std::os::fd::OwnedFd>,
+        fence_fd: Option<std::os::fd::OwnedFd>,
     ) -> io::Result<()> {
         let mut fm = proto::FrameMessage {
             magic: proto::MAGIC_LAND,
@@ -115,8 +121,12 @@ impl AppSession {
                 proto::PlaneDesc { offset: 0, stride: 0 },
             ],
         };
-        let fds: Vec<std::os::fd::OwnedFd> = pixel_fd.into_iter().collect();
+        let mut fds: Vec<std::os::fd::OwnedFd> = pixel_fd.into_iter().collect();
         fm.set_carries_fds(!fds.is_empty());
+        if let Some(fence) = fence_fd {
+            fm.set_carries_fence(true);
+            fds.push(fence);
+        }
         self.transport.send(&Message::Frame(fm, fds))
     }
 
@@ -137,21 +147,56 @@ impl AppSession {
     }
 
     /// Receive any message from the App (non-blocking).
-    /// For SlotBuffer messages, also receives the following native_handle (P-13).
-    pub fn recv_message(&mut self) -> io::Result<Option<Message>> {
+    /// For SlotBuffer messages, also receives the following native_handle (P-13)
+    /// and imports the dmabuf fd into `blit` (M6b).
+    pub fn recv_message(&mut self, blit: &mut BlitEngine) -> io::Result<Option<Message>> {
         match self.transport.recv() {
             Ok(Some(Message::Slot(slot))) => {
                 self.slot_count += 1;
                 info!(slot = slot.slot, count = self.slot_count, "slot registered");
-                // Recv the native_handle that follows (P-13)
-                if let Ok(Some((_data, fds))) = self.transport.recv_raw() {
-                    if let Some(handle) = crate::ahb_handle::parse_native_handle(&_data, fds) {
-                        debug!(slot = slot.slot, num_fds = handle.num_fds, "native_handle parsed");
-                        // TODO M6b: import fds into Vulkan for blit
-                        let _ = handle.fds;
-                    } else {
-                        warn!(slot = slot.slot, "failed to parse native_handle");
+                // P-13: each TBUF is immediately followed by exactly one native_handle
+                // message (raw wire format + SCM_RIGHTS fds).
+                if let Some((data, fds)) = self.recv_native_handle_follow_up() {
+                    match crate::ahb_handle::parse_native_handle(&data, fds) {
+                        Some(handle) => {
+                            debug!(slot = slot.slot, num_fds = handle.num_fds, "native_handle parsed");
+                            if let Some(fd) = handle.fds.into_iter().next() {
+                                match blit.register_slot(
+                                    slot.slot,
+                                    fd,
+                                    slot.width,
+                                    slot.height,
+                                    // DRM_FORMAT_ABGR8888 is R,G,B,A memory order → VK R8G8B8A8 (DESIGN §9.2)
+                                    ash::vk::Format::R8G8B8A8_UNORM,
+                                    // v1 TBUF carries DRM_FORMAT_MOD_LINEAR
+                                    slot.modifier,
+                                ) {
+                                    Ok(handle) => {
+                                        info!(slot = slot.slot, handle, "slot image imported into Vulkan")
+                                    }
+                                    Err(e) => warn!(
+                                        slot = slot.slot, err = %e,
+                                        "slot import failed (server-side); slot unavailable",
+                                    ),
+                                }
+                            } else {
+                                warn!(slot = slot.slot, "native_handle carries no fds");
+                            }
+                        }
+                        None => {
+                            // P-13: 解析失败 → 明确报错并断开
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!("malformed native_handle for slot {}", slot.slot),
+                            ));
+                        }
                     }
+                } else {
+                    // P-13: the handle MUST follow the TBUF; a missing one desyncs the stream.
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("missing native_handle after TBUF slot {}", slot.slot),
+                    ));
                 }
                 Ok(Some(Message::Slot(slot)))
             }
@@ -160,6 +205,20 @@ impl AppSession {
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(None),
             Err(e) => Err(e),
         }
+    }
+
+    /// P-13 follow-up: the native_handle raw message immediately follows each
+    /// TBUF. A bounded non-blocking poll absorbs socket-scheduling gaps so the
+    /// unframed bytes are never mistaken for a length-prefixed protocol message.
+    fn recv_native_handle_follow_up(&mut self) -> Option<(Vec<u8>, Vec<OwnedFd>)> {
+        for _ in 0..100 {
+            match self.transport.recv_raw() {
+                Ok(Some(raw)) => return Some(raw),
+                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(1)),
+                Err(_) => return None,
+            }
+        }
+        None
     }
 
     pub fn slot_count(&self) -> u32 {
@@ -181,10 +240,60 @@ impl AppSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::fd::{AsRawFd, OwnedFd, RawFd};
     use std::os::unix::net::UnixStream;
+
+    // X-04: fd leak guard. Mirrors frame_cache::tests::FdCountGuard — /proc/self/fd
+    // is process-global, so guard tests are only deterministic while no other
+    // fd-touching test runs concurrently. Combine with `--test-threads=1`.
+    static FD_GUARD_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+
+    fn fd_guard_lock() -> &'static std::sync::Mutex<()> {
+        FD_GUARD_LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
+    struct FdCountGuard {
+        initial: usize,
+        label: &'static str,
+    }
+
+    impl FdCountGuard {
+        fn new(label: &'static str) -> Self {
+            let initial = std::fs::read_dir("/proc/self/fd")
+                .map(|entries| entries.count())
+                .unwrap_or(0);
+            Self { initial, label }
+        }
+    }
+
+    impl Drop for FdCountGuard {
+        fn drop(&mut self) {
+            let current = std::fs::read_dir("/proc/self/fd")
+                .map(|entries| entries.count())
+                .unwrap_or(0);
+            assert_eq!(
+                current, self.initial,
+                "FdCountGuard [{}]: fd count changed: {} != {} (leak detected)",
+                self.label, current, self.initial
+            );
+        }
+    }
 
     fn socketpair() -> (UnixStream, UnixStream) {
         UnixStream::pair().expect("socketpair")
+    }
+
+    fn fake_dmabuf_fd() -> OwnedFd {
+        socketpair().0.into()
+    }
+
+    // native_handle wire format with numFds=1, numInts=0 (P-13)
+    fn native_handle_bytes() -> Vec<u8> {
+        let mut data = Vec::new();
+        data.extend_from_slice(&(-1i32).to_le_bytes()); // version placeholder
+        data.extend_from_slice(&1i32.to_le_bytes());    // numFds
+        data.extend_from_slice(&0i32.to_le_bytes());    // numInts
+        data
     }
 
     // H-01, H-02: HELO→CONF handshake (non-blocking, requires multiple polls)
@@ -230,12 +339,22 @@ mod tests {
         handle.join().unwrap();
     }
 
-    // P-11, F-11: Frame → Ack
+    // P-11, F-11, H-04: blit mode — Frame only after SLOT_COUNT TBUF registrations.
+    // app_caps=0 → blit → SlotRegistration; the client registers 3 TBUFs (each
+    // followed by its native_handle, P-13) before the server activates and sends.
     #[test]
     fn frame_ack_roundtrip() {
+        let _lock = fd_guard_lock().lock().unwrap();
+        let _guard = FdCountGuard::new("frame-ack-rt");
+
         let (srv, cli) = socketpair();
         let mut session = AppSession::new(Transport::new(srv).unwrap());
         let mut client = Transport::new(cli).unwrap();
+        let mut blit = BlitEngine::new(); // uninitialized → import errors, flow continues
+
+        // One fake dmabuf fd per TBUF slot (P-13 SCM_RIGHTS payload).
+        let fake_fds: Vec<OwnedFd> = (0..proto::SLOT_COUNT).map(|_| fake_dmabuf_fd()).collect();
+        let raw_fds: Vec<RawFd> = fake_fds.iter().map(|fd| fd.as_raw_fd()).collect();
 
         let handle = std::thread::spawn(move || {
             // Wait for HELO
@@ -246,14 +365,28 @@ mod tests {
                     _ => {}
                 }
             }
-            // Send CONF
+            // Send CONF with app_caps=0 → blit mode (H-04)
             client
                 .send(&Message::Config(proto::ConfigMessage::new(
                     100, 100, 60000, 96, 0,
                 )))
                 .unwrap();
 
+            // H-04: blit waits for SLOT_COUNT TBUFs; each TBUF is followed by the
+            // native_handle wire message carrying the dmabuf fd (P-13).
+            for (slot, &raw_fd) in raw_fds.iter().enumerate() {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                client
+                    .send(&Message::Slot(proto::SlotBuffer::new(
+                        slot as u32, 100, 100, proto::DRM_FORMAT_ABGR8888, 400,
+                    )))
+                    .unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                client.send_raw(&native_handle_bytes(), &[raw_fd]).unwrap();
+            }
+
             // Wait for Frame
+            let mut attempts = 0;
             loop {
                 match client.recv().unwrap() {
                     Some(Message::Frame(fm, _)) => {
@@ -266,22 +399,43 @@ mod tests {
                             .unwrap();
                         break;
                     }
-                    None => std::thread::sleep(std::time::Duration::from_millis(5)),
+                    None => {
+                        attempts += 1;
+                        if attempts > 400 {
+                            panic!("expected Frame, timed out (never activated)");
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
                     other => panic!("expected Frame, got {other:?}"),
                 }
             }
         });
 
-        // Server: handshake
+        // Server: handshake → blit waits for slot registrations (H-04)
         loop {
             match session.do_handshake().unwrap() {
                 true => break,
                 false => std::thread::sleep(std::time::Duration::from_millis(5)),
             }
         }
+        assert_eq!(session.mode(), SessionMode::SlotRegistration);
+
+        // Register all slots (mirrors main.rs SlotRegistration branch)
+        for _ in 0..proto::SLOT_COUNT {
+            let msg = loop {
+                match session.recv_message(&mut blit).unwrap() {
+                    Some(m) => break m,
+                    None => std::thread::sleep(std::time::Duration::from_millis(5)),
+                }
+            };
+            assert!(matches!(msg, Message::Slot(_)));
+        }
+        assert_eq!(session.slot_count(), proto::SLOT_COUNT as u32);
+        session.activate();
+        assert_eq!(session.mode(), SessionMode::Active);
 
         // Send frame
-        session.send_frame(7, 1, 100, 100, 100, 100, None).unwrap();
+        session.send_frame(7, 1, 100, 100, 100, 100, None, None).unwrap();
 
         // Receive ack
         let ack = loop {
@@ -291,6 +445,311 @@ mod tests {
             }
         };
         assert_eq!(ack, 7);
+
+        handle.join().unwrap();
+    }
+
+    // P-13 + X-04: a Slot message with a parseable native_handle reaches the
+    // blit engine. With an uninitialized engine import fails, but the session
+    // must not panic and the received fds must be closed — never silently leaked.
+    #[test]
+    fn slot_fd_imported_not_dropped() {
+        let _lock = fd_guard_lock().lock().unwrap();
+        let _guard = FdCountGuard::new("slot-registration-fd-leak");
+
+        let (srv, cli) = socketpair();
+        let mut session = AppSession::new(Transport::new(srv).unwrap());
+        let mut client = Transport::new(cli).unwrap();
+        let mut blit = BlitEngine::new();
+
+        let fake_fds: Vec<OwnedFd> = (0..proto::SLOT_COUNT).map(|_| fake_dmabuf_fd()).collect();
+        let raw_fds: Vec<RawFd> = fake_fds.iter().map(|fd| fd.as_raw_fd()).collect();
+
+        let handle = std::thread::spawn(move || {
+            loop {
+                match client.recv().unwrap() {
+                    Some(Message::Hello(_)) => break,
+                    None => std::thread::sleep(std::time::Duration::from_millis(5)),
+                    _ => {}
+                }
+            }
+            client
+                .send(&Message::Config(proto::ConfigMessage::new(
+                    100, 100, 60000, 96, 0,
+                )))
+                .unwrap();
+            for (slot, &raw_fd) in raw_fds.iter().enumerate() {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                client
+                    .send(&Message::Slot(proto::SlotBuffer::new(
+                        slot as u32, 100, 100, proto::DRM_FORMAT_ABGR8888, 400,
+                    )))
+                    .unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                client.send_raw(&native_handle_bytes(), &[raw_fd]).unwrap();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        });
+
+        loop {
+            match session.do_handshake().unwrap() {
+                true => break,
+                false => std::thread::sleep(std::time::Duration::from_millis(5)),
+            }
+        }
+        assert_eq!(session.mode(), SessionMode::SlotRegistration);
+
+        for _ in 0..proto::SLOT_COUNT {
+            let msg = loop {
+                match session.recv_message(&mut blit).unwrap() {
+                    Some(m) => break m,
+                    None => std::thread::sleep(std::time::Duration::from_millis(5)),
+                }
+            };
+            assert!(matches!(msg, Message::Slot(_)));
+        }
+        assert_eq!(session.slot_count(), proto::SLOT_COUNT as u32);
+
+        // Engine uninitialized → import_dmabuf errors → registry stays empty.
+        handle.join().unwrap();
+        assert!(blit.slots.is_empty());
+    }
+
+    // P-13: a malformed native_handle after a TBUF is an explicit error the
+    // caller (main.rs) turns into a disconnect — not a silent drop.
+    #[test]
+    fn malformed_native_handle_disconnects() {
+        let _lock = fd_guard_lock().lock().unwrap();
+        let _guard = FdCountGuard::new("malformed-native-handle");
+
+        let (srv, cli) = socketpair();
+        let mut session = AppSession::new(Transport::new(srv).unwrap());
+        let mut client = Transport::new(cli).unwrap();
+        let mut blit = BlitEngine::new();
+        let fake_fd = fake_dmabuf_fd();
+
+        let handle = std::thread::spawn(move || {
+            loop {
+                match client.recv().unwrap() {
+                    Some(Message::Hello(_)) => break,
+                    None => std::thread::sleep(std::time::Duration::from_millis(5)),
+                    _ => {}
+                }
+            }
+            client
+                .send(&Message::Config(proto::ConfigMessage::new(
+                    100, 100, 60000, 96, 0,
+                )))
+                .unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            client
+                .send(&Message::Slot(proto::SlotBuffer::new(
+                    0, 100, 100, proto::DRM_FORMAT_ABGR8888, 400,
+                )))
+                .unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            // native_handle claims numFds=2 but only 1 fd is sent → parse failure
+            let mut data = Vec::new();
+            data.extend_from_slice(&(-1i32).to_le_bytes());
+            data.extend_from_slice(&2i32.to_le_bytes());
+            data.extend_from_slice(&0i32.to_le_bytes());
+            client.send_raw(&data, &[fake_fd.as_raw_fd()]).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        });
+
+        loop {
+            match session.do_handshake().unwrap() {
+                true => break,
+                false => std::thread::sleep(std::time::Duration::from_millis(5)),
+            }
+        }
+
+        let err = loop {
+            match session.recv_message(&mut blit) {
+                Ok(Some(_)) => panic!("expected parse error, got a message"),
+                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(5)),
+                Err(e) => break e,
+            }
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+
+        handle.join().unwrap();
+    }
+
+    // P-08b / TODO 23: a frame sent with both a pixel fd and a fence fd must
+    // set FRAME_CARRIES_FDS + FRAME_CARRIES_FENCE and carry num_planes + 1 fds
+    // (plane fds first, fence fd last). Roundtrip-decoded by the real Transport.
+    #[test]
+    fn send_frame_with_fence_appends_fence_fd_and_sets_flag() {
+        let _lock = fd_guard_lock().lock().unwrap();
+        let _guard = FdCountGuard::new("frame-pixel-and-fence");
+
+        let (srv, cli) = socketpair();
+        let mut session = AppSession::new(Transport::new(srv).unwrap());
+        let mut client = Transport::new(cli).unwrap();
+
+        let pixel_end = fake_dmabuf_fd();
+        let fence_end = fake_dmabuf_fd();
+        session
+            .send_frame(9, 2, 100, 100, 100, 100, Some(pixel_end), Some(fence_end))
+            .unwrap();
+
+        let msg = loop {
+            match client.recv().unwrap() {
+                Some(m) => break m,
+                None => std::thread::sleep(std::time::Duration::from_millis(5)),
+            }
+        };
+        match msg {
+            Message::Frame(fm, fds) => {
+                assert_eq!(fm.serial, 9);
+                assert_eq!(fm.buffer_id, 2);
+                assert!(fm.carries_fds(), "pixel fd present → FRAME_CARRIES_FDS");
+                assert!(fm.carries_fence(), "fence fd present → FRAME_CARRIES_FENCE");
+                assert_eq!(proto::fd_count(&Message::Frame(fm, vec![])), 2);
+                assert_eq!(fds.len(), 2, "num_planes (1) + fence (1) fds, P-08b");
+            }
+            other => panic!("expected Frame, got {other:?}"),
+        }
+    }
+
+    // F-08 blit mode: the App owns the slot buffer, so a blitted frame carries
+    // NO pixel fd — only the sync_file fence fd (flags = fence-only LAND).
+    #[test]
+    fn send_frame_fence_only_carries_single_fd() {
+        let _lock = fd_guard_lock().lock().unwrap();
+        let _guard = FdCountGuard::new("frame-fence-only");
+
+        let (srv, cli) = socketpair();
+        let mut session = AppSession::new(Transport::new(srv).unwrap());
+        let mut client = Transport::new(cli).unwrap();
+
+        let fence_end = fake_dmabuf_fd();
+        session
+            .send_frame(10, 3, 100, 100, 100, 100, None, Some(fence_end))
+            .unwrap();
+
+        let msg = loop {
+            match client.recv().unwrap() {
+                Some(m) => break m,
+                None => std::thread::sleep(std::time::Duration::from_millis(5)),
+            }
+        };
+        match msg {
+            Message::Frame(fm, fds) => {
+                assert_eq!(fm.serial, 10);
+                assert_eq!(fm.buffer_id, 3);
+                assert!(!fm.carries_fds(), "blit frame carries no pixel fd (F-08)");
+                assert!(fm.carries_fence());
+                assert_eq!(proto::fd_count(&Message::Frame(fm, vec![])), 1);
+                assert_eq!(fds.len(), 1, "exactly the fence fd");
+            }
+            other => panic!("expected Frame, got {other:?}"),
+        }
+    }
+
+    // X-06: full blit-mode session flow over a real socketpair with the real
+    // AppSession: handshake (app_caps=0 → blit) → SLOT_COUNT TBUFs + native
+    // handles → activate → a fence-only frame reaches the client with
+    // FRAME_CARRIES_FENCE set and exactly one fd → cumulative ack returns.
+    // (Slot import itself fails on host — no real dmabufs — which is fine: the
+    // session flow under test is transport-level.)
+    #[test]
+    fn blit_mode_frame_with_fence_roundtrip() {
+        let _lock = fd_guard_lock().lock().unwrap();
+        let _guard = FdCountGuard::new("blit-fence-roundtrip");
+
+        let (srv, cli) = socketpair();
+        let mut session = AppSession::new(Transport::new(srv).unwrap());
+        let mut client = Transport::new(cli).unwrap();
+        let mut blit = BlitEngine::new(); // uninitialized → slot import errors, flow continues
+
+        let fake_fds: Vec<OwnedFd> = (0..proto::SLOT_COUNT).map(|_| fake_dmabuf_fd()).collect();
+        let raw_fds: Vec<RawFd> = fake_fds.iter().map(|fd| fd.as_raw_fd()).collect();
+
+        let handle = std::thread::spawn(move || {
+            loop {
+                match client.recv().unwrap() {
+                    Some(Message::Hello(_)) => break,
+                    None => std::thread::sleep(std::time::Duration::from_millis(5)),
+                    _ => {}
+                }
+            }
+            client
+                .send(&Message::Config(proto::ConfigMessage::new(
+                    100, 100, 60000, 96, 0,
+                )))
+                .unwrap();
+            for (slot, &raw_fd) in raw_fds.iter().enumerate() {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                client
+                    .send(&Message::Slot(proto::SlotBuffer::new(
+                        slot as u32, 100, 100, proto::DRM_FORMAT_ABGR8888, 400,
+                    )))
+                    .unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                client.send_raw(&native_handle_bytes(), &[raw_fd]).unwrap();
+            }
+
+            // Expect the fence-only blit frame
+            let mut attempts = 0;
+            loop {
+                match client.recv().unwrap() {
+                    Some(Message::Frame(fm, fds)) => {
+                        assert_eq!(fm.serial, 42);
+                        assert_eq!(fm.buffer_id, 1, "blit frame buffer_id is the slot id");
+                        assert!(!fm.carries_fds(), "no pixel fd in blit mode (F-08)");
+                        assert!(fm.carries_fence(), "FRAME_CARRIES_FENCE expected");
+                        assert_eq!(fds.len(), 1);
+                        client
+                            .send(&Message::Ack(proto::FrameAck::new(42)))
+                            .unwrap();
+                        break;
+                    }
+                    None => {
+                        attempts += 1;
+                        if attempts > 400 {
+                            panic!("expected fence-carrying Frame, timed out");
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    other => panic!("expected Frame, got {other:?}"),
+                }
+            }
+        });
+
+        loop {
+            match session.do_handshake().unwrap() {
+                true => break,
+                false => std::thread::sleep(std::time::Duration::from_millis(5)),
+            }
+        }
+        assert_eq!(session.mode(), SessionMode::SlotRegistration);
+
+        for _ in 0..proto::SLOT_COUNT {
+            let msg = loop {
+                match session.recv_message(&mut blit).unwrap() {
+                    Some(m) => break m,
+                    None => std::thread::sleep(std::time::Duration::from_millis(5)),
+                }
+            };
+            assert!(matches!(msg, Message::Slot(_)));
+        }
+        session.activate();
+
+        // Fence-only blit frame for slot 1
+        let fence_end = fake_dmabuf_fd();
+        session
+            .send_frame(42, 1, 100, 100, 100, 100, None, Some(fence_end))
+            .unwrap();
+
+        let ack = loop {
+            match session.try_recv_ack().unwrap() {
+                Some(s) => break s,
+                None => std::thread::sleep(std::time::Duration::from_millis(5)),
+            }
+        };
+        assert_eq!(ack, 42);
 
         handle.join().unwrap();
     }

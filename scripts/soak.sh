@@ -1,6 +1,6 @@
 #!/bin/bash
 # soak.sh — 1-hour performance soak test for wl-android
-# Monitors: RSS, fd count, FPS, memory growth over time.
+# Monitors: RSS (PERF-05) and fd count (PERF-07), sampled every 60s.
 # Run inside the container alongside wl-android and KWin.
 #
 # Usage:
@@ -67,9 +67,10 @@ while [ "$ELAPSED" -lt "$DURATION" ]; do
         echo "$NOW $FD" >> "$FD_LOG"
         echo "$NOW $RSS" >> "$RSS_LOG"
 
-        # Alerts
-        if [ "$RSS" -gt 32000 ]; then
-            echo "  ${RED}⚠️  RSS=${RSS}KB > 32MB (PERF-05)${NC}"
+        # Alerts — PERF-05 bound is RSS < 32MB; VmRSS is in kB, so the limit is
+        # 32 * 1024 = 32768 kB (not 32000, which is 31.25MiB and false-fails).
+        if [ "$RSS" -gt 32768 ]; then
+            echo "  ${RED}⚠️  RSS=${RSS}KB >= 32MB (PERF-05)${NC}"
         fi
     else
         echo "$NOW 0" >> "$FD_LOG"
@@ -105,7 +106,7 @@ if [ "$INIT_FD" != "N/A" ] && [ "$FINAL_FD" != "N/A" ]; then
         FD_OK="✅"
     fi
 fi
-if [ "$FINAL_RSS" != "N/A" ] && [ "$FINAL_RSS" -lt 32000 ]; then
+if [ "$FINAL_RSS" != "N/A" ] && [ "$FINAL_RSS" -lt 32768 ]; then
     RSS_OK="✅"
 fi
 

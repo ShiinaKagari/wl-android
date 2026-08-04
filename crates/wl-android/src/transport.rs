@@ -1,19 +1,54 @@
 use std::io;
+use std::mem;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
 
 use nix::sys::socket::{self, MsgFlags, ControlMessage, ControlMessageOwned};
 use wl_android_common::proto::{self, Message};
 
+/// Message transport over a SOCK_STREAM unix socket.
+///
+/// DESIGN.md P-01 mandates SOCK_SEQPACKET so the kernel preserves message
+/// boundaries and keeps each SCM_RIGHTS fd aligned with the bytes it was sent
+/// with. The protocol deviates and uses SOCK_STREAM + a u32 length prefix,
+/// which lets multiple messages (and their fds) coalesce into one recvmsg.
+/// This transport compensates with a persistent read-ahead buffer
+/// (`pending` plus `pending_fds`); the SEQPACKET deviation remains a known
+/// deviation (DESIGN.md P-01) but the buffering below makes it safe.
 pub struct Transport {
     stream: UnixStream,
+    /// Scratch read buffer for a single recvmsg (up to 64 KiB).
     recv_buf: Vec<u8>,
+    /// Bytes read from the socket but not yet consumed by a message or raw
+    /// chunk. Absorbs coalesced trailing bytes (e.g. a native_handle that
+    /// followed a TBUF in the same recvmsg) so nothing is silently dropped.
+    pending: Vec<u8>,
+    /// SCM_RIGHTS fds that arrived together with `pending`'s bytes.
+    ///
+    /// FD-ORDERING RULE: on SOCK_STREAM the kernel delivers fds in the order
+    /// their bytes were sent, and this transport consumes messages in byte
+    /// order, so fds are consumed in order: the first N fds (N = fd count of
+    /// the decoded message, or all of them for a raw chunk) belong to the
+    /// current message and the remainder stays pending for the next one. This
+    /// holds for the TBUF + native_handle pattern: the TBUF carries 0 fds and
+    /// the handle carries exactly its own fds, so after a coalesced read the
+    /// TBUF consumes 0 fds and the handle's fds are carried over intact.
+    ///
+    /// `pending`/`pending_fds` are per-session (one Transport per AppSession)
+    /// and are dropped together with the Transport on disconnect — no explicit
+    /// clearing is needed.
+    pending_fds: Vec<OwnedFd>,
 }
 
 impl Transport {
     pub fn new(stream: UnixStream) -> io::Result<Self> {
         stream.set_nonblocking(true)?;
-        Ok(Self { stream, recv_buf: vec![0u8; 65536] })
+        Ok(Self {
+            stream,
+            recv_buf: vec![0u8; 65536],
+            pending: Vec::new(),
+            pending_fds: Vec::new(),
+        })
     }
 
     pub fn send(&mut self, msg: &Message) -> io::Result<()> {
@@ -48,35 +83,52 @@ impl Transport {
         Ok(())
     }
 
+    /// Receive one length-prefixed message (non-blocking; Ok(None) on EAGAIN).
+    ///
+    /// Serves a complete message from `pending` first (never blocks); only when
+    /// `pending` holds no complete message does it issue a new recvmsg, whose
+    /// result is appended to `pending` — trailing bytes + their fds stay
+    /// buffered for the next call instead of being dropped.
     pub fn recv(&mut self) -> io::Result<Option<Message>> {
+        if let Some((body, fds)) = self.take_pending_message()? {
+            return self.decode_msg(&body, fds).map(Some);
+        }
+
         let (data, fds) = match self.recv_raw_inner(MsgFlags::MSG_DONTWAIT) {
-            Ok((d, f)) => (d, f),
+            Ok(v) => v,
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(None),
             Err(e) => return Err(e),
         };
-
         if data.is_empty() {
+            // Peer closed / nothing queued; `pending` (partial or raw bytes)
+            // is left as-is for a later call.
             return Ok(None);
         }
-        if data.len() < 4 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "message too short"));
+
+        self.pending.extend_from_slice(&data);
+        self.pending_fds.extend(fds);
+
+        match self.take_pending_message()? {
+            Some((body, fds)) => self.decode_msg(&body, fds).map(Some),
+            None => Ok(None), // partial length prefix — wait for the rest
         }
-
-        let msg_len = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
-        if data.len() < 4 + msg_len {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "truncated message body"));
-        }
-
-        let msg_body = &data[4..4 + msg_len];
-        let msg = proto::decode(msg_body, fds)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-
-        Ok(Some(msg))
     }
 
     /// Receive raw bytes + fds without length prefix (for native_handle, P-13).
-    /// Returns None on EAGAIN.
+    /// Returns None on EAGAIN. Serves `pending` first; only when `pending` is
+    /// empty does it issue a new recvmsg, so each call returns at most one
+    /// recvmsg's worth of bytes. A caller needing a full native_handle must
+    /// poll (as app_link::recv_native_handle_follow_up does); in practice a
+    /// 12–32 B handle arrives whole in one recvmsg.
     pub fn recv_raw(&mut self) -> io::Result<Option<(Vec<u8>, Vec<OwnedFd>)>> {
+        if !self.pending.is_empty() {
+            // Per the FD-ORDERING RULE, every fd that was not consumed by the
+            // length-prefixed message belongs to this trailing raw chunk.
+            let data = mem::take(&mut self.pending);
+            let fds = mem::take(&mut self.pending_fds);
+            return Ok(Some((data, fds)));
+        }
+
         match self.recv_raw_inner(MsgFlags::MSG_DONTWAIT) {
             Ok((d, f)) => {
                 if d.is_empty() { Ok(None) } else { Ok(Some((d, f))) }
@@ -103,6 +155,66 @@ impl Transport {
             None,
         )?;
         Ok(())
+    }
+
+    /// If `pending` holds a complete length-prefixed message, extract its body
+    /// and the fds aligned to it (FD-ORDERING RULE), leaving any trailing bytes
+    /// + fds in place. Ok(None) for a partial message.
+    fn take_pending_message(&mut self) -> io::Result<Option<(Vec<u8>, Vec<OwnedFd>)>> {
+        if self.pending.len() < 4 {
+            return Ok(None);
+        }
+        let msg_len = u32::from_le_bytes([
+            self.pending[0],
+            self.pending[1],
+            self.pending[2],
+            self.pending[3],
+        ]) as usize;
+        // All protocol messages are <= 80 B; guard against a garbage length
+        // prefix (e.g. native_handle bytes misread as a length) so a desynced
+        // stream fails fast instead of stalling forever.
+        const MAX_MSG_LEN: usize = 1 << 20;
+        if msg_len > MAX_MSG_LEN {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unreasonable message length: {msg_len}"),
+            ));
+        }
+        let total = 4 + msg_len;
+        if self.pending.len() < total {
+            return Ok(None);
+        }
+
+        let body = self.pending[4..total].to_vec();
+        self.pending.drain(..total);
+
+        let need = Self::msg_fd_count(&body);
+        let take = need.min(self.pending_fds.len());
+        let fds: Vec<OwnedFd> = self.pending_fds.drain(..take).collect();
+        Ok(Some((body, fds)))
+    }
+
+    fn decode_msg(&self, body: &[u8], fds: Vec<OwnedFd>) -> io::Result<Message> {
+        proto::decode(body, fds)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
+    }
+
+    /// Number of SCM_RIGHTS fds a length-prefixed message body consumes. Only
+    /// Frame messages carry fds (P-08/P-08b); mirrors proto::fd_count on raw
+    /// body bytes so the transport can align fds to a message before decode.
+    fn msg_fd_count(body: &[u8]) -> usize {
+        if body.len() < 4 {
+            return 0;
+        }
+        let magic = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
+        // FrameMessage layout: magic@0, num_planes@4, ..., flags@36.
+        if magic != proto::MAGIC_LAND || body.len() < 40 {
+            return 0;
+        }
+        let num_planes = u32::from_le_bytes([body[4], body[5], body[6], body[7]]) as usize;
+        let flags = u32::from_le_bytes([body[36], body[37], body[38], body[39]]);
+        (if flags & proto::FRAME_CARRIES_FDS != 0 { num_planes } else { 0 })
+            + (if flags & proto::FRAME_CARRIES_FENCE != 0 { 1 } else { 0 })
     }
 
     fn recv_raw_inner(&mut self, flags: MsgFlags) -> io::Result<(Vec<u8>, Vec<OwnedFd>)> {
@@ -151,8 +263,86 @@ mod tests {
     use std::os::unix::net::UnixStream;
     use wl_android_common::proto::HelloMessage;
 
+    // X-04: fd leak guard — /proc/self/fd is process-global, so guard tests are
+    // only deterministic while no other fd-touching test runs concurrently.
+    // Combine with `--test-threads=1` (the crate's established convention).
+    static FD_GUARD_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+
+    fn fd_guard_lock() -> &'static std::sync::Mutex<()> {
+        FD_GUARD_LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
+    struct FdCountGuard {
+        initial: usize,
+        label: &'static str,
+    }
+
+    impl FdCountGuard {
+        fn new(label: &'static str) -> Self {
+            let initial = std::fs::read_dir("/proc/self/fd")
+                .map(|entries| entries.count())
+                .unwrap_or(0);
+            Self { initial, label }
+        }
+    }
+
+    impl Drop for FdCountGuard {
+        fn drop(&mut self) {
+            let current = std::fs::read_dir("/proc/self/fd")
+                .map(|entries| entries.count())
+                .unwrap_or(0);
+            assert_eq!(
+                current, self.initial,
+                "FdCountGuard [{}]: fd count changed: {} != {} (leak detected)",
+                self.label, current, self.initial
+            );
+        }
+    }
+
     fn socketpair() -> (UnixStream, UnixStream) {
         UnixStream::pair().expect("socketpair")
+    }
+
+    fn fake_dmabuf_fd() -> OwnedFd {
+        socketpair().0.into()
+    }
+
+    // native_handle wire format with numFds=1, numInts=0 (P-13)
+    fn native_handle_bytes() -> Vec<u8> {
+        let mut data = Vec::new();
+        data.extend_from_slice(&(-1i32).to_le_bytes()); // version placeholder
+        data.extend_from_slice(&1i32.to_le_bytes());    // numFds
+        data.extend_from_slice(&0i32.to_le_bytes());    // numInts
+        data
+    }
+
+    fn poll_recv(t: &mut Transport) -> Message {
+        for _ in 0..100 {
+            if let Some(m) = t.recv().unwrap() {
+                return m;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        panic!("recv timed out");
+    }
+
+    fn poll_recv_raw(t: &mut Transport) -> (Vec<u8>, Vec<OwnedFd>) {
+        for _ in 0..100 {
+            if let Some(r) = t.recv_raw().unwrap() {
+                return r;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        panic!("recv_raw timed out");
+    }
+
+    /// The received fd must be a live descriptor: getsockopt succeeds and it is
+    /// a stream socket (the fake dmabuf we sent is a socketpair endpoint, so a
+    /// dup through SCM_RIGHTS must still be a socket).
+    fn assert_valid_fd(fd: &OwnedFd) {
+        let t = nix::sys::socket::getsockopt(fd, nix::sys::socket::sockopt::SockType)
+            .expect("received fd must be a valid live descriptor");
+        assert_eq!(t, nix::sys::socket::SockType::Stream);
     }
 
     #[test]
@@ -179,5 +369,127 @@ mod tests {
             }
         };
         assert!(matches!(received, Message::Hello(_)));
+    }
+
+    // THE regression test (mirrors the real-device failure): the App sends the
+    // TBUF length-prefixed message and the native_handle raw payload back-to-back
+    // with NO delay. On SOCK_STREAM both byte-ranges + the SCM_RIGHTS fd coalesce
+    // into one recvmsg. The pre-fix transport consumed only the TBUF and silently
+    // dropped the trailing handle bytes + its fd, so recv_raw() never saw them.
+    #[test]
+    fn regression_tbuf_plus_native_handle_back_to_back() {
+        // Ignore poisoning: the lock only serializes fd-touching tests (a prior
+        // RED-phase panic must not cascade into PoisonError for the next test).
+        let _lock = fd_guard_lock().lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = FdCountGuard::new("regression-tbuf-plus-handle");
+
+        let (srv, cli) = socketpair();
+        let mut server = Transport::new(srv).unwrap();
+        let mut client = Transport::new(cli).unwrap();
+
+        let fake = fake_dmabuf_fd();
+        let raw_fd = fake.as_raw_fd();
+
+        // (a) length-prefixed TBUF, then (b) raw native_handle — back-to-back, no delay.
+        client
+            .send(&Message::Slot(proto::SlotBuffer::new(
+                0, 100, 100, proto::DRM_FORMAT_ABGR8888, 400,
+            )))
+            .unwrap();
+        client.send_raw(&native_handle_bytes(), &[raw_fd]).unwrap();
+
+        // Server recv() must return the Slot...
+        let msg = poll_recv(&mut server);
+        assert!(matches!(msg, Message::Slot(s) if s.slot == 0));
+
+        // ...then recv_raw() must return the handle bytes + its fd (not the next
+        // message and not garbage).
+        let (data, fds) = poll_recv_raw(&mut server);
+        assert_eq!(data, native_handle_bytes());
+        assert_eq!(fds.len(), 1);
+        assert_valid_fd(&fds[0]);
+    }
+
+    // P-05 coalescing: two length-prefixed messages sent back-to-back must both
+    // be delivered, in order, with no bytes lost.
+    #[test]
+    fn recv_consumes_only_one_message_keeps_rest() {
+        let (srv, cli) = socketpair();
+        let mut server = Transport::new(srv).unwrap();
+        let mut client = Transport::new(cli).unwrap();
+
+        let touch = Message::Touch(proto::TouchMessage::new(
+            1, 10.0, 20.0, proto::TOUCH_PHASE_DOWN, 5,
+        ));
+        let conf = Message::Config(proto::ConfigMessage::new(
+            800, 600, 60000, 96, proto::APP_CAP_DIRECT_IMPORT,
+        ));
+
+        client.send(&touch).unwrap();
+        client.send(&conf).unwrap();
+
+        assert_eq!(poll_recv(&mut server), touch);
+        assert_eq!(poll_recv(&mut server), conf);
+    }
+
+    // P-13 + X-04: a length-prefixed Hello (0 fds) coalesced with a raw
+    // native_handle carrying one fd. The first recv() consumes 0 fds; the fd must
+    // survive into the trailing raw chunk so recv_raw() returns it intact.
+    #[test]
+    fn recv_raw_after_recv_gets_trailing_fd() {
+        // Ignore poisoning: the lock only serializes fd-touching tests (a prior
+        // RED-phase panic must not cascade into PoisonError for the next test).
+        let _lock = fd_guard_lock().lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = FdCountGuard::new("recv-raw-after-recv-trailing-fd");
+
+        let (srv, cli) = socketpair();
+        let mut server = Transport::new(srv).unwrap();
+        let mut client = Transport::new(cli).unwrap();
+
+        let fake = fake_dmabuf_fd();
+        let raw_fd = fake.as_raw_fd();
+
+        client
+            .send(&Message::Hello(HelloMessage::default()))
+            .unwrap();
+        client.send_raw(&native_handle_bytes(), &[raw_fd]).unwrap();
+
+        let msg = poll_recv(&mut server);
+        assert!(matches!(msg, Message::Hello(_)));
+
+        let (data, fds) = poll_recv_raw(&mut server);
+        assert_eq!(data, native_handle_bytes());
+        assert_eq!(fds.len(), 1);
+        assert_valid_fd(&fds[0]);
+    }
+
+    // A second recv() must be served from `pending` without a new recvmsg (the
+    // socket is drained after the first read), preserving byte order. The
+    // immediate `expect` is the observable: no EAGAIN, no poll needed.
+    #[test]
+    fn pending_served_without_recvmsg() {
+        let (srv, cli) = socketpair();
+        let mut server = Transport::new(srv).unwrap();
+        let mut client = Transport::new(cli).unwrap();
+
+        let touch = Message::Touch(proto::TouchMessage::new(
+            1, 10.0, 20.0, proto::TOUCH_PHASE_DOWN, 5,
+        ));
+        let conf = Message::Config(proto::ConfigMessage::new(
+            800, 600, 60000, 96, proto::APP_CAP_DIRECT_IMPORT,
+        ));
+        let key = Message::Key(proto::KeyMessage::new(10, 1, 0));
+
+        client.send(&touch).unwrap();
+        client.send(&conf).unwrap();
+        client.send(&key).unwrap();
+
+        // First call absorbs one recvmsg with all three messages.
+        assert_eq!(poll_recv(&mut server), touch);
+        // The remaining two are served straight from pending, in order.
+        let second = server.recv().unwrap().expect("pending Config served immediately");
+        assert_eq!(second, conf);
+        let third = server.recv().unwrap().expect("pending Key served immediately");
+        assert_eq!(third, key);
     }
 }

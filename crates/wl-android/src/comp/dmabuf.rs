@@ -2,20 +2,9 @@ use smithay::wayland::dmabuf::{DmabufFeedbackBuilder, DmabufGlobal, DmabufHandle
 use smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer;
 use smithay::wayland::buffer::BufferHandler;
 use smithay::backend::allocator::Buffer;
-use tracing::{debug, error, warn};
-use drm_fourcc::DrmFourcc;
-use std::os::fd::OwnedFd;
-use std::os::fd::AsRawFd as _;
+use tracing::{debug, warn};
 
 use crate::state::WlState;
-
-fn fourcc_to_vk(fourcc: DrmFourcc) -> ash::vk::Format {
-    match fourcc {
-        DrmFourcc::Argb8888 | DrmFourcc::Xrgb8888 => ash::vk::Format::B8G8R8A8_UNORM,
-        DrmFourcc::Abgr8888 | DrmFourcc::Xbgr8888 => ash::vk::Format::R8G8B8A8_UNORM,
-        _ => ash::vk::Format::B8G8R8A8_UNORM, // fallback
-    }
-}
 
 pub fn build_default_feedback() -> smithay::wayland::dmabuf::DmabufFeedback {
     use drm_fourcc::DrmFourcc;
@@ -62,6 +51,12 @@ impl DmabufHandler for WlState {
         let num_planes = dmabuf.num_planes();
         debug!(num_planes, "dmabuf imported");
 
+        // TODO 25: the eager import here is redundant — the KWin frame fd is
+        // dup'd and stashed at commit time (extract_from_buffer →
+        // pending_frames) and lazily imported in blit_and_send_frame via the
+        // PERF-11 frame_images cache (state.rs). This handler only accepts the
+        // dmabuf so KWin's wl_dmabuf negotiation completes; notifier.successful
+        // is the acceptance signal — dropping it would reject KWin's buffer.
         let handles: Vec<_> = dmabuf.handles().collect();
         if handles.is_empty() {
             warn!("dmabuf with no planes");
@@ -69,30 +64,7 @@ impl DmabufHandler for WlState {
             return;
         }
 
-        // Dup the first plane's fd (Dmabuf retains ownership)
-        let raw_fd = handles[0].as_raw_fd();
-        let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(raw_fd) };
-        let Ok(fd) = borrowed.try_clone_to_owned() else {
-            error!("failed to dup dmabuf fd");
-            notifier.failed();
-            return;
-        };
-
-        // Import into blit engine
-        let format = dmabuf.format();
-        let modifier: u64 = u64::from(format.modifier);
-        let vk_format = fourcc_to_vk(format.code);
-
-        match self.blit_engine.import_dmabuf(fd, 0, 0, vk_format, modifier) {
-            Ok(handle) => {
-                self.blit_image_handles.push(handle);
-                let _ = notifier.successful::<Self>();
-            }
-            Err(e) => {
-                error!(err = %e, "blit import failed");
-                notifier.failed();
-            }
-        }
+        let _ = notifier.successful::<Self>();
     }
 }
 

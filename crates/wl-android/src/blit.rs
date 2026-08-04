@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
-use std::os::fd::OwnedFd;
+use std::os::fd::{FromRawFd, OwnedFd};
 
 use ash::vk;
 use tracing::info;
@@ -16,6 +16,8 @@ pub struct BlitEngine {
     image_memories: HashMap<u64, vk::DeviceMemory>,
     image_views: HashMap<u64, vk::ImageView>,
     fence: vk::Fence,
+    /// TBUF slot number → imported VkImage handle (P-12/P-13).
+    pub slots: HashMap<u32, u64>,
     initialized: bool,
 }
 
@@ -31,6 +33,7 @@ impl BlitEngine {
             images: HashMap::new(),
             image_memories: HashMap::new(),
             image_views: HashMap::new(),
+            slots: HashMap::new(),
             fence: vk::Fence::null(),
             initialized: false,
         }
@@ -76,10 +79,13 @@ impl BlitEngine {
             .queue_family_index(queue_family_index)
             .queue_priorities(&queue_priorities);
 
+        // SYNC_FD fence export uses KHR_external_fence_fd; VK_ANDROID_external_fence_sync_file never shipped.
         let device_extensions = [
             vk::KHR_EXTERNAL_MEMORY_FD_NAME,
             vk::EXT_EXTERNAL_MEMORY_DMA_BUF_NAME,
             vk::KHR_EXTERNAL_MEMORY_NAME,
+            vk::KHR_EXTERNAL_FENCE_NAME,
+            vk::KHR_EXTERNAL_FENCE_FD_NAME,
         ];
 
         let dev_ext_names: Vec<CString> = device_extensions
@@ -112,8 +118,11 @@ impl BlitEngine {
                 .map_err(|e| format!("allocate_cmd_buf: {e}"))?
         };
 
+        let mut fence_export_info = vk::ExportFenceCreateInfo::default()
+            .handle_types(vk::ExternalFenceHandleTypeFlags::SYNC_FD);
         let fence_info = vk::FenceCreateInfo::default()
-            .flags(vk::FenceCreateFlags::SIGNALED);
+            .flags(vk::FenceCreateFlags::SIGNALED)
+            .push_next(&mut fence_export_info);
         let fence = unsafe {
             device.create_fence(&fence_info, None)
                 .map_err(|e| format!("create_fence: {e}"))?
@@ -232,13 +241,29 @@ impl BlitEngine {
         width: u32,
         height: u32,
     ) -> Result<(), String> {
+        self.blit_submit_with_fence(src_handle, dst_handle, width, height, self.fence)
+    }
+
+    /// Blit from src to dst, submit against the given fence instead of the
+    /// internal one. The fence must be unsignaled (or resettable): it is
+    /// reset here before submission. Submissions are still serialized on the
+    /// single command buffer; the chosen fence only changes which object
+    /// signals completion (for the SYNC_FD export path).
+    pub fn blit_submit_with_fence(
+        &self,
+        src_handle: u64,
+        dst_handle: u64,
+        width: u32,
+        height: u32,
+        fence: vk::Fence,
+    ) -> Result<(), String> {
         if !self.initialized { return Err("not initialized".into()); }
         let device = self.device();
 
         let src = *self.images.get(&src_handle).ok_or("src not found")?;
         let dst = *self.images.get(&dst_handle).ok_or("dst not found")?;
 
-        unsafe { device.reset_fences(&[self.fence]) }
+        unsafe { device.reset_fences(&[fence]) }
             .map_err(|e| format!("reset_fence: {e}"))?;
 
         let begin_info = vk::CommandBufferBeginInfo::default()
@@ -314,7 +339,7 @@ impl BlitEngine {
         let submit_info = vk::SubmitInfo::default()
             .command_buffers(std::slice::from_ref(&self.command_buffer));
         unsafe {
-            device.queue_submit(self.queue, &[submit_info], self.fence)
+            device.queue_submit(self.queue, &[submit_info], fence)
                 .map_err(|e| format!("queue_submit: {e}"))?;
         }
 
@@ -331,6 +356,54 @@ impl BlitEngine {
         Ok(())
     }
 
+    /// Export a fence as a SYNC_FD. Returns Ok(None) when the driver reports
+    /// the fence already signaled (F-13: vkGetFenceFdKHR may yield fd -1 for a
+    /// signaled SYNC_FD fence) — the caller must treat that as "already
+    /// complete", not as an fd. On success the returned OwnedFd wraps the fd
+    /// exactly once; -1 is never wrapped. SYNC_FD fence export has COPY
+    /// transference (spec, "Importing Fence State"): the fence keeps its
+    /// payload and is NOT reset by export — reuse happens via the reset in
+    /// blit_submit_with_fence. (The reset-on-export rule is for semaphores.)
+    pub fn export_fence_syncfd(&self, fence: vk::Fence) -> Result<Option<OwnedFd>, String> {
+        if !self.initialized { return Err("not initialized".into()); }
+        let instance = self.instance.as_ref().ok_or("no instance")?;
+        let device = self.device();
+
+        let loader = ash::khr::external_fence_fd::Device::new(instance, device);
+        let get_info = vk::FenceGetFdInfoKHR::default()
+            .fence(fence)
+            .handle_type(vk::ExternalFenceHandleTypeFlags::SYNC_FD);
+        let fd = unsafe { loader.get_fence_fd(&get_info) }
+            .map_err(|e| format!("get_fence_fd: {e}"))?;
+        if fd == -1 {
+            return Ok(None);
+        }
+        Ok(Some(unsafe { OwnedFd::from_raw_fd(fd) }))
+    }
+
+    /// Create an unsignaled fence exportable as SYNC_FD. Caller-owned: the
+    /// caller must destroy it with destroy_fence_handle once no submission
+    /// can still signal it.
+    pub fn create_exportable_fence(&mut self) -> Result<vk::Fence, String> {
+        if !self.initialized { return Err("not initialized".into()); }
+        let device = self.device();
+
+        let mut export_info = vk::ExportFenceCreateInfo::default()
+            .handle_types(vk::ExternalFenceHandleTypeFlags::SYNC_FD);
+        let fence_info = vk::FenceCreateInfo::default()
+            .push_next(&mut export_info);
+        let fence = unsafe {
+            device.create_fence(&fence_info, None)
+                .map_err(|e| format!("create_exportable_fence: {e}"))?
+        };
+        Ok(fence)
+    }
+
+    pub fn destroy_fence_handle(&self, fence: vk::Fence) {
+        if !self.initialized || fence == vk::Fence::null() { return; }
+        unsafe { self.device().destroy_fence(fence, None); }
+    }
+
     pub fn destroy_image(&mut self, handle: u64) {
         if let Some(image) = self.images.remove(&handle) {
             unsafe { self.device.as_ref().unwrap().destroy_image(image, None); }
@@ -340,6 +413,43 @@ impl BlitEngine {
         }
         if let Some(view) = self.image_views.remove(&handle) {
             unsafe { self.device.as_ref().unwrap().destroy_image_view(view, None); }
+        }
+    }
+
+    /// Import a dmabuf for a TBUF slot and record slot → image handle (P-13).
+    /// Import first, then replace the previous slot image (P-14: a new TBUF
+    /// invalidates the old slot fd), so a failed import leaves the old image
+    /// untouched. On error the fd is dropped by `import_dmabuf` — never leaked.
+    pub fn register_slot(
+        &mut self,
+        slot: u32,
+        fd: OwnedFd,
+        width: u32,
+        height: u32,
+        format: vk::Format,
+        modifier: u64,
+    ) -> Result<u64, String> {
+        let handle = self.import_dmabuf(fd, width, height, format, modifier)?;
+        if let Some(&old) = self.slots.get(&slot) {
+            self.destroy_image(old);
+        }
+        self.slots.insert(slot, handle);
+        Ok(handle)
+    }
+
+    /// Destroy the image for a slot and forget the mapping.
+    pub fn unregister_slot(&mut self, slot: u32) {
+        if let Some(handle) = self.slots.remove(&slot) {
+            self.destroy_image(handle);
+        }
+    }
+
+    /// Unregister all slots (C-02: on App disconnect, destroy all slot VkImages
+    /// and close their fds).
+    pub fn clear_slots(&mut self) {
+        let slots: Vec<u32> = self.slots.keys().copied().collect();
+        for slot in slots {
+            self.unregister_slot(slot);
         }
     }
 }
