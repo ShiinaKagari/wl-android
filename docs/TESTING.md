@@ -74,7 +74,9 @@ NS "dbus-daemon --session --address=unix:path=/tmp/wl-runtime/bus --fork"
 NS "$KGSL_ENV $CONTAINER_REPO/target/release/wl-android run >> /tmp/wl-runtime/wl-android.log 2>&1 &"   # sleep 2
 
 # 5. 一条命令拉起整个 Plasma 会话
-NS "$KGSL_ENV HOME=/home/kagari startplasma-wayland &"   # sleep 5
+#    qdbus 依赖 /usr/bin/qdbus 符号链接（见 §5）；DBUS_SESSION_BUS_ADDRESS 必须显式给，
+#    否则 startplasmacompositor 报 "Could not start D-Bus. Can you call qdbus?"
+NS "$KGSL_ENV HOME=/home/kagari DBUS_SESSION_BUS_ADDRESS=unix:path=/tmp/wl-runtime/bus startplasma-wayland &"   # sleep 5
 
 # 6. 重启 App
 adb shell "am force-stop com.wl.android && am start com.wl.android/.MainActivity"
@@ -118,6 +120,7 @@ NS "grep -c 'blit frame' /tmp/wl-runtime/wl-android.log 2>/dev/null"
 
 | 现象 | 原因 | 处理 |
 |------|------|------|
+| plasma.log 出现 "startplasmacompositor: Could not start D-Bus. Can you call qdbus?" | startplasma-wayland 需要 `qdbus`：容器必须存在 `/usr/bin/qdbus -> /usr/lib/qt6/bin/qdbus` 符号链接（Arch 系仅提供 qdbus6）；缺失时 KWin/Plasma 不启动 → 黑屏 | 修复：容器内 `ln -s /usr/lib/qt6/bin/qdbus /usr/bin/qdbus`（容器重建后需重新执行） |
 | plasmashell 直接崩（单独 `plasmashell &`） | startplasma-wayland 依赖已存在的 dbus session；缺 dbus 时 plasmashell 无 session bus 崩 | 先 `dbus-daemon --session --address=unix:path=$XDG_RUNTIME_DIR/bus --fork` 再 `startplasma-wayland`（§3 顺序） |
 | dbus-daemon 拒绝启动 / 权限错 | $XDG_RUNTIME_DIR 权限 0777（adb shell 默认） | `chmod 700 $XDG_RUNTIME_DIR` |
 | 背靠背 TBUF+native_handle 断连（旧 bug） | SOCK_STREAM 下两条消息合并进一次 recvmsg，旧实现丢尾部字节+fd | **已修复**：transport 的 pending 读前瞻缓冲保留合并字节与 fd（P-18/P-19），有回归测试，不再复现 |
