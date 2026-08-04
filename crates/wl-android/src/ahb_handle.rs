@@ -33,8 +33,10 @@
 /// (12 ints, 32-bit usage) is kept as a fallback for older Android.
 use std::os::fd::OwnedFd;
 
-/// `'GB01'` — GraphicBuffer::flatten magic, LE bytes on the wire (Android 15+).
-pub const FLAT_MAGIC: u32 = 0x3130_4247; // bytes on wire: 31 30 42 47 ("10BG" LE = 'GB01')
+/// `'GB01'` — GraphicBuffer::flatten magic. AOSP writes the multi-char literal
+/// 'GB01' (= 0x47423031) to a 32-bit int; on little-endian the wire bytes are
+/// 31 30 42 47, so the LE u32 read of those bytes is 0x47423031.
+pub const FLAT_MAGIC: u32 = 0x4742_3031;
 /// Legacy `'GBFR'` magic (pre-Android-15 flatten, 32-bit usage).
 pub const FLAT_MAGIC_LEGACY: u32 = 0x5246_4247; // wire bytes: 47 42 46 52
 /// New flatten header: 13 x i32 = 52 bytes.
@@ -191,7 +193,7 @@ mod tests {
     /// GraphicBuffer::flatten wire bytes (Android 15+ 'GB01', 13 ints).
     fn flat_bytes(w: i32, h: i32) -> Vec<u8> {
         let mut data = Vec::new();
-        data.extend_from_slice(&0x3130_4247u32.to_le_bytes()); // 'GB01' LE
+        data.extend_from_slice(&0x4742_3031u32.to_le_bytes()); // 'GB01' LE → 31 30 42 47
         data.extend_from_slice(&w.to_le_bytes()); // width
         data.extend_from_slice(&h.to_le_bytes()); // height
         data.extend_from_slice(&(w * 4).to_le_bytes()); // stride

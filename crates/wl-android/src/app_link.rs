@@ -249,7 +249,7 @@ impl AppSession {
         tracing::debug!(
             n = data.len(),
             fds = fds.len(),
-            first = data.iter().take(8).map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" "),
+            first = data.iter().take(16).map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" "),
             "handle follow-up: first chunk"
         );
         let is_flat = {
