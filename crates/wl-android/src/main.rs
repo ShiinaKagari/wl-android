@@ -59,7 +59,15 @@ fn run_server() -> Result<(), Box<dyn std::error::Error>> {
             format!("{xdg_runtime}/wl-android/land.sock")
         });
 
-    // Clean stale sockets from previous runs
+    // Clean stale sockets from previous runs.
+    //
+    // The land socket is deployed inside a DIRECTORY bind mount
+    // (host /data/local/tmp/wl-android ↔ container /run/wl-android): the
+    // directory is the mount point, and the socket FILE inside it is a
+    // regular entry — unlink here removes the stale socket from the shared
+    // directory (both sides), then create_listener binds a fresh one. This
+    // is safe BECAUSE the file is not itself a mount point (a single-file
+    // bind would make it one: EBUSY on unlink, EADDRINUSE on bind).
     for stray in &[
         &wayland_socket_path,
         &format!("{wayland_socket_path}.lock"),
