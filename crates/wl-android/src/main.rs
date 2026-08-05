@@ -46,11 +46,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn run_server() -> Result<(), Box<dyn std::error::Error>> {
-    // Default display name: use the standard wayland-0 so compositor
-    // clients (Plasma/KWin) find the socket in a default environment
-    // without a WAYLAND_DISPLAY override.
+    // Default display name: use a NON-standard name (land-0), NOT the
+    // standard wayland-0. wl-android is the OUTER compositor in a nested
+    // setup: KWin runs on top as the inner compositor and needs wayland-0
+    // for ITS OWN socket (Plasma shell connects to KWin's wayland-0).
+    // Occupying wayland-0 would make KWin fail with "unable to lock
+    // lockfile wayland-0.lock, maybe another compositor is running".
     let wayland_display =
-        std::env::var("WAYLAND_DISPLAY").unwrap_or_else(|_| "wayland-0".into());
+        std::env::var("WAYLAND_DISPLAY").unwrap_or_else(|_| "land-0".into());
     // Default runtime dir: prefer XDG_RUNTIME_DIR; per the XDG Base
     // Directory spec §3, when it is unset applications should fall back to
     // a replacement directory with similar capabilities AND print a
