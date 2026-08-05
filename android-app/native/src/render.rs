@@ -1044,7 +1044,7 @@ impl RenderState {
             let slot = self.acquire_next_image(u64::MAX, None, None)?;
             // Steps 1-3 keep the device borrow scoped to this block so the
             // &mut self.present below does not collide with it.
-            let (buffer, staging_mem) = {
+            let (buffer, staging_mem, copy_sem) = {
                 let device = self.device.as_ref().expect("device set");
 
                 // 1. Staging buffer (HOST_VISIBLE) sized to the frame.
@@ -1197,22 +1197,37 @@ impl RenderState {
                     .end_command_buffer(self.command_buffer)
                     .map_err(|e| format!("upload: end_cmd: {e}"))?;
             }
-            let cmd_bufs = [self.command_buffer];
-            let submit = vk::SubmitInfo::default().command_buffers(&cmd_bufs);
-            unsafe {
-                device
-                    .queue_submit(self.queue, &[submit], vk::Fence::null())
-                    .map_err(|e| format!("upload: queue_submit: {e}"))?;
-            }
-                (buffer, staging_mem)
+                let cmd_bufs = [self.command_buffer];
+                // Sync: signal a binary semaphore when the copy completes;
+                // present waits on it (without this, present can race ahead
+                // of vkCmdCopyBufferToImage and show an empty/old image —
+                // the black-screen root cause).
+                let semaphore_info = vk::SemaphoreCreateInfo::default();
+                let copy_sem = unsafe {
+                    device
+                        .create_semaphore(&semaphore_info, None)
+                        .map_err(|e| format!("upload: create_semaphore: {e}"))?
+                };
+                let signal_sems = [copy_sem];
+                let submit = vk::SubmitInfo::default()
+                    .command_buffers(&cmd_bufs)
+                    .signal_semaphores(&signal_sems);
+                unsafe {
+                    device
+                        .queue_submit(self.queue, &[submit], vk::Fence::null())
+                        .map_err(|e| format!("upload: queue_submit: {e}"))?;
+                }
+                (buffer, staging_mem, copy_sem)
             };
 
-            // 4. Present (steps 1-3 ended the device borrow above).
-            self.present(slot, &[])?;
+            // 4. Present, waiting for the copy semaphore (steps 1-3 ended the
+            // device borrow above).
+            self.present(slot, &[copy_sem])?;
 
-            // 5. Release staging resources.
+            // 5. Release staging resources + the copy semaphore.
             let device = self.device.as_ref().expect("device set");
             unsafe {
+                device.destroy_semaphore(copy_sem, None);
                 device.destroy_buffer(buffer, None);
                 device.free_memory(staging_mem, None);
             }
