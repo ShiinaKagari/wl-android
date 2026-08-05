@@ -598,14 +598,22 @@ fn register_swapchain_slots(inner: &mut Inner) -> Result<u32, String> {
 #[unsafe(no_mangle)]
 extern "system" fn Java_com_wl_android_NativeBridge_nativeOnConfig(
     _env: JNIEnv, _class: JClass, handle: jlong,
-    w: jint, h: jint, refresh_millihz: jint, dpi: jint,
+    w: jint, h: jint, refresh_millihz: jint, dpi: jint, frame_mode: jint,
 ) {
     if let Some(state) = find(handle) {
         let mut inner = state.lock().unwrap();
         if let Some(ref mut session) = inner.session {
-            let _ = session.send_config(w as u32, h as u32, refresh_millihz as u32, dpi as u32);
+            let _ = session.send_config(w as u32, h as u32, refresh_millihz as u32, dpi as u32, frame_mode as u32);
         }
     }
+}
+
+#[unsafe(no_mangle)]
+extern "system" fn Java_com_wl_android_NativeBridge_nativeSetRenderSize(
+    _env: JNIEnv, _class: JClass, _handle: jlong,
+    w: jint, h: jint,
+) {
+    crate::jni_bridge::set_render_size(w as u32, h as u32);
 }
 
 #[unsafe(no_mangle)]

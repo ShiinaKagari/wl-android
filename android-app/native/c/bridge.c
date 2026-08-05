@@ -39,3 +39,11 @@ int wl_set_format(ANativeWindow* window) {
     }
     return ANativeWindow_setBuffersGeometry(window, 0, 0, WINDOW_FORMAT_BGRA_8888);
 }
+
+/* SCALE: set the buffer geometry to the render target resolution (the scaled
+ * size KWin renders at). The SurfaceView stays fullscreen, so SurfaceFlinger
+ * stretches the smaller buffer to fill the panel. width/height of 0 keeps the
+ * surface's own size (fullscreen, no scaling). */
+int wl_set_dimensions(ANativeWindow* window, int width, int height) {
+    return ANativeWindow_setBuffersGeometry(window, width, height, WINDOW_FORMAT_BGRA_8888);
+}

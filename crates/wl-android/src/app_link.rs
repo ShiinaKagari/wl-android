@@ -521,8 +521,7 @@ mod tests {
                     Some(Message::Hello(_)) => {
                         client
                             .send(&Message::Config(proto::ConfigMessage::new(
-                                800, 600, 60000, 96, proto::APP_CAP_DIRECT_IMPORT,
-                            )))
+                                800, 600, 60000, 96, proto::APP_CAP_DIRECT_IMPORT, 0)))
                             .unwrap();
                         break;
                     }
@@ -579,8 +578,7 @@ mod tests {
             // Send CONF with app_caps=0 → blit mode (H-04)
             client
                 .send(&Message::Config(proto::ConfigMessage::new(
-                    100, 100, 60000, 96, 0,
-                )))
+                    100, 100, 60000, 96, 0, 0)))
                 .unwrap();
 
             // H-04: blit waits for SLOT_COUNT TBUFs; each TBUF is followed by the
@@ -686,8 +684,7 @@ mod tests {
             }
             client
                 .send(&Message::Config(proto::ConfigMessage::new(
-                    100, 100, 60000, 96, 0,
-                )))
+                    100, 100, 60000, 96, 0, 0)))
                 .unwrap();
             for (slot, &raw_fd) in raw_fds.iter().enumerate() {
                 std::thread::sleep(std::time::Duration::from_millis(20));
@@ -749,8 +746,7 @@ mod tests {
             }
             client
                 .send(&Message::Config(proto::ConfigMessage::new(
-                    100, 100, 60000, 96, 0,
-                )))
+                    100, 100, 60000, 96, 0, 0)))
                 .unwrap();
             std::thread::sleep(std::time::Duration::from_millis(20));
             client
@@ -888,8 +884,7 @@ mod tests {
             }
             client
                 .send(&Message::Config(proto::ConfigMessage::new(
-                    100, 100, 60000, 96, 0,
-                )))
+                    100, 100, 60000, 96, 0, 0)))
                 .unwrap();
             for (slot, &raw_fd) in raw_fds.iter().enumerate() {
                 std::thread::sleep(std::time::Duration::from_millis(20));

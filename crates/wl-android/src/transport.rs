@@ -536,8 +536,7 @@ mod tests {
             1, 10.0, 20.0, proto::TOUCH_PHASE_DOWN, 5,
         ));
         let conf = Message::Config(proto::ConfigMessage::new(
-            800, 600, 60000, 96, proto::APP_CAP_DIRECT_IMPORT,
-        ));
+            800, 600, 60000, 96, proto::APP_CAP_DIRECT_IMPORT, 0));
 
         client.send(&touch).unwrap();
         client.send(&conf).unwrap();
@@ -611,8 +610,7 @@ mod tests {
             }
             client
                 .send(&Message::Config(proto::ConfigMessage::new(
-                    100, 100, 60000, 96, 0,
-                )))
+                    100, 100, 60000, 96, 0, 0)))
                 .unwrap();
 
             // The device burst: ALL pairs in one write, 5 fds coalescing into a
@@ -693,8 +691,7 @@ mod tests {
             }
             client
                 .send(&Message::Config(proto::ConfigMessage::new(
-                    100, 100, 60000, 96, 0,
-                )))
+                    100, 100, 60000, 96, 0, 0)))
                 .unwrap();
             // TBUF0
             client
@@ -764,8 +761,7 @@ mod tests {
             1, 10.0, 20.0, proto::TOUCH_PHASE_DOWN, 5,
         ));
         let conf = Message::Config(proto::ConfigMessage::new(
-            800, 600, 60000, 96, proto::APP_CAP_DIRECT_IMPORT,
-        ));
+            800, 600, 60000, 96, proto::APP_CAP_DIRECT_IMPORT, 0));
         let key = Message::Key(proto::KeyMessage::new(10, 1, 0));
 
         client.send(&touch).unwrap();

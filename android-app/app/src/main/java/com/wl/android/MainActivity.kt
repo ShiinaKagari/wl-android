@@ -18,6 +18,8 @@ class MainActivity : Activity(), SurfaceHolder.Callback, StatusListener {
     private lateinit var touchForwarder: TouchForwarder
     private var nativeHandle: Long = 0
     private val socketPath = "/data/local/tmp/wl-android/land.sock"
+    private val scaleOptions = floatArrayOf(0.5f, 1f, 1.5f, 2f)
+    private var scaleIndex = 1 // default 1x
 
     // CONN-STATE: event-driven — native calls onStateChanged on connection
     // state changes (no polling). Runs on the native recv thread; hop to the
@@ -76,6 +78,10 @@ class MainActivity : Activity(), SurfaceHolder.Callback, StatusListener {
                     android.widget.FrameLayout.LayoutParams.MATCH_PARENT,
                     android.widget.FrameLayout.LayoutParams.MATCH_PARENT
                 ))
+                addView(buildControlPanel(), android.widget.FrameLayout.LayoutParams(
+                    android.widget.FrameLayout.LayoutParams.MATCH_PARENT,
+                    android.widget.FrameLayout.LayoutParams.WRAP_CONTENT
+                ).apply { gravity = android.view.Gravity.BOTTOM })
             }
         )
 
@@ -98,20 +104,63 @@ class MainActivity : Activity(), SurfaceHolder.Callback, StatusListener {
             true
         }
 
-        collector = ScreenInfoCollector(this) { w, h, ref, dpi ->
+        collector = ScreenInfoCollector(this) { w, h, ref, dpi, mode ->
             touchForwarder.screenWidth = w
             touchForwarder.screenHeight = h
             if (nativeHandle != 0L) {
-                NativeBridge.nativeOnConfig(nativeHandle, w, h, ref, dpi)
+                NativeBridge.nativeOnConfig(nativeHandle, w, h, ref, dpi, mode)
             }
         }
 
-        // Connect once, keep alive across lifecycle
+    // Connect once, keep alive across lifecycle
         nativeHandle = NativeBridge.nativeInit(socketPath)
         // CONN-STATE: register the event-driven status listener (native calls
         // onStateChanged on connection changes — no polling).
         if (nativeHandle != 0L) {
             NativeBridge.nativeSetStatusListener(nativeHandle, this)
+        }
+    }
+
+    /** Bottom control panel: render-scale cycling button + frame-pacing mode
+     * cycling button. Scale multiplies the physical mode into the render
+     * target resolution sent to the backend; mode selects pacing on the
+     * server (0 free, 1 vsync-align, 2 performance, 3 power-save). */
+    private fun buildControlPanel(): android.view.View {
+        val scaleBtn = android.widget.Button(this).apply {
+            text = "Scale: 1x"
+            setOnClickListener {
+                scaleIndex = (scaleIndex + 1) % scaleOptions.size
+                text = "Scale: ${scaleOptions[scaleIndex]}x"
+                collector.scale = scaleOptions[scaleIndex]
+                // Set the App-side buffer geometry to the render target too,
+                // so ANativeWindow_lock hands back the scaled size.
+                val mode = display?.mode
+                if (mode != null && nativeHandle != 0L) {
+                    val rw = (mode.physicalWidth * collector.scale).toInt().coerceAtLeast(1)
+                    val rh = (mode.physicalHeight * collector.scale).toInt().coerceAtLeast(1)
+                    NativeBridge.nativeSetRenderSize(nativeHandle, rw, rh)
+                }
+                collector.emit()
+            }
+        }
+        val modeBtn = android.widget.Button(this).apply {
+            text = "Pacing: Free"
+            setOnClickListener {
+                collector.frameMode = (collector.frameMode + 1) % 4
+                text = when (collector.frameMode) {
+                    1 -> "Pacing: Vsync-align"
+                    2 -> "Pacing: Performance"
+                    3 -> "Pacing: Power-save"
+                    else -> "Pacing: Free"
+                }
+                collector.emit()
+            }
+        }
+        return android.widget.LinearLayout(this).apply {
+            orientation = android.widget.LinearLayout.HORIZONTAL
+            setBackgroundColor(android.graphics.Color.argb(140, 0, 0, 0))
+            addView(scaleBtn, android.widget.LinearLayout.LayoutParams(0, android.widget.LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+            addView(modeBtn, android.widget.LinearLayout.LayoutParams(0, android.widget.LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
         }
     }
 

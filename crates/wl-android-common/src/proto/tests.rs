@@ -127,7 +127,7 @@ fn golden_hello() {
 
 #[test]
 fn golden_config() {
-    let msg = ConfigMessage::new(3392, 2400, 144000, 289, APP_CAP_DIRECT_IMPORT);
+    let msg = ConfigMessage::new(3392, 2400, 144000, 289, APP_CAP_DIRECT_IMPORT, 0);
     let bytes = encode(&Message::Config(msg));
     assert_eq!(bytes.len(), 32);
     assert_eq!(bytes[0..4], *b"CONF");
@@ -269,7 +269,7 @@ fn decode_roundtrip(msg: &Message) -> Result<Message, ProtoError> {
 proptest! {
     #[test]
     fn rt_config(width in 100u32..8000, height in 100u32..8000, refresh in 1000u32..240000, dpi in 96u32..600, caps in 0u32..1) {
-        let msg = Message::Config(ConfigMessage::new(width, height, refresh, dpi, caps));
+        let msg = Message::Config(ConfigMessage::new(width, height, refresh, dpi, caps, 0));
         let got = decode_roundtrip(&msg)?;
         assert_eq!(got, msg);
     }

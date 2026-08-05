@@ -126,11 +126,14 @@ pub struct ConfigMessage {
     pub refresh_millihz: u32,
     pub dpi: u32,
     pub app_caps: u32,
-    pub _reserved: u32,
+    /// Frame pacing mode (previously `_reserved`): 0 = free, 1 = vsync-align
+    /// (deliver at the refresh period), 2 = performance (no pacing, minimum
+    /// buffering), 3 = power-save (cap frame rate below refresh).
+    pub frame_mode: u32,
 }
 
 impl ConfigMessage {
-    pub fn new(width: u32, height: u32, refresh_millihz: u32, dpi: u32, app_caps: u32) -> Self {
+    pub fn new(width: u32, height: u32, refresh_millihz: u32, dpi: u32, app_caps: u32, frame_mode: u32) -> Self {
         Self {
             magic: MAGIC_CONF,
             protocol_version: PROTOCOL_VERSION,
@@ -139,7 +142,7 @@ impl ConfigMessage {
             refresh_millihz,
             dpi,
             app_caps,
-            _reserved: 0,
+            frame_mode,
         }
     }
 }

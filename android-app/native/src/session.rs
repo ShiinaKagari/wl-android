@@ -242,8 +242,8 @@ impl AppSession {
         self.write_msg(&proto::encode(msg))
     }
 
-    pub fn send_config(&self, w: u32, h: u32, refresh_millihz: u32, dpi: u32) -> io::Result<()> {
-        let conf = proto::ConfigMessage::new(w, h, refresh_millihz, dpi, 0);
+    pub fn send_config(&self, w: u32, h: u32, refresh_millihz: u32, dpi: u32, frame_mode: u32) -> io::Result<()> {
+        let conf = proto::ConfigMessage::new(w, h, refresh_millihz, dpi, 0, frame_mode);
         self.send_message(&Message::Config(conf))
     }
 
@@ -294,7 +294,7 @@ impl AppSession {
         }
 
         // 2. Send CONF
-        let conf_data = proto::encode(&Message::Config(proto::ConfigMessage::new(3392, 2400, 144000, 289, 0)));
+        let conf_data = proto::encode(&Message::Config(proto::ConfigMessage::new(3392, 2400, 144000, 289, 0, 0)));
         let len = (conf_data.len() as u32).to_le_bytes();
         wr.write_all(&len)?;
         wr.write_all(&conf_data)?;

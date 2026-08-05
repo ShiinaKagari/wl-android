@@ -11,6 +11,7 @@ unsafe extern "C" {
     fn wl_unlock_and_post(window: *mut std::ffi::c_void) -> std::ffi::c_int;
     fn wl_acquire_window(window: *mut std::ffi::c_void);
     fn wl_set_format(window: *mut std::ffi::c_void) -> std::ffi::c_int;
+    fn wl_set_dimensions(window: *mut std::ffi::c_void, width: std::ffi::c_int, height: std::ffi::c_int) -> std::ffi::c_int;
 }
 
 static WINDOW: Mutex<Option<usize>> = Mutex::new(None);
@@ -59,6 +60,19 @@ pub fn set_surface(env: *mut std::ffi::c_void, surface: jni::sys::jobject) {
     let fmt_result = unsafe { wl_set_format(window as _) };
     log::info!("set_surface: window={window:p} (acquired) set_format={fmt_result}");
     *w = Some(window as usize);
+}
+
+/// SCALE: set the ANativeWindow buffer geometry to the render target
+/// resolution (physical × scale). The SurfaceView stays fullscreen, so
+/// SurfaceFlinger stretches the smaller render buffer to fill the panel.
+/// 0x0 restores fullscreen (scale 1.0). Safe to call before any lock; the
+/// next ANativeWindow_lock returns the new buffer size.
+pub fn set_render_size(width: u32, height: u32) {
+    let w = WINDOW.lock().unwrap();
+    let Some(window) = *w else { return };
+    if window == 0 { return; }
+    let rc = unsafe { wl_set_dimensions(window as _, width as _, height as _) };
+    log::info!("set_render_size: {width}x{height} rc={rc}");
 }
 
 /// Row-wise BGRX -> BGRA copy (byte-identical: both sides are B,G,R,X memory

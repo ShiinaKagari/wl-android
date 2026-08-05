@@ -23,7 +23,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("✅ HELO");
 
     // Send CONF (3392x2400 @144Hz, 289 DPI, blit mode)
-    let conf = ConfigMessage::new(3392, 2400, 144000, 289, 0);
+    let conf = ConfigMessage::new(3392, 2400, 144000, 289, 0, 0);
     send_msg(&mut stream, &Message::Config(conf))?;
     println!("✅ CONF");
     std::thread::sleep(std::time::Duration::from_millis(300));

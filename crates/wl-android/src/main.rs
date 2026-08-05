@@ -329,6 +329,7 @@ fn handle_land_input(state: &mut WlState) -> bool {
                         state.apply_config(
                             conf.width, conf.height,
                             conf.refresh_millihz, conf.dpi,
+                            conf.frame_mode,
                         );
                         false
                     }

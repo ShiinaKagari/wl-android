@@ -290,6 +290,11 @@ pub struct WlState {
     pub screen_height: u32,
     pub refresh_millihz: u32,
     pub dpi: u32,
+    /// Frame pacing mode from the App's ConfigMessage: 0 free, 1 vsync-align,
+    /// 2 performance, 3 power-save. Drives commit-time throttling (last_send).
+    pub frame_mode: u32,
+    /// Last Instant a frame was actually sent to the App — pacing anchor.
+    pub last_send: std::time::Instant,
     pub output: Output,
     pub toplevel: Option<ToplevelSurface>,
     pub seat_state: SeatState<Self>,
@@ -383,6 +388,7 @@ impl WlState {
             app_session: None, land_listener: None, land_source: None,
             clock_epoch: std::time::Instant::now(),
             screen_width: w, screen_height: h, refresh_millihz: refresh, dpi,
+            frame_mode: 0, last_send: std::time::Instant::now(),
             output, toplevel: None, seat_state, seat, touch_injector,
             next_serial: 1,
             pending_frames: PendingFrames::default(),
@@ -528,14 +534,14 @@ impl WlState {
         );
     }
 
-    pub fn apply_config(&mut self, w: u32, h: u32, refresh_millihz: u32, dpi: u32) {
-        info!(w, h, refresh = refresh_millihz, dpi, "applying config update");
+    pub fn apply_config(&mut self, w: u32, h: u32, refresh_millihz: u32, dpi: u32, frame_mode: u32) {
+        info!(w, h, refresh = refresh_millihz, dpi, frame_mode, "applying config update");
         let size_changed = self.screen_width != w || self.screen_height != h;
-        let _refresh_changed = self.refresh_millihz != refresh_millihz;
         self.screen_width = w;
         self.screen_height = h;
         self.refresh_millihz = refresh_millihz;
         self.dpi = dpi;
+        self.frame_mode = frame_mode;
         self.touch_injector.set_logical_size(w, h);
 
         let new_mode = Mode { size: (w as i32, h as i32).into(), refresh: refresh_millihz as i32 };
@@ -551,6 +557,37 @@ impl WlState {
                 state.states.set(xdg_toplevel::State::Fullscreen);
             });
             tl.send_configure();
+        }
+    }
+
+    /// PACING: decide whether a freshly-committed frame may be sent to the App
+    /// now, and (if sent) update the pacing anchor. Modes (ConfigMessage):
+    /// 0 free — always send.
+    /// 1 vsync-align — send at most one frame per refresh period; a commit
+    ///   inside the same period is merged into the next tick (latest-wins).
+    /// 2 performance — always send, minimum buffering (no pacing gate).
+    /// 3 power-save — cap at half the refresh rate (fewer presents, less
+    ///   GPU + copy work in the App; still smooth for static content).
+    /// Returns true when the frame should be delivered.
+    pub fn pacing_gate(&mut self) -> bool {
+        let period = match self.frame_mode {
+            0 | 2 => return true,
+            1 => {
+                let p = 1_000_000_000_000u64 / self.refresh_millihz.max(1) as u64;
+                p.min(1_000_000_000) // cap at 1s: a 0/absent refresh never stalls
+            }
+            3 => {
+                let p = 2_000_000_000_000u64 / self.refresh_millihz.max(1) as u64;
+                p.min(2_000_000_000)
+            }
+            _ => return true,
+        };
+        let elapsed = self.last_send.elapsed().as_nanos() as u64;
+        if elapsed >= period {
+            self.last_send = std::time::Instant::now();
+            true
+        } else {
+            false
         }
     }
 
@@ -770,8 +807,10 @@ impl CompositorHandler for WlState {
                     tracing::info!(bw, bh, "frame extracted from SHM");
                     let seq = self.frame_cache.as_ref().map(|c| c.seq()).unwrap_or(0);
                     // H-04: blit sends no frames until its slots are registered.
+                    let paced = self.pacing_gate();
                     if let Some(session) = &mut self.app_session
                         && session.mode() == SessionMode::Active
+                        && paced
                     {
                         let serial = seq;
                         tracing::info!(serial, bw, bh, "sending frame to App");
@@ -797,7 +836,7 @@ impl CompositorHandler for WlState {
                         Some(s) => s.mode() == SessionMode::Active,
                     };
                     fed_router = true; // the DMABUF branch owns the router feed
-                    if feedable {
+                    if feedable && self.pacing_gate() {
                         let actions = self.frame_router.handle(
                             crate::frame_router::RouterEvent::Commit {
                                 buffer_id: buf_key,
@@ -822,8 +861,10 @@ impl CompositorHandler for WlState {
                     if let Some(cache) = &mut self.frame_cache {
                         if let Some(fd) = cache.current_frame() {
                             // H-04: blit sends no frames until its slots are registered.
+                            let paced = self.pacing_gate();
                             if let Some(session) = &mut self.app_session
                                 && session.mode() == SessionMode::Active
+                                && paced
                             {
                                 let (fd, seq, cw, ch) = fd;
                                 let _ = session.send_frame(
