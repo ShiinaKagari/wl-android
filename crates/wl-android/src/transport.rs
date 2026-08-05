@@ -87,15 +87,26 @@ impl Transport {
             MsgFlags::empty(),
             None,
         )
-        .inspect_err(|_| {
-            // The App is gone (EPIPE/ECONNRESET). Shutdown the socket so the
-            // next recv() sees EOF and the session teardown path fires — a
-            // dead-but-Open session keeps accepting SCM_RIGHTS fds into the
-            // socket buffer, leaking a 32MB memfd per frame until OOM.
-            let _ = nix::sys::socket::shutdown(
-                self.stream.as_raw_fd(),
-                nix::sys::socket::Shutdown::Both,
-            );
+        .map_err(|e| {
+            // Only a definitively-dead peer (EPIPE/ECONNRESET/ENOTCONN) gets
+            // the teardown kick: shutdown() the socket so the next recv()
+            // sees EOF and the session teardown path fires. A dead-but-Open
+            // session keeps accepting SCM_RIGHTS fds into the socket buffer,
+            // leaking a 32MB memfd per frame until OOM. EAGAIN etc. are
+            // transient (non-blocking socket, full buffer) — the App is fine,
+            // never kill the session for those.
+            if matches!(
+                e,
+                nix::errno::Errno::EPIPE
+                    | nix::errno::Errno::ECONNRESET
+                    | nix::errno::Errno::ENOTCONN
+            ) {
+                let _ = nix::sys::socket::shutdown(
+                    self.stream.as_raw_fd(),
+                    nix::sys::socket::Shutdown::Both,
+                );
+            }
+            std::io::Error::from_raw_os_error(e as i32)
         })?;
         Ok(())
     }
