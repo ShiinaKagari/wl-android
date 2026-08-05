@@ -68,6 +68,7 @@ android_logger、insta、proptest、cargo-ndk。
 - ❌ 支持 proot 环境
 - ❌ 使用 OpenGL ES（App 渲染仅 Vulkan）
 - ❌ App 层面申请 root 权限
+- ❌ GUI 进程（server / KWin / Plasma）以 root 运行（必须为普通用户，见 §8.2）
 - ❌ 引入消息队列 / IPC 框架（仅裸二进制 socket 协议）
 - ❌ 修改 Wayland 协议或发明私有 Wayland 扩展
 - ❌ 修改测试后端的环境变量、文件权限、系统参数（见 §8.1 测试后端不可变原则）
@@ -122,3 +123,18 @@ android_logger、insta、proptest、cargo-ndk。
 
 > 例外：用户**明确、实时**指示的临时环境操作（如本次会话中用户指示的 `setenforce 0`），
 > 仅在指示范围内执行，且操作前后必须向用户明示差异。
+
+### 8.2 GUI 进程用户权限原则（符合 Linux desktop 规范）
+
+**所有 GUI 程序禁止以 root 运行，必须以普通用户权限运行**，遵循 Linux desktop 规范：
+
+- ✅ server（wl-android）、KWin、Plasma 及一切图形 / 桌面相关进程以非 root 用户运行
+- ✅ 符合 freedesktop 规范：`XDG_RUNTIME_DIR=/run/user/<uid>`（0700、属主=运行用户）、
+  `WAYLAND_DISPLAY`、`DBUS_SESSION_BUS_ADDRESS` 等标准环境由登录机制提供
+- ✅ 涉及特权资源（GPU 设备访问、capabilities）时，通过**标准机制**解决
+  （容器/登录配置、用户组、设备节点既有权限），而非以 root 运行 GUI 绕过
+- ❌ 禁止以 root（或提权）启动任何 GUI 进程作为"让它跑起来"的手段
+- ❌ 禁止为 GUI 进程授予文件级 capabilities（`setcap`）作为运行前提
+
+**验证方式**：运行中的桌面栈进程（server / kwin_wayland / plasmashell 等）
+`ps -o user=` 必须为非 root 用户；`XDG_RUNTIME_DIR` 必须指向 `/run/user/<uid>` 且属主正确。
