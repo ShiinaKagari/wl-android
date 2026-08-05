@@ -643,7 +643,10 @@ extern "system" fn Java_com_wl_android_NativeBridge_nativeOnTouch(
     _env: JNIEnv, _class: JClass, handle: jlong,
     touch_id: jint, x: jfloat, y: jfloat, phase: jint, time_ms: jint,
 ) {
-    let Some(state) = find(handle) else { return };
+    let Some(state) = find(handle) else {
+        log::warn!("nativeOnTouch: unknown handle {handle}");
+        return;
+    };
     let msg = wl_android_common::proto::TouchMessage::new(
         touch_id, x, y, phase as u32, time_ms as u32,
     );
@@ -672,8 +675,14 @@ extern "system" fn Java_com_wl_android_NativeBridge_nativeOnKey(
 /// syscall: on SOCK_STREAM a single write is atomic, so this never interleaves
 /// with the recv thread's FACK writes on its own stream clone.
 fn send_input_message(state: &StateRef, msg: &wl_android_common::proto::Message) {
-    let Ok(inner) = state.lock() else { return };
-    let Some(ws) = inner.input_write.lock().unwrap().clone() else { return };
+    let Ok(inner) = state.lock() else {
+        log::warn!("send_input_message: state lock failed");
+        return;
+    };
+    let Some(ws) = inner.input_write.lock().unwrap().clone() else {
+        log::warn!("send_input_message: no input_write stream");
+        return;
+    };
     let data = wl_android_common::proto::encode(msg);
     let mut buf = Vec::with_capacity(4 + data.len());
     buf.extend_from_slice(&(data.len() as u32).to_le_bytes());
@@ -682,7 +691,10 @@ fn send_input_message(state: &StateRef, msg: &wl_android_common::proto::Message)
     // atomic unit, so the message can never interleave with the recv thread's
     // FACK writes on its own stream clone. The message is ~40B and the socket
     // buffer is ≥64KiB, so the write completes in one call in practice.
-    let _ = ws.as_ref().write(&buf);
+    match ws.as_ref().write(&buf) {
+        Ok(n) => log::debug!("send_input_message: wrote {n} bytes"),
+        Err(e) => log::warn!("send_input_message: write failed: {e}"),
+    }
 }
 
 #[unsafe(no_mangle)]

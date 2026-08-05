@@ -46,6 +46,16 @@ class MainActivity : Activity(), SurfaceHolder.Callback, StatusListener {
         super.onCreate(savedInstanceState)
 
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        // NOTIFICATION-SHADE FOCUS: the shade holds the input focus when the
+        // status bar is visible, swallowing every touch (KWin never sees
+        // clicks). Fullscreen + hide the status bar so the shade cannot
+        // appear / keep focus.
+        window.addFlags(WindowManager.LayoutParams.FLAG_FULLSCREEN)
+        window.decorView.systemUiVisibility =
+            android.view.View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY or
+            android.view.View.SYSTEM_UI_FLAG_FULLSCREEN or
+            android.view.View.SYSTEM_UI_FLAG_HIDE_NAVIGATION or
+            android.view.View.SYSTEM_UI_FLAG_LAYOUT_STABLE
 
         if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O_MR1) {
             setShowWhenLocked(true)
@@ -246,6 +256,23 @@ class MainActivity : Activity(), SurfaceHolder.Callback, StatusListener {
 
         // Focus can be stolen (e.g. keyguard dismissal, dialog), re-grab after resume.
         surfaceView.post { surfaceView.requestFocus() }
+    }
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus) {
+            // INPUT FOCUS: the NotificationShade can hold the focused window
+            // (e.g. after a swipe-down or a restart), which swallows every
+            // touch before it reaches the SurfaceView — KWin then never sees
+            // clicks (icons appear dead). Re-assert focus + hide the system
+            // bars so the shade cannot steal input again.
+            surfaceView.requestFocus()
+            window.decorView.systemUiVisibility =
+                android.view.View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY or
+                android.view.View.SYSTEM_UI_FLAG_FULLSCREEN or
+                android.view.View.SYSTEM_UI_FLAG_HIDE_NAVIGATION or
+                android.view.View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+        }
     }
 
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
