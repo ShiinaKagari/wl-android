@@ -77,10 +77,10 @@ fn fourcc_to_vk(fourcc: drm_fourcc::DrmFourcc) -> ash::vk::Format {
 }
 
 fn extract_from_buffer(
-    wl_buffer: smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer,
+    wl_buffer: &smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer,
     frame_cache: &mut Option<FrameCache>,
 ) -> Option<ExtractedFrame> {
-    let shm_result = shm::with_buffer_contents(&wl_buffer, |ptr, _pool_len, data| {
+    let shm_result = shm::with_buffer_contents(wl_buffer, |ptr, _pool_len, data| {
         let stride = data.stride as usize;
         let height = data.height as usize;
         if height == 0 || stride == 0 { return None; }
@@ -720,7 +720,14 @@ impl CompositorHandler for WlState {
                     let buffer = guard.current().buffer.take();
                     match buffer {
                         Some(BufferAssignment::NewBuffer(wl_buffer)) => {
-                            extract_from_buffer(wl_buffer, &mut self.frame_cache)
+                            let r = extract_from_buffer(&wl_buffer, &mut self.frame_cache);
+                            // ASYNC-RELEASE: the frame is now copied into the
+                            // resident FrameCache (our shared memory), so KWin's
+                            // buffer is free — release it immediately. Dropping
+                            // WlBuffer alone does NOT send wl_buffer.release;
+                            // smithay's own code always calls it explicitly.
+                            wl_buffer.release();
+                            r
                         }
                         _ => None,
                     }
@@ -733,7 +740,9 @@ impl CompositorHandler for WlState {
                         let buffer = guard.current().buffer.take();
                         match buffer {
                             Some(BufferAssignment::NewBuffer(wl_buffer)) => {
-                                extract_from_buffer(wl_buffer, &mut self.frame_cache)
+                                let r = extract_from_buffer(&wl_buffer, &mut self.frame_cache);
+                                wl_buffer.release();
+                                r
                             }
                             _ => None,
                         }
