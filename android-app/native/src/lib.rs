@@ -67,6 +67,12 @@ struct Inner {
     /// session's write stream, guarded by its own mutex so UI-thread input
     /// never contends with the recv thread's Inner lock (frame bookkeeping).
     input_write: Mutex<Option<Arc<UnixStream>>>,
+    /// CONFIG RACE: nativeOnConfig may fire before the handshake CONF is done
+    /// (onResume → collector.start() races the connection). Sending a second
+    /// CONF over the same socket mid-handshake desyncs the length-prefix
+    /// stream (the server reads 0x18 as a magic). Cache the latest config
+    /// here; flush it once the session reaches Active (handshake complete).
+    pending_config: Option<(u32, u32, u32, u32, u32)>,
     /// CONN-LOOP: set by nativeDestroy to stop the reconnect thread (it owns
     /// an Arc of Inner and would otherwise retry forever).
     stopped: std::sync::atomic::AtomicBool,
@@ -170,6 +176,7 @@ extern "system" fn Java_com_wl_android_NativeBridge_nativeInit(
         server_caps: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         consecutive_present_failures: 0,
         input_write: Mutex::new(None),
+        pending_config: None,
         stopped: std::sync::atomic::AtomicBool::new(false),
     }));
 
@@ -225,6 +232,13 @@ extern "system" fn Java_com_wl_android_NativeBridge_nativeInit(
                             // live even without frames (KWin may be idle).
                             if let Ok(mut inner) = on_connected_state.lock() {
                                 inner.state = AppState::Active;
+                                // CONFIG RACE: flush the config the UI thread
+                                // cached while the handshake was in progress.
+                                if let Some((w, h, r, d, m)) = inner.pending_config.take()
+                                    && let Some(ref mut session) = inner.session
+                                {
+                                    let _ = session.send_config(w, h, r, d, m);
+                                }
                                 notify_status(AppState::Active);
                             }
                         },
@@ -602,8 +616,16 @@ extern "system" fn Java_com_wl_android_NativeBridge_nativeOnConfig(
 ) {
     if let Some(state) = find(handle) {
         let mut inner = state.lock().unwrap();
-        if let Some(ref mut session) = inner.session {
-            let _ = session.send_config(w as u32, h as u32, refresh_millihz as u32, dpi as u32, frame_mode as u32);
+        let cfg = (w as u32, h as u32, refresh_millihz as u32, dpi as u32, frame_mode as u32);
+        // CONFIG RACE: only send once the handshake CONF is done (Active). A
+        // mid-handshake second CONF over the same socket desyncs the
+        // length-prefix stream on the server (bad magic). Cache otherwise.
+        if inner.state == AppState::Active {
+            if let Some(ref mut session) = inner.session {
+                let _ = session.send_config(cfg.0, cfg.1, cfg.2, cfg.3, cfg.4);
+            }
+        } else {
+            inner.pending_config = Some(cfg);
         }
     }
 }
