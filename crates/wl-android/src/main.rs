@@ -48,8 +48,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     let wayland_display =
         std::env::var("WAYLAND_DISPLAY").unwrap_or_else(|_| "land-0".into());
-    let xdg_runtime =
-        std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into());
+    // Default runtime dir: prefer XDG_RUNTIME_DIR; fall back to a per-user
+    // dir under $HOME/.cache (NOT /tmp — the turnip/Vulkan driver segfaults
+    // in BlitEngine::drop when XDG_RUNTIME_DIR is unset and the sockets land
+    // in /tmp; a private $HOME/.cache/wl-runtime is safe and always creatable).
+    let xdg_runtime = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+        let dir = format!("{home}/.cache/wl-runtime");
+        std::fs::create_dir_all(&dir).ok();
+        dir
+    });
     let wayland_socket_path = format!("{xdg_runtime}/{wayland_display}");
 
     // Default land socket in user space (not /run)
