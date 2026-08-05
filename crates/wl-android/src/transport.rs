@@ -86,7 +86,17 @@ impl Transport {
             &cmsgs,
             MsgFlags::empty(),
             None,
-        )?;
+        )
+        .inspect_err(|_| {
+            // The App is gone (EPIPE/ECONNRESET). Shutdown the socket so the
+            // next recv() sees EOF and the session teardown path fires — a
+            // dead-but-Open session keeps accepting SCM_RIGHTS fds into the
+            // socket buffer, leaking a 32MB memfd per frame until OOM.
+            let _ = nix::sys::socket::shutdown(
+                self.stream.as_raw_fd(),
+                nix::sys::socket::Shutdown::Both,
+            );
+        })?;
         Ok(())
     }
 
@@ -107,9 +117,15 @@ impl Transport {
             Err(e) => return Err(e),
         };
         if data.is_empty() {
-            // Peer closed / nothing queued; `pending` (partial or raw bytes)
-            // is left as-is for a later call.
-            return Ok(None);
+            // Peer closed. This is NOT an empty-read / WouldBlock case: the
+            // App is gone (SIGKILL/lmkd) and the session must be torn down —
+            // otherwise the caller keeps treating the dead session as Active
+            // and every subsequent send_frame piles another SCM_RIGHTS fd into
+            // the dead socket (per-frame memfd leak → OOM kills more apps).
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionReset,
+                "peer closed the land socket",
+            ));
         }
 
         self.pending.extend_from_slice(&data);
