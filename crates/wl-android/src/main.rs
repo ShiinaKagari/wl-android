@@ -51,17 +51,36 @@ fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     // without a WAYLAND_DISPLAY override.
     let wayland_display =
         std::env::var("WAYLAND_DISPLAY").unwrap_or_else(|_| "wayland-0".into());
-    // Default runtime dir: prefer XDG_RUNTIME_DIR; fall back to a per-user
-    // dir under $HOME/.cache (NOT /tmp — the turnip/Vulkan driver segfaults
-    // in BlitEngine::drop when the XDG_RUNTIME_DIR env var is unset or
-    // empty; any non-empty value works, including /tmp. We pick a private
-    // $HOME/.cache/wl-runtime and export it so the driver sees the var).
+    // Default runtime dir: prefer XDG_RUNTIME_DIR; per the XDG Base
+    // Directory spec §3, when it is unset applications should fall back to
+    // a replacement directory with similar capabilities AND print a
+    // warning. We use a private $HOME/.cache/wl-runtime (NOT /tmp — the
+    // turnip/Vulkan driver segfaults in BlitEngine::drop when the
+    // XDG_RUNTIME_DIR env var is unset or empty; any non-empty value
+    // works, including /tmp). The fallback is created with mode 0700 and
+    // chown'd to the invoking user to match the spec's ownership/0700
+    // requirements.
     let xdg_runtime = match std::env::var("XDG_RUNTIME_DIR") {
         Ok(v) if !v.is_empty() => v,
         _ => {
             let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
             let dir = format!("{home}/.cache/wl-runtime");
             std::fs::create_dir_all(&dir).ok();
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+            // SAFETY: single-threaded startup; path is owned by us.
+            unsafe {
+                let _ = libc::chown(
+                    std::ffi::CString::new(dir.as_str()).unwrap().as_ptr(),
+                    libc::getuid(),
+                    libc::getgid(),
+                );
+            }
+            tracing::warn!(
+                dir,
+                "XDG_RUNTIME_DIR is not set — using private fallback (spec §3 allows this; \
+                 prefer launching via a systemd user session so /run/user/<uid> is provided)"
+            );
             // The driver checks the env var itself; the path alone is not
             // enough. Export so turnip's teardown path does not segfault.
             // SAFETY: single-threaded at startup, no other env access yet.
