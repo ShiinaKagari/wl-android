@@ -81,6 +81,19 @@ fn copy_row_bgra(
     copy_h: usize,
 ) -> bool {
     let row_bytes = copy_w * 4;
+    // PERF: when both strides match (the common case: window stride ==
+    // SHM stride == width*4), the whole frame is one contiguous block —
+    // a single memcpy beats per-row copies (less loop overhead, better
+    // vectorization). Fall back to row-wise when they differ.
+    if src_stride_bytes == dst_stride_bytes {
+        let total = row_bytes.saturating_mul(copy_h);
+        let n = total.min(src.len()).min(dst.len());
+        // SAFETY: both slices are valid; n is clamped to both lengths.
+        unsafe {
+            std::ptr::copy_nonoverlapping(src.as_ptr(), dst.as_mut_ptr(), n);
+        }
+        return n < total;
+    }
     let mut truncated = false;
     for y in 0..copy_h {
         let src_row = y * src_stride_bytes;

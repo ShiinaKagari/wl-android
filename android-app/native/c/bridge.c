@@ -1,4 +1,5 @@
 #include <android/native_window_jni.h>
+#include <dlfcn.h>
 
 /* NDK 27's native_window.h does not define WINDOW_FORMAT_BGRA_8888.
  * Value 5 matches android.graphics.PixelFormat.BGRA_8888. */
@@ -23,5 +24,18 @@ void wl_acquire_window(ANativeWindow* window) {
 }
 
 int wl_set_format(ANativeWindow* window) {
+    // SOM-BUF: three-buffer pool (like Sommelier's fixed shm pool) so the
+    // render thread never overwrites a buffer SurfaceFlinger is still
+    // displaying — the "jumping between frames" artifact. Default is 2.
+    //
+    // ANativeWindow_setBufferCount is API 35+ and absent from the device's
+    // libandroid — resolve dynamically and skip when unavailable (a hard
+    // reference would fail dlopen with UnsatisfiedLinkError).
+    typedef int32_t (*set_buf_count_fn)(ANativeWindow*, size_t);
+    set_buf_count_fn set_count =
+        (set_buf_count_fn)dlsym(RTLD_DEFAULT, "ANativeWindow_setBufferCount");
+    if (set_count != NULL) {
+        set_count(window, 3);
+    }
     return ANativeWindow_setBuffersGeometry(window, 0, 0, WINDOW_FORMAT_BGRA_8888);
 }
