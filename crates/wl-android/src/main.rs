@@ -50,14 +50,22 @@ fn run_server() -> Result<(), Box<dyn std::error::Error>> {
         std::env::var("WAYLAND_DISPLAY").unwrap_or_else(|_| "land-0".into());
     // Default runtime dir: prefer XDG_RUNTIME_DIR; fall back to a per-user
     // dir under $HOME/.cache (NOT /tmp — the turnip/Vulkan driver segfaults
-    // in BlitEngine::drop when XDG_RUNTIME_DIR is unset and the sockets land
-    // in /tmp; a private $HOME/.cache/wl-runtime is safe and always creatable).
-    let xdg_runtime = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-        let dir = format!("{home}/.cache/wl-runtime");
-        std::fs::create_dir_all(&dir).ok();
-        dir
-    });
+    // in BlitEngine::drop when the XDG_RUNTIME_DIR env var is unset or
+    // empty; any non-empty value works, including /tmp. We pick a private
+    // $HOME/.cache/wl-runtime and export it so the driver sees the var).
+    let xdg_runtime = match std::env::var("XDG_RUNTIME_DIR") {
+        Ok(v) if !v.is_empty() => v,
+        _ => {
+            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+            let dir = format!("{home}/.cache/wl-runtime");
+            std::fs::create_dir_all(&dir).ok();
+            // The driver checks the env var itself; the path alone is not
+            // enough. Export so turnip's teardown path does not segfault.
+            // SAFETY: single-threaded at startup, no other env access yet.
+            unsafe { std::env::set_var("XDG_RUNTIME_DIR", &dir) };
+            dir
+        }
+    };
     let wayland_socket_path = format!("{xdg_runtime}/{wayland_display}");
 
     // Default land socket in user space (not /run)
