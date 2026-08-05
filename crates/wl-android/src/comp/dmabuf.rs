@@ -31,9 +31,33 @@ pub fn build_default_feedback() -> smithay::wayland::dmabuf::DmabufFeedback {
         })
         .collect();
 
-    DmabufFeedbackBuilder::new(0, formats)
+    // Advertise the container's render node dev_t. KWin (nested client)
+    // resolves its GPU via drmGetDeviceFromDevId on this value — dev_t 0
+    // made it fail with "drmGetDeviceFromDevId() failed" and fall back to
+    // no rendering backend. Discover the real device dynamically so the
+    // value matches what the kernel exposes on this machine.
+    let device_id = discover_render_node_dev_t().unwrap_or(0);
+    DmabufFeedbackBuilder::new(device_id, formats)
         .build()
         .expect("build dmabuf feedback")
+}
+
+/// stat(2) the first render node under /dev/dri and return its st_rdev
+/// (dev_t), or None when no render node exists.
+fn discover_render_node_dev_t() -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    let dir = std::fs::read_dir("/dev/dri").ok()?;
+    for entry in dir.flatten() {
+        let path = entry.path();
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with("renderD") {
+            if let Ok(meta) = std::fs::metadata(&path) {
+                return Some(meta.rdev());
+            }
+        }
+    }
+    None
 }
 
 impl DmabufHandler for WlState {
