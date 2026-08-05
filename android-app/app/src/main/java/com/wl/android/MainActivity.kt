@@ -11,7 +11,7 @@ import android.view.MotionEvent
 import android.view.WindowManager
 import android.widget.TextView
 
-class MainActivity : Activity(), SurfaceHolder.Callback {
+class MainActivity : Activity(), SurfaceHolder.Callback, StatusListener {
     private lateinit var surfaceView: SurfaceView
     private lateinit var statusText: TextView
     private lateinit var collector: ScreenInfoCollector
@@ -19,22 +19,16 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     private var nativeHandle: Long = 0
     private val socketPath = "/data/local/tmp/wl-android/land.sock"
 
-    // CONN-STATE: poll interval for the status overlay (nativeGetState).
-    private val statusPollHandler = android.os.Handler(android.os.Looper.getMainLooper())
-    private val statusPoll = object : Runnable {
-        override fun run() {
-            updateStatusOverlay()
-            statusPollHandler.postDelayed(this, 200)
-        }
-    }
-
-    private fun updateStatusOverlay() {
-        if (nativeHandle == 0L) return
-        val state = NativeBridge.nativeGetState(nativeHandle)
-        when (state) {
-            2 -> statusText.visibility = android.view.View.GONE // Active: normal display
-            4 -> { statusText.text = "Disconnected"; statusText.visibility = android.view.View.VISIBLE }
-            else -> { statusText.text = "Reconnection"; statusText.visibility = android.view.View.VISIBLE }
+    // CONN-STATE: event-driven — native calls onStateChanged on connection
+    // state changes (no polling). Runs on the native recv thread; hop to the
+    // main thread to touch the view hierarchy.
+    override fun onStateChanged(state: Int) {
+        runOnUiThread {
+            when (state) {
+                2 -> statusText.visibility = android.view.View.GONE // Active: normal display
+                4 -> { statusText.text = "Disconnected"; statusText.visibility = android.view.View.VISIBLE }
+                else -> { statusText.text = "Reconnection"; statusText.visibility = android.view.View.VISIBLE }
+            }
         }
     }
 
@@ -114,6 +108,11 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
 
         // Connect once, keep alive across lifecycle
         nativeHandle = NativeBridge.nativeInit(socketPath)
+        // CONN-STATE: register the event-driven status listener (native calls
+        // onStateChanged on connection changes — no polling).
+        if (nativeHandle != 0L) {
+            NativeBridge.nativeSetStatusListener(nativeHandle, this)
+        }
     }
 
     override fun onResume() {
@@ -127,9 +126,6 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         }
 
         collector.start()
-
-        // CONN-STATE: start polling nativeGetState for the status overlay.
-        statusPollHandler.post(statusPoll)
 
         // Focus can be stolen (e.g. keyguard dismissal, dialog), re-grab after resume.
         surfaceView.post { surfaceView.requestFocus() }
@@ -154,7 +150,6 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     }
 
     override fun onPause() {
-        statusPollHandler.removeCallbacks(statusPoll)
         collector.stop()
         super.onPause()
     }

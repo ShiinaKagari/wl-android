@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use jni::objects::{JClass, JString};
-use jni::sys::{jfloat, jint, jlong};
+use jni::sys::{jfloat, jint, jlong, jobject};
 use jni::JNIEnv;
 
 use crate::session::AppSession;
@@ -82,6 +82,15 @@ static STATE_MAP: std::sync::LazyLock<Mutex<Vec<(Handle, StateRef)>>> =
 
 static NEXT_ID: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(1);
 
+/// CONN-STATE: process-global JavaVM saved in JNI_OnLoad, used by the recv
+/// thread (a plain Rust thread) to attach and call the Java status listener.
+static JAVA_VM: std::sync::OnceLock<Arc<jni::JavaVM>> = std::sync::OnceLock::new();
+
+/// CONN-STATE: process-global Java StatusListener (global ref). Kept OUTSIDE
+/// Inner so notify_status can be called while the caller already holds an
+/// Inner lock (no self-deadlock). Single-activity app: one listener suffices.
+static STATUS_LISTENER: Mutex<Option<jni::objects::GlobalRef>> = Mutex::new(None);
+
 /// RENDER-DECOUPLE: global frame-ready condvar (shared by the recv thread's
 /// notify and the render thread's park). Kept OUT of Inner so the render
 /// thread's wait does not borrow through the same mutex it parks on.
@@ -105,14 +114,40 @@ fn remove(handle: Handle) {
 
 #[cfg(target_os = "android")]
 #[unsafe(no_mangle)]
-pub unsafe extern "system" fn JNI_OnLoad(_vm: jni::JavaVM, _: *mut std::ffi::c_void) -> jni::sys::jint {
+pub unsafe extern "system" fn JNI_OnLoad(vm: jni::JavaVM, _: *mut std::ffi::c_void) -> jni::sys::jint {
     android_logger::init_once(
         android_logger::Config::default()
             .with_max_level(log::LevelFilter::Info)
             .with_tag("land-native"),
     );
     log::info!("JNI_OnLoad: land_native loaded");
+    let _ = JAVA_VM.set(Arc::new(vm));
     jni::sys::JNI_VERSION_1_6
+}
+
+/// CONN-STATE: notify the Java StatusListener (if registered) of a state
+/// change. Runs on the recv thread (a plain Rust thread) — attaches to the
+/// VM per call and posts onStateChanged to the listener.
+fn notify_status(state: AppState) {
+    let Some(vm) = JAVA_VM.get().cloned() else { return };
+    let listener = STATUS_LISTENER.lock().unwrap().clone();
+    let Some(listener) = listener else { return };
+    let mut env = match vm.attach_current_thread() {
+        Ok(e) => e,
+        Err(e) => {
+            log::error!("notify_status: attach failed: {e}");
+            return;
+        }
+    };
+    let state_int = state as i32;
+    if let Err(e) = env.call_method(
+        &listener,
+        "onStateChanged",
+        "(I)V",
+        &[jni::objects::JValue::Int(state_int)],
+    ) {
+        log::error!("notify_status: call failed: {e}");
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -168,6 +203,7 @@ extern "system" fn Java_com_wl_android_NativeBridge_nativeInit(
                             inner.input_write.lock().unwrap().replace(ws);
                         }
                         inner.state = AppState::Handshake;
+                        notify_status(AppState::Handshake);
                     }
                     let caps = {
                         let inner = state_clone.lock().unwrap();
@@ -189,6 +225,7 @@ extern "system" fn Java_com_wl_android_NativeBridge_nativeInit(
                             // live even without frames (KWin may be idle).
                             if let Ok(mut inner) = on_connected_state.lock() {
                                 inner.state = AppState::Active;
+                                notify_status(AppState::Active);
                             }
                         },
                         move |serial, buffer_id, width, height, fence_fd: Option<OwnedFd>, pixel_fd: Option<OwnedFd>| {
@@ -227,6 +264,7 @@ extern "system" fn Java_com_wl_android_NativeBridge_nativeInit(
                     {
                         let mut inner = state_clone.lock().unwrap();
                         inner.state = AppState::Disconnected;
+                        notify_status(AppState::Disconnected);
                     }
                 }
                 Err(e) => {
@@ -234,8 +272,10 @@ extern "system" fn Java_com_wl_android_NativeBridge_nativeInit(
                     // CONN-STATE: reconnect retry. If we HAD a session, the
                     // overlay keeps showing "Disconnected" (a session was
                     // lost); never having connected shows "Reconnection".
+                    let new_state = if had_session { AppState::Disconnected } else { AppState::Init };
                     let mut inner = state_clone.lock().unwrap();
-                    inner.state = if had_session { AppState::Disconnected } else { AppState::Init };
+                    inner.state = new_state;
+                    notify_status(new_state);
                 }
             }
             // Tear down the dead session so JNI sends drop their messages,
@@ -602,6 +642,28 @@ extern "system" fn Java_com_wl_android_NativeBridge_nativeGetState(
     find(handle)
         .map(|s| s.lock().unwrap().state as jint)
         .unwrap_or(AppState::Error as jint)
+}
+
+#[unsafe(no_mangle)]
+extern "system" fn Java_com_wl_android_NativeBridge_nativeSetStatusListener(
+    mut env: JNIEnv, _class: JClass, handle: jlong, listener: jobject,
+) {
+    let _ = handle;
+    if listener.is_null() {
+        // Clear: drop the global ref so the recv thread stops calling back.
+        STATUS_LISTENER.lock().unwrap().take();
+        return;
+    }
+    // CONN-STATE: keep a global ref to the Java StatusListener instance so
+    // the recv thread can invoke onStateChanged without polling. The old
+    // listener (if any) is released.
+    match unsafe { env.new_global_ref(jni::objects::JObject::from_raw(listener)) } {
+        Ok(g) => {
+            log::info!("nativeSetStatusListener: registered");
+            *STATUS_LISTENER.lock().unwrap() = Some(g);
+        }
+        Err(e) => log::error!("nativeSetStatusListener: new_global_ref failed: {e}"),
+    }
 }
 
 #[unsafe(no_mangle)]
