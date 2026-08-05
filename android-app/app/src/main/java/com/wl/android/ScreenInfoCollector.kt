@@ -35,24 +35,23 @@ class ScreenInfoCollector(
     }
 
     fun emit() {
-        // Physical display mode: currentMode gives the real resolution and
-        // refresh rate of the panel (more accurate than displayMetrics, which
-        // can lag behind mode switches).
+        // Refresh rate: Display.Mode gives the panel's real current mode rate
+        // (VRR-aware, more accurate than the deprecated refreshRate getter).
         val mode = activity.display?.mode
-        val physW: Int
-        val physH: Int
-        val refresh: Float
-        if (mode != null && mode.physicalWidth > 0 && mode.physicalHeight > 0) {
-            physW = mode.physicalWidth
-            physH = mode.physicalHeight
-            refresh = mode.refreshRate
+        val refresh: Float = if (mode != null && mode.refreshRate > 0f) {
+            mode.refreshRate
         } else {
-            val metrics = activity.resources.displayMetrics
-            physW = metrics.widthPixels
-            physH = metrics.heightPixels
-            refresh = activity.display?.refreshRate ?: 60f
+            activity.display?.refreshRate ?: 60f
         }
-        val dpi = activity.resources.displayMetrics.densityDpi
+        // Resolution: displayMetrics is ALREADY rotated to the App's current
+        // orientation (the SurfaceView buffer is 3392x2400 landscape while the
+        // panel's Display.Mode reports 2400x3392 portrait). Using the panel
+        // size here would hand KWin a portrait render target while the App
+        // presents landscape — a 90° mismatch. Metrics match the surface.
+        val metrics = activity.resources.displayMetrics
+        val physW = metrics.widthPixels
+        val physH = metrics.heightPixels
+        val dpi = metrics.densityDpi
         // Render target resolution = physical × scale (user-controlled).
         val rw = (physW * scale).toInt().coerceAtLeast(1)
         val rh = (physH * scale).toInt().coerceAtLeast(1)

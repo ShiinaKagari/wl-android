@@ -133,11 +133,13 @@ class MainActivity : Activity(), SurfaceHolder.Callback, StatusListener {
                 text = "Scale: ${scaleOptions[scaleIndex]}x"
                 collector.scale = scaleOptions[scaleIndex]
                 // Set the App-side buffer geometry to the render target too,
-                // so ANativeWindow_lock hands back the scaled size.
-                val mode = display?.mode
-                if (mode != null && nativeHandle != 0L) {
-                    val rw = (mode.physicalWidth * collector.scale).toInt().coerceAtLeast(1)
-                    val rh = (mode.physicalHeight * collector.scale).toInt().coerceAtLeast(1)
+                // so ANativeWindow_lock hands back the scaled size. Use
+                // displayMetrics (rotated to the App orientation) like the
+                // collector — Display.Mode reports panel-native portrait.
+                if (nativeHandle != 0L) {
+                    val m = resources.displayMetrics
+                    val rw = (m.widthPixels * collector.scale).toInt().coerceAtLeast(1)
+                    val rh = (m.heightPixels * collector.scale).toInt().coerceAtLeast(1)
                     NativeBridge.nativeSetRenderSize(nativeHandle, rw, rh)
                 }
                 collector.emit()
