@@ -46,8 +46,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn run_server() -> Result<(), Box<dyn std::error::Error>> {
+    // Default display name: use the standard wayland-0 so compositor
+    // clients (Plasma/KWin) find the socket in a default environment
+    // without a WAYLAND_DISPLAY override.
     let wayland_display =
-        std::env::var("WAYLAND_DISPLAY").unwrap_or_else(|_| "land-0".into());
+        std::env::var("WAYLAND_DISPLAY").unwrap_or_else(|_| "wayland-0".into());
     // Default runtime dir: prefer XDG_RUNTIME_DIR; fall back to a per-user
     // dir under $HOME/.cache (NOT /tmp — the turnip/Vulkan driver segfaults
     // in BlitEngine::drop when the XDG_RUNTIME_DIR env var is unset or
