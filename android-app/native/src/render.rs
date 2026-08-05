@@ -995,6 +995,234 @@ impl RenderState {
         self.present(swapchain_index, &[])
     }
 
+    /// GPU-upload present (PERF): copy a pixel fd's contents (mmap'd, e.g. the
+    /// server's SHM memfd) into the acquired swapchain image and present.
+    ///
+    /// This is the "smooth + responsive" path: it bypasses ANativeWindow_lock
+    /// and SurfaceFlinger's CPU composition — the pixels go straight into the
+    /// swapchain via a HOST_VISIBLE staging buffer + vkCmdCopyBufferToImage,
+    /// and SurfaceFlinger only composites the final present. No AHB import
+    /// (turnip's SIGSEGV never applies: everything stays inside the App's
+    /// Qualcomm Vulkan driver).
+    ///
+    /// The fd is mmap'd read-only, copied into the staging buffer, then
+    /// released — the caller owns the fd. Returns the presented slot.
+    pub fn upload_and_present(
+        &mut self,
+        width: u32,
+        height: u32,
+        pixel_fd: &std::os::fd::OwnedFd,
+    ) -> Result<u32, String> {
+        use std::os::fd::AsRawFd;
+        if !self.initialized {
+            return Err("render: upload before init".into());
+        }
+        let size = width as usize * height as usize * 4;
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstat(pixel_fd.as_raw_fd(), &mut st) } != 0 {
+            return Err("upload: fstat failed".into());
+        }
+        let map_len = (st.st_size as usize).min(size);
+        if map_len == 0 {
+            return Err("upload: empty fd".into());
+        }
+        let src_ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                map_len,
+                libc::PROT_READ,
+                libc::MAP_SHARED,
+                pixel_fd.as_raw_fd(),
+                0,
+            )
+        };
+        if src_ptr == libc::MAP_FAILED {
+            return Err("upload: mmap failed".into());
+        }
+
+        let result = (|| {
+            let slot = self.acquire_next_image(u64::MAX, None, None)?;
+            // Steps 1-3 keep the device borrow scoped to this block so the
+            // &mut self.present below does not collide with it.
+            let (buffer, staging_mem) = {
+                let device = self.device.as_ref().expect("device set");
+
+                // 1. Staging buffer (HOST_VISIBLE) sized to the frame.
+                let buffer_info = vk::BufferCreateInfo::default()
+                    .size(size as u64)
+                    .usage(vk::BufferUsageFlags::TRANSFER_SRC);
+                let buffer = unsafe {
+                    device
+                        .create_buffer(&buffer_info, None)
+                        .map_err(|e| format!("upload: create_buffer: {e}"))?
+                };
+            let mem_req = unsafe { device.get_buffer_memory_requirements(buffer) };
+            let mem_type = {
+                let instance = self.instance.as_ref().expect("instance set");
+                let mem_props = unsafe {
+                    instance.get_physical_device_memory_properties(self.physical_device)
+                };
+                (0..mem_props.memory_type_count).find(|&i| {
+                    let t = mem_props.memory_types[i as usize];
+                    mem_req.memory_type_bits & (1 << i) != 0
+                        && t.property_flags.contains(
+                            vk::MemoryPropertyFlags::HOST_VISIBLE
+                                | vk::MemoryPropertyFlags::HOST_COHERENT,
+                        )
+                })
+                .ok_or_else(|| "upload: no HOST_VISIBLE memory type".to_string())?
+            };
+            let alloc_info = vk::MemoryAllocateInfo::default()
+                .allocation_size(mem_req.size)
+                .memory_type_index(mem_type);
+            let staging_mem = unsafe {
+                device
+                    .allocate_memory(&alloc_info, None)
+                    .map_err(|e| format!("upload: allocate_memory: {e}"))?
+            };
+            unsafe {
+                device
+                    .bind_buffer_memory(buffer, staging_mem, 0)
+                    .map_err(|e| format!("upload: bind_buffer_memory: {e}"))?;
+            }
+
+            // 2. Write the mmap'd pixels into the staging buffer.
+            let dst_ptr = unsafe {
+                device
+                    .map_memory(staging_mem, 0, mem_req.size, vk::MemoryMapFlags::empty())
+                    .map_err(|e| format!("upload: map_memory: {e}"))?
+            };
+            // SAFETY: dst_ptr is HOST_VISIBLE memory of size mem_req.size;
+            // src_ptr is the fstat-guarded mmap.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    src_ptr as *const u8,
+                    dst_ptr as *mut u8,
+                    map_len.min(mem_req.size as usize),
+                );
+            }
+            unsafe {
+                device.unmap_memory(staging_mem);
+            }
+
+            // 3. Record copy: staging buffer -> swapchain image.
+            let dst_image = *self
+                .images
+                .get(slot as usize)
+                .ok_or_else(|| format!("upload: swapchain image {slot} missing"))?;
+            unsafe {
+                device
+                    .reset_command_buffer(self.command_buffer, vk::CommandBufferResetFlags::empty())
+                    .map_err(|e| format!("upload: reset_cmd: {e}"))?;
+            }
+            let begin = vk::CommandBufferBeginInfo::default()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+            unsafe {
+                device
+                    .begin_command_buffer(self.command_buffer, &begin)
+                    .map_err(|e| format!("upload: begin_cmd: {e}"))?;
+            }
+
+            let to_transfer = vk::ImageMemoryBarrier::default()
+                .image(dst_image)
+                .old_layout(vk::ImageLayout::UNDEFINED)
+                .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .src_access_mask(vk::AccessFlags::empty())
+                .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .subresource_range(vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                });
+            unsafe {
+                device.cmd_pipeline_barrier(
+                    self.command_buffer,
+                    vk::PipelineStageFlags::TOP_OF_PIPE,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[to_transfer],
+                );
+            }
+            let region = vk::BufferImageCopy::default()
+                .image_subresource(vk::ImageSubresourceLayers {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    mip_level: 0,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                })
+                .image_extent(vk::Extent3D {
+                    width: width.min(self.extent.width),
+                    height: height.min(self.extent.height),
+                    depth: 1,
+                });
+            unsafe {
+                device.cmd_copy_buffer_to_image(
+                    self.command_buffer,
+                    buffer,
+                    dst_image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &[region],
+                );
+            }
+            let to_present = vk::ImageMemoryBarrier::default()
+                .image(dst_image)
+                .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::empty())
+                .subresource_range(vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                });
+            unsafe {
+                device.cmd_pipeline_barrier(
+                    self.command_buffer,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[to_present],
+                );
+            }
+            unsafe {
+                device
+                    .end_command_buffer(self.command_buffer)
+                    .map_err(|e| format!("upload: end_cmd: {e}"))?;
+            }
+            let cmd_bufs = [self.command_buffer];
+            let submit = vk::SubmitInfo::default().command_buffers(&cmd_bufs);
+            unsafe {
+                device
+                    .queue_submit(self.queue, &[submit], vk::Fence::null())
+                    .map_err(|e| format!("upload: queue_submit: {e}"))?;
+            }
+                (buffer, staging_mem)
+            };
+
+            // 4. Present (steps 1-3 ended the device borrow above).
+            self.present(slot, &[])?;
+
+            // 5. Release staging resources.
+            let device = self.device.as_ref().expect("device set");
+            unsafe {
+                device.destroy_buffer(buffer, None);
+                device.free_memory(staging_mem, None);
+            }
+            Ok(slot)
+        })();
+
+        unsafe { libc::munmap(src_ptr, map_len); }
+        result
+    }
+
     /// Destroy the current swapchain and re-create it against the same
     /// surface, re-fetching the images (anti-stale-state: image list, extent
     /// and format are all re-queried). Needed for rotation/resize (M5 dynamic
