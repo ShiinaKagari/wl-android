@@ -140,6 +140,7 @@ pub struct AhbSlot {
     /// AHB and travels via `AHardwareBuffer_sendHandleToUnixSocket`; the
     /// public NDK offers no fd extraction (`AHardwareBuffer_getNativeHandle`
     /// is VNDK-only). Field retained from the stub for wire-path symmetry.
+    #[allow(dead_code)]
     pub fd: Option<OwnedFd>,
     ahb: Option<AhbHandle>,
 }
@@ -194,6 +195,7 @@ impl AhbSlot {
     ///
     /// The returned AHB has a fresh reference that this slot owns and
     /// releases on Drop (Vulkan spec requirement).
+    #[allow(dead_code)] // TODO 27: primary swapchain-export path, not yet wired
     pub fn from_swapchain_image(
         loader: &AhbLoader,
         slot: u32,
@@ -306,6 +308,7 @@ impl AhbSlot {
 
     /// Whether this slot holds a real AHB (both acquisition paths do; a
     /// slot without one can never be registered).
+    #[allow(dead_code)]
     pub fn has_ahb(&self) -> bool {
         self.ahb.is_some()
     }

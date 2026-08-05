@@ -79,9 +79,7 @@ wl-android/
 │   └── wl-android/          # 服务端：Smithay 合成器 + frame_router + doctor
 ├── android-app/             # Kotlin UI + Rust JNI (cargo-ndk, 无 C++ 层)
 ├── magisk-module/           # 目录 + sepolicy（无业务逻辑）
-├── milestones/               # M2~M7 真机验证脚本
-├── m0/                       # M0 探测件（独立 crate）
-├── scripts/                  # build-all / container-probe / m0-build / soak
+├── scripts/                  # build-all / deploy-test / soak
 └── docs/DESIGN.md
 ```
 
@@ -107,16 +105,19 @@ mount 传递。详见 [docs/AGENTS.md](docs/AGENTS.md)。
 
 ## 里程碑
 
-| # | 交付 | 真机验证 (milestones/) | CI 测试 | 状态 |
+| # | 交付 | 真机验证 | CI 测试 | 状态 |
 |---|---|------|------|
-| M0 | 宿主 Vulkan 探测 + 容器环境诊断 + socket fd 冒烟 | 手动 adb 运行 probe / 脚本跑 probe-container.sh | — | ✅ 完成 |
-| M1 | `wl-android-common`：协议 + golden bytes + proptest + 测试基建 | 无需真机 | `cargo test` 35/35 绿 | ✅ 完成 |
-| M2 | Smithay 起 land-0；FakeCompositor 帧到达 | `M2-verify.sh`: weston-info 协议对象枚举、doctor 自检 | mock-app 集成回归 | [ ] |
-| M3 | App Vulkan swapchain 上屏 + BRDY 拉式回压 | `M3-verify.sh`: socket 连接、slot 注册、帧循环、视觉正确 | FakeCompositor 帧到达 | [ ] |
-| M4 | 多点触控注入 | `M4-verify.sh`: 单点/拖拽/多点/边缘/FRAME sentinel | TouchMessage 单元测试 | [ ] |
-| M5 | 旋转 / 144Hz / 分辨率变化动态适配 | `M5-verify.sh`: 旋转→桌面跟随、`wm size`→适配、刷新率切换 | MockClock 节拍验证 | [ ] |
-| M6 | KWin/Plasma 拉起；Weston/Hyprland 兼容 | `M6-verify.sh`: Plasma 可见、触摸交互、窗口操作、旋转+Plasma | 协议缺失扫描 | [ ] |
-| M7 | 性能收口 + Magisk 打包 | `M7-verify.sh`: 1h soak、PERF-01~15 全达标、doctor report | criterion bench 无回归 | [ ] |
+| M0 | 宿主 Vulkan 探测 + 容器环境诊断 + socket fd 冒烟 | 已完成（结论入 DESIGN.md ADR #5/#15） | — | ✅ 完成 |
+| M1 | `wl-android-common`：协议 + golden bytes + proptest + 测试基建 | 无需真机 | `cargo test` 全绿 | ✅ 完成 |
+| M2 | Smithay 起 land-0；FakeCompositor 帧到达 | 按 DESIGN.md §14（V-xx 验收表） | mock-app 集成回归 | [ ] |
+| M3 | App Vulkan swapchain 上屏 + BRDY 拉式回压 | 按 DESIGN.md §14 | FakeCompositor 帧到达 | [ ] |
+| M4 | 多点触控注入 | 按 DESIGN.md §14 | TouchMessage 单元测试 | [ ] |
+| M5 | 旋转 / 144Hz / 分辨率变化动态适配 | 按 DESIGN.md §14 | MockClock 节拍验证 | [ ] |
+| M6 | KWin/Plasma 拉起；Weston/Hyprland 兼容 | 按 DESIGN.md §14 | 协议缺失扫描 | [ ] |
+| M7 | 性能收口 + Magisk 打包 | 按 DESIGN.md §14 + soak.sh | criterion bench 无回归 | [ ] |
+
+> 注：历史验证脚本（milestones/）与 M0 探测件（m0/）已归档移除，
+> 验收以 docs/DESIGN.md §14 的 V-xx 列表为权威。
 
 ## 环境变量
 

@@ -124,6 +124,8 @@ impl FrameCache {
 
     /// Push pixel data into the next buffer of the triple-buffer rotation.
     /// Returns a dup'd fd for SCM_RIGHTS transfer (the caller owns it).
+    /// Production uses `push_from`; `push` is exercised by the F-15 tests.
+    #[allow(dead_code)]
     pub fn push(&mut self, data: &[u8], width: u32, height: u32) -> Option<OwnedFd> {
         let needed = width as usize * height as usize * 4;
         if data.len() != needed {

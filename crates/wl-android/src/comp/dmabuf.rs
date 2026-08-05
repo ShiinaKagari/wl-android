@@ -1,7 +1,6 @@
 use smithay::wayland::dmabuf::{DmabufFeedbackBuilder, DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier, get_dmabuf};
 use smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer;
 use smithay::wayland::buffer::BufferHandler;
-use smithay::backend::allocator::Buffer;
 use tracing::{debug, warn};
 
 use crate::state::WlState;

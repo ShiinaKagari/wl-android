@@ -3,8 +3,6 @@
 
 use std::sync::Mutex;
 
-use log;
-
 unsafe extern "C" {
     fn wl_get_native_window(env: *mut std::ffi::c_void, surface: jni::sys::jobject) -> *mut std::ffi::c_void;
     fn wl_lock_window(window: *mut std::ffi::c_void, buf: *mut ndk_sys::ANativeWindow_Buffer) -> std::ffi::c_int;
@@ -168,7 +166,7 @@ pub fn render_frame(serial: u64, width: u32, height: u32, pixel_data: &[u8]) -> 
         return Err("zero dimensions".into());
     }
 
-    log::info!("render: buf {}x{} stride={} fmt={:#x} bits={:p}", buf.width, buf.height, buf.stride, buf.format, buf.bits);
+    log::debug!("render: buf {}x{} stride={} fmt={:#x} bits={:p}", buf.width, buf.height, buf.stride, buf.format, buf.bits);
 
     let bpp = match buf.format {
         1 => 4, // WINDOW_FORMAT_RGBA_8888

@@ -1,5 +1,4 @@
-use std::ffi::CString;
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
@@ -93,23 +92,6 @@ impl PendingReader {
         let fds = std::mem::take(pending_fds);
         pending.drain(..4 + msg_len);
         Some((body, fds))
-    }
-}
-
-#[allow(unused)]
-fn dlog(tag: &str, msg: &str) {
-    #[cfg(target_os = "android")]
-    {
-        let tag_c = CString::new(tag).unwrap_or_default();
-        let msg_c = CString::new(msg).unwrap_or_default();
-        unsafe {
-            ndk_sys::__android_log_write(4, tag_c.as_ptr(), msg_c.as_ptr());
-        }
-    }
-    #[cfg(not(target_os = "android"))]
-    {
-        let _ = (tag, msg);
-        eprintln!("[{}] {}", tag, msg);
     }
 }
 
@@ -247,6 +229,11 @@ impl AppSession {
         self.send_message(&Message::Config(conf))
     }
 
+    /// Protocol primitives for blit-slot registration (TBUF) and slot-release
+    /// (BRDY). Not wired into the current frame loop (registration runs in
+    /// nativeSetSurface's swapchain path; BRDY awaits lane 29 pacing) — kept
+    /// as the wire-level API mirrored by the host test harnesses.
+    #[allow(dead_code)]
     pub fn send_tbuf(&self, slot: u32, w: u32, h: u32, fmt: u32, stride: u32) -> io::Result<()> {
         let tb = proto::SlotBuffer::new(slot, w, h, fmt, stride);
         self.send_message(&Message::Slot(tb))
@@ -256,6 +243,7 @@ impl AppSession {
     /// pull-model swap. Lane 29 wires this into the frame loop for pacing;
     /// this lane only provides the primitive. Body mirrors the host-tested
     /// `send_brdy_on` in .omo/start-work/session-brdy-harness.
+    #[allow(dead_code)]
     pub fn send_brdy(&self, slot: u32) -> io::Result<()> {
         let brdy = proto::BufferReady::new(slot);
         self.send_message(&Message::Ready(brdy))
@@ -276,18 +264,17 @@ impl AppSession {
         on_connected: impl FnOnce(),
         on_frame: impl Fn(u64, u32, u32, u32, Option<OwnedFd>, Option<OwnedFd>),
     ) -> io::Result<()> {
-        dlog("land-native", "run_loop: entered");
+        log::debug!("run_loop: entered");
         let mut reader = PendingReader::new(read_stream);
         let mut wr = write_stream;
 
         // 1. Receive HELO
-        dlog("land-native", "recv_thread: waiting for HELO...");
+        log::debug!("recv_thread: waiting for HELO...");
         let (data, _fds) = reader.next_message()?;
         let msg = proto::decode(&data, vec![])
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
         if let Message::Hello(helo) = msg {
             server_caps.store(helo.server_caps, std::sync::atomic::Ordering::Relaxed);
-            dlog("land-native", "HELO received");
             log::info!("HELO received (caps={:#x})", helo.server_caps);
         } else {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "expected HELO"));
@@ -300,7 +287,6 @@ impl AppSession {
         wr.write_all(&conf_data)?;
         wr.flush()?;
         log::info!("CONF sent, entering frame loop");
-        dlog("land-native", "CONF sent, entering frame loop");
         // CONN-STATE: the handshake is complete — the session is live even
         // before any frame arrives (KWin may be idle). Mark Active so the
         // status overlay hides immediately on reconnect.
@@ -313,16 +299,13 @@ impl AppSession {
         // matches the server's raw recv_raw. Order is load-bearing: the
         // server decodes TBUF and treats the very next bytes as the handle.
         if slots.is_empty() {
-            let msg = "no slots registered — blit mode will stall until lane 30 wires AhbSlots";
-            log::warn!("{msg}");
-            dlog("land-native", msg);
+            log::warn!("no slots registered — blit mode will stall until lane 30 wires AhbSlots");
         } else {
             for slot in &slots {
                 let tbuf_data = proto::encode(&slot.to_tbuf_message());
                 Self::send_tbuf_then_handle(&mut wr, &tbuf_data, |fd| slot.send_registration(fd))
                     .map_err(|e| {
                         let err_msg = format!("slot registration (slot={}) failed: {e}", slot.slot);
-                        dlog("land-native", &err_msg);
                         log::error!("{err_msg}");
                         e
                     })?;
@@ -339,24 +322,22 @@ impl AppSession {
                 Ok(v) => v,
                 Err(e) => {
                     let err_msg = format!("next_message failed: {e}");
-                    dlog("land-native", &err_msg);
                     log::error!("{err_msg}");
                     return Err(e);
                 }
             };
-            log::info!("recv: {} bytes, {} fds", data.len(), fds.len());
+            log::debug!("recv: {} bytes, {} fds", data.len(), fds.len());
             let msg = match proto::decode(&data, fds) {
                 Ok(m) => m,
                 Err(e) => {
                     let err_msg = format!("proto::decode failed: {e}");
-                    dlog("land-native", &err_msg);
                     log::error!("{err_msg} data[..min(8)]={:02x?}", &data[..data.len().min(8)]);
                     return Err(io::Error::new(io::ErrorKind::InvalidData, e.to_string()));
                 }
             };
             match msg {
                 Message::Frame(fm, fds) => {
-                    log::info!(
+                    log::debug!(
                         "Frame received: serial={} {}x{} fds={} fence={}",
                         fm.serial,
                         fm.width,
@@ -413,6 +394,7 @@ impl AppSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::CString;
     use std::fs;
 
     struct FdCountGuard {

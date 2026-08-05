@@ -1,5 +1,4 @@
 use std::sync::Arc;
-use std::time::Duration;
 
 use calloop::generic::Generic;
 use calloop::{EventLoop, Interest, Mode};
@@ -121,7 +120,7 @@ fn run_server() -> Result<(), Box<dyn std::error::Error>> {
 
     let event_handle = event_loop.handle();
 
-    event_loop.run(Some(Duration::from_millis(16)), &mut state, |state| {
+    event_loop.run(None, &mut state, |state| {
         // Dispatch pending Wayland client messages
         state.dispatch_wayland();
 
@@ -381,12 +380,6 @@ fn dispatch_router_actions(
                     });
                 }
             }
-            RouterAction::Gone { buffer_id } => {
-                if let Some(session) = &mut state.app_session {
-                    let _ = session.send_gone(*buffer_id);
-                }
-            }
-            _ => {}
         }
     }
 }

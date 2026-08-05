@@ -675,7 +675,7 @@ impl RenderState {
             .swapchains(&swapchains)
             .image_indices(&indices);
         let outcome = unsafe { loader.queue_present(self.queue, &present_info) };
-        log::info!("present: slot={image_index}");
+        log::debug!("present: slot={image_index}");
         match outcome {
             Ok(suboptimal) => {
                 if suboptimal {
@@ -995,291 +995,6 @@ impl RenderState {
         self.present(swapchain_index, &[])
     }
 
-    /// GPU-upload present (PERF): copy a pixel fd's contents (mmap'd, e.g. the
-    /// server's SHM memfd) into the acquired swapchain image and present.
-    ///
-    /// This is the "smooth + responsive" path: it bypasses ANativeWindow_lock
-    /// and SurfaceFlinger's CPU composition — the pixels go straight into the
-    /// swapchain via a HOST_VISIBLE staging buffer + vkCmdCopyBufferToImage,
-    /// and SurfaceFlinger only composites the final present. No AHB import
-    /// (turnip's SIGSEGV never applies: everything stays inside the App's
-    /// Qualcomm Vulkan driver).
-    ///
-    /// The fd is mmap'd read-only, copied into the staging buffer, then
-    /// released — the caller owns the fd. Returns the presented slot.
-    pub fn upload_and_present(
-        &mut self,
-        width: u32,
-        height: u32,
-        pixel_fd: &std::os::fd::OwnedFd,
-    ) -> Result<u32, String> {
-        use std::os::fd::AsRawFd;
-        if !self.initialized {
-            return Err("render: upload before init".into());
-        }
-        let size = width as usize * height as usize * 4;
-        let mut st: libc::stat = unsafe { std::mem::zeroed() };
-        if unsafe { libc::fstat(pixel_fd.as_raw_fd(), &mut st) } != 0 {
-            return Err("upload: fstat failed".into());
-        }
-        let map_len = (st.st_size as usize).min(size);
-        if map_len == 0 {
-            return Err("upload: empty fd".into());
-        }
-        let src_ptr = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                map_len,
-                libc::PROT_READ,
-                libc::MAP_SHARED,
-                pixel_fd.as_raw_fd(),
-                0,
-            )
-        };
-        if src_ptr == libc::MAP_FAILED {
-            return Err("upload: mmap failed".into());
-        }
-
-        let result = (|| {
-            let slot = self.acquire_next_image(u64::MAX, None, None)?;
-            // Steps 1-3 keep the device borrow scoped to this block so the
-            // &mut self.present below does not collide with it.
-            let (buffer, staging_mem, copy_sem) = {
-                let device = self.device.as_ref().expect("device set");
-
-                // 1. Staging buffer (HOST_VISIBLE) sized to the frame.
-                let buffer_info = vk::BufferCreateInfo::default()
-                    .size(size as u64)
-                    .usage(vk::BufferUsageFlags::TRANSFER_SRC);
-                let buffer = unsafe {
-                    device
-                        .create_buffer(&buffer_info, None)
-                        .map_err(|e| format!("upload: create_buffer: {e}"))?
-                };
-            let mem_req = unsafe { device.get_buffer_memory_requirements(buffer) };
-            let mem_type = {
-                let instance = self.instance.as_ref().expect("instance set");
-                let mem_props = unsafe {
-                    instance.get_physical_device_memory_properties(self.physical_device)
-                };
-                (0..mem_props.memory_type_count).find(|&i| {
-                    let t = mem_props.memory_types[i as usize];
-                    mem_req.memory_type_bits & (1 << i) != 0
-                        && t.property_flags.contains(
-                            vk::MemoryPropertyFlags::HOST_VISIBLE
-                                | vk::MemoryPropertyFlags::HOST_COHERENT,
-                        )
-                })
-                .ok_or_else(|| "upload: no HOST_VISIBLE memory type".to_string())?
-            };
-            let alloc_info = vk::MemoryAllocateInfo::default()
-                .allocation_size(mem_req.size)
-                .memory_type_index(mem_type);
-            let staging_mem = unsafe {
-                device
-                    .allocate_memory(&alloc_info, None)
-                    .map_err(|e| format!("upload: allocate_memory: {e}"))?
-            };
-            unsafe {
-                device
-                    .bind_buffer_memory(buffer, staging_mem, 0)
-                    .map_err(|e| format!("upload: bind_buffer_memory: {e}"))?;
-            }
-
-            // 2. Write the mmap'd pixels into the staging buffer.
-            let dst_ptr = unsafe {
-                device
-                    .map_memory(staging_mem, 0, mem_req.size, vk::MemoryMapFlags::empty())
-                    .map_err(|e| format!("upload: map_memory: {e}"))?
-            };
-            // Channel-order conversion: KWin's SHM pixels are BGRX memory
-            // order, but the swapchain image may be R8G8B8A8_UNORM (the
-            // device picked the fallback format). A raw copy would swap R/B
-            // → wrong colors / dark screen. Convert row-wise when needed.
-            let copy_len = map_len.min(mem_req.size as usize);
-            log::info!(
-                "upload: slot={slot} fmt={:?} copy={}B (fd={}, req={})",
-                self.image_format, copy_len, map_len, mem_req.size,
-            );
-            if self.image_format == vk::Format::R8G8B8A8_UNORM {
-                // SAFETY: both pointers are valid for copy_len bytes.
-                let src = src_ptr as *const u8;
-                let dst = dst_ptr as *mut u8;
-                unsafe {
-                    for i in (0..copy_len).step_by(4) {
-                        let b = *src.add(i);
-                        let r = *src.add(i + 2);
-                        *dst.add(i) = r;
-                        *dst.add(i + 1) = *src.add(i + 1);
-                        *dst.add(i + 2) = b;
-                        *dst.add(i + 3) = *src.add(i + 3);
-                    }
-                }
-            } else {
-                // B8G8R8A8_UNORM: memory order matches BGRX — direct copy.
-                // SAFETY: dst_ptr is HOST_VISIBLE memory of size mem_req.size;
-                // src_ptr is the fstat-guarded mmap.
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        src_ptr as *const u8,
-                        dst_ptr as *mut u8,
-                        copy_len,
-                    );
-                }
-            }
-            unsafe {
-                device.unmap_memory(staging_mem);
-            }
-            // DEBUG: first pixel of the staging buffer (after conversion).
-            unsafe {
-                let probe = dst_ptr as *const u8;
-                log::info!(
-                    "upload: staging[0..4]={:02x} {:02x} {:02x} {:02x} (src={:02x} {:02x} {:02x} {:02x})",
-                    *probe, *probe.add(1), *probe.add(2), *probe.add(3),
-                    *(src_ptr as *const u8), *(src_ptr as *const u8).add(1),
-                    *(src_ptr as *const u8).add(2), *(src_ptr as *const u8).add(3),
-                );
-            }
-
-            // 3. Record copy: staging buffer -> swapchain image.
-            let dst_image = *self
-                .images
-                .get(slot as usize)
-                .ok_or_else(|| format!("upload: swapchain image {slot} missing"))?;
-            unsafe {
-                device
-                    .reset_command_buffer(self.command_buffer, vk::CommandBufferResetFlags::empty())
-                    .map_err(|e| format!("upload: reset_cmd: {e}"))?;
-            }
-            let begin = vk::CommandBufferBeginInfo::default()
-                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-            unsafe {
-                device
-                    .begin_command_buffer(self.command_buffer, &begin)
-                    .map_err(|e| format!("upload: begin_cmd: {e}"))?;
-            }
-
-            let to_transfer = vk::ImageMemoryBarrier::default()
-                .image(dst_image)
-                .old_layout(vk::ImageLayout::UNDEFINED)
-                .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                .src_access_mask(vk::AccessFlags::empty())
-                .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                .subresource_range(vk::ImageSubresourceRange {
-                    aspect_mask: vk::ImageAspectFlags::COLOR,
-                    base_mip_level: 0,
-                    level_count: 1,
-                    base_array_layer: 0,
-                    layer_count: 1,
-                });
-            unsafe {
-                device.cmd_pipeline_barrier(
-                    self.command_buffer,
-                    vk::PipelineStageFlags::TOP_OF_PIPE,
-                    vk::PipelineStageFlags::TRANSFER,
-                    vk::DependencyFlags::empty(),
-                    &[],
-                    &[],
-                    &[to_transfer],
-                );
-            }
-            let region = vk::BufferImageCopy::default()
-                .image_subresource(vk::ImageSubresourceLayers {
-                    aspect_mask: vk::ImageAspectFlags::COLOR,
-                    mip_level: 0,
-                    base_array_layer: 0,
-                    layer_count: 1,
-                })
-                .image_extent(vk::Extent3D {
-                    width: width.min(self.extent.width),
-                    height: height.min(self.extent.height),
-                    depth: 1,
-                });
-            unsafe {
-                device.cmd_copy_buffer_to_image(
-                    self.command_buffer,
-                    buffer,
-                    dst_image,
-                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                    &[region],
-                );
-            }
-            let to_present = vk::ImageMemoryBarrier::default()
-                .image(dst_image)
-                .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)
-                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                .dst_access_mask(vk::AccessFlags::empty())
-                .subresource_range(vk::ImageSubresourceRange {
-                    aspect_mask: vk::ImageAspectFlags::COLOR,
-                    base_mip_level: 0,
-                    level_count: 1,
-                    base_array_layer: 0,
-                    layer_count: 1,
-                });
-            unsafe {
-                device.cmd_pipeline_barrier(
-                    self.command_buffer,
-                    vk::PipelineStageFlags::TRANSFER,
-                    vk::PipelineStageFlags::BOTTOM_OF_PIPE,
-                    vk::DependencyFlags::empty(),
-                    &[],
-                    &[],
-                    &[to_present],
-                );
-            }
-            unsafe {
-                device
-                    .end_command_buffer(self.command_buffer)
-                    .map_err(|e| format!("upload: end_cmd: {e}"))?;
-            }
-                let cmd_bufs = [self.command_buffer];
-                // Sync: signal a binary semaphore when the copy completes;
-                // present waits on it (without this, present can race ahead
-                // of vkCmdCopyBufferToImage and show an empty/old image —
-                // the black-screen root cause).
-                let semaphore_info = vk::SemaphoreCreateInfo::default();
-                let copy_sem = unsafe {
-                    device
-                        .create_semaphore(&semaphore_info, None)
-                        .map_err(|e| format!("upload: create_semaphore: {e}"))?
-                };
-                let signal_sems = [copy_sem];
-                let submit = vk::SubmitInfo::default()
-                    .command_buffers(&cmd_bufs)
-                    .signal_semaphores(&signal_sems);
-                unsafe {
-                    device
-                        .queue_submit(self.queue, &[submit], vk::Fence::null())
-                        .map_err(|e| format!("upload: queue_submit: {e}"))?;
-                }
-                (buffer, staging_mem, copy_sem)
-            };
-
-            // 4. Present, waiting for the copy semaphore (steps 1-3 ended the
-            // device borrow above).
-            self.present(slot, &[copy_sem])?;
-
-            // 5. Release staging resources + the copy semaphore. The GPU may
-            // still be reading the staging buffer (present waits on the
-            // semaphore, but the read happens before present signals) —
-            // wait idle so destroying the buffer/memory is safe.
-            let device = self.device.as_ref().expect("device set");
-            unsafe {
-                device
-                    .device_wait_idle()
-                    .map_err(|e| format!("upload: wait_idle: {e}"))?;
-                device.destroy_semaphore(copy_sem, None);
-                device.destroy_buffer(buffer, None);
-                device.free_memory(staging_mem, None);
-            }
-            Ok(slot)
-        })();
-
-        unsafe { libc::munmap(src_ptr, map_len); }
-        result
-    }
-
     /// Destroy the current swapchain and re-create it against the same
     /// surface, re-fetching the images (anti-stale-state: image list, extent
     /// and format are all re-queried). Needed for rotation/resize (M5 dynamic
@@ -1315,28 +1030,14 @@ impl RenderState {
         self.image_format
     }
 
-    pub fn color_space(&self) -> vk::ColorSpaceKHR {
-        self.color_space
-    }
-
     pub fn extent(&self) -> vk::Extent2D {
         self.extent
-    }
-
-    pub fn present_mode(&self) -> vk::PresentModeKHR {
-        self.present_mode
     }
 
     /// Swapchain images (gralloc-backed AHardwareBuffers) — lane 27 walks
     /// these to extract AHB handles for the TBUF handshake.
     pub fn images(&self) -> &[vk::Image] {
         &self.images
-    }
-
-    /// The `VkDeviceMemory` bound to swapchain image `index` — lane 27 passes
-    /// this to `AhbSlot::from_swapchain_image` to export the AHardwareBuffer.
-    pub fn image_memory(&self, index: u32) -> Option<vk::DeviceMemory> {
-        self.image_memories.get(index as usize).copied()
     }
 
     /// Whether the host driver exposes `VK_KHR_external_semaphore_fd`
@@ -1348,28 +1049,6 @@ impl RenderState {
     /// the swapchain comes up.
     pub fn semaphore_fd_supported(&self) -> bool {
         self.semaphore_fd_loader.is_some()
-    }
-
-    pub fn raw_instance(&self) -> Option<&ash::Instance> {
-        self.instance.as_ref()
-    }
-
-    pub fn raw_device(&self) -> vk::Device {
-        self.device.as_ref().map(|d| d.handle()).unwrap_or_default()
-    }
-
-    /// `&ash::Device` — lane 28 builds the AHB loader via
-    /// `AhbLoader::new(&instance, &device)`.
-    pub fn raw_device_ref(&self) -> Option<&ash::Device> {
-        self.device.as_ref()
-    }
-
-    pub fn raw_physical_device(&self) -> vk::PhysicalDevice {
-        self.physical_device
-    }
-
-    pub fn raw_queue(&self) -> vk::Queue {
-        self.queue
     }
 }
 

@@ -207,8 +207,6 @@ impl AppSession {
                                     slot.height,
                                     // DRM_FORMAT_ABGR8888 is R,G,B,A memory order → VK R8G8B8A8 (DESIGN §9.2)
                                     ash::vk::Format::R8G8B8A8_UNORM,
-                                    // v1 TBUF carries DRM_FORMAT_MOD_LINEAR
-                                    slot.modifier,
                                 ) {
                                     Ok(handle) => {
                                         info!(slot = slot.slot, handle, "slot image imported into Vulkan")
@@ -438,11 +436,6 @@ impl AppSession {
 
     pub fn activate(&mut self) {
         self.mode = SessionMode::Active;
-    }
-
-    pub fn send_gone(&mut self, buffer_id: u32) -> io::Result<()> {
-        let gone = proto::BufferGone::new(buffer_id);
-        self.transport.send(&Message::Gone(gone))
     }
 }
 

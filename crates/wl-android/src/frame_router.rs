@@ -2,24 +2,18 @@ use std::collections::HashMap;
 
 use tracing::debug;
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RouterEvent {
     /// A surface was committed with buffer info.
-    Commit { buffer_id: u32, has_fds: bool, serial: u64 },
+    Commit { buffer_id: u32 },
     /// The App acknowledged frames up to `serial` (cumulative).
     AppAck { serial: u64 },
     /// App connected — enter active session.
     AppConnected,
     /// App disconnected — enter headless drain.
     AppLost,
-    /// Tick event for frame callback timing.
-    Tick,
-    /// Compositor disconnected.
-    CompositorLost,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, PartialEq, Eq)]
 pub enum RouterAction {
     /// Enqueue a frame for sending to App. `has_fds` indicates whether this
@@ -29,10 +23,6 @@ pub enum RouterAction {
     ReleaseBuffer { buffer_id: u32 },
     /// Fire a frame callback.
     FireCallback,
-    /// Buffer destroyed — notify App (BGON).
-    Gone { buffer_id: u32 },
-    /// Drop a frame without sending (headless drain).
-    DiscardFrame { serial: u64 },
 }
 
 pub struct FrameRouter {
@@ -40,7 +30,6 @@ pub struct FrameRouter {
     pending_frame: Option<(u64, u32)>,  // (serial, buffer_id)
     in_flight: Vec<(u64, u32)>,  // (serial, buffer_id) of unacked frames (F-04)
     app_connected: bool,
-    compositor_connected: bool,
     max_in_flight: usize,
     /// Registered buffer_ids in current session (P-10).
     /// Contains buffer_ids that have already been sent with fds.
@@ -54,14 +43,9 @@ impl FrameRouter {
             pending_frame: None,
             in_flight: Vec::with_capacity(4),
             app_connected: false,
-            compositor_connected: false,
             max_in_flight: 2, // F-04
             registered: HashMap::new(),
         }
-    }
-
-    pub fn current_serial(&self) -> u64 {
-        self.serial
     }
 
     pub fn handle(&mut self, event: RouterEvent) -> Vec<RouterAction> {
@@ -90,14 +74,9 @@ impl FrameRouter {
                 }
                 debug!("app lost, drained {} frames", entries.len());
             }
-            RouterEvent::CompositorLost => {
-                self.compositor_connected = false;
-                self.pending_frame = None;
-            }
-            RouterEvent::Commit { buffer_id, has_fds: _, serial: _ } => {
+            RouterEvent::Commit { buffer_id } => {
                 self.serial += 1;
                 let serial = self.serial;
-                self.compositor_connected = true;
 
                 // F-05: latest-wins — replace pending frame
                 if let Some((_old_serial, _)) = self.pending_frame.take() {
@@ -156,15 +135,6 @@ impl FrameRouter {
                 }
 
                 if released > 0 {
-                    actions.push(RouterAction::FireCallback);
-                }
-            }
-            RouterEvent::Tick => {
-                if self.app_connected && self.in_flight.len() < self.max_in_flight {
-                    if self.pending_frame.is_none() {
-                        actions.push(RouterAction::FireCallback);
-                    }
-                } else if !self.app_connected {
                     actions.push(RouterAction::FireCallback);
                 }
             }

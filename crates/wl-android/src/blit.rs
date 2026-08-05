@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::ffi::{CStr, CString};
+use std::ffi::CString;
 use std::os::fd::{FromRawFd, OwnedFd};
 
 use ash::vk;
@@ -152,7 +152,6 @@ impl BlitEngine {
         width: u32,
         height: u32,
         format: vk::Format,
-        modifier: u64,
     ) -> Result<u64, String> {
         if !self.initialized { return Err("not initialized".into()); }
         let device = self.device();
@@ -231,17 +230,6 @@ impl BlitEngine {
         std::mem::forget(fd); // consumed by import
         info!(handle, width, height, "imported dmabuf");
         Ok(handle)
-    }
-
-    /// Blit from src to dst, submit to GPU. Call wait_complete before reading dst.
-    pub fn blit_submit(
-        &self,
-        src_handle: u64,
-        dst_handle: u64,
-        width: u32,
-        height: u32,
-    ) -> Result<(), String> {
-        self.blit_submit_with_fence(src_handle, dst_handle, width, height, self.fence)
     }
 
     /// Blit from src to dst, submit against the given fence instead of the
@@ -346,16 +334,6 @@ impl BlitEngine {
         Ok(())
     }
 
-    pub fn wait_complete(&self) -> Result<(), String> {
-        if !self.initialized { return Ok(()); }
-        let device = self.device();
-        unsafe {
-            device.wait_for_fences(&[self.fence], true, u64::MAX)
-                .map_err(|e| format!("wait_for_fences: {e}"))?;
-        }
-        Ok(())
-    }
-
     /// Export a fence as a SYNC_FD. Returns Ok(None) when the driver reports
     /// the fence already signaled (F-13: vkGetFenceFdKHR may yield fd -1 for a
     /// signaled SYNC_FD fence) — the caller must treat that as "already
@@ -427,9 +405,8 @@ impl BlitEngine {
         width: u32,
         height: u32,
         format: vk::Format,
-        modifier: u64,
     ) -> Result<u64, String> {
-        let handle = self.import_dmabuf(fd, width, height, format, modifier)?;
+        let handle = self.import_dmabuf(fd, width, height, format)?;
         if let Some(&old) = self.slots.get(&slot) {
             self.destroy_image(old);
         }

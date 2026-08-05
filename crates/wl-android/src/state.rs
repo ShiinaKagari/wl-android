@@ -266,16 +266,7 @@ pub struct WlState {
     pub display: Display<Self>,
     pub compositor_state: CompositorState,
     pub shm_state: ShmState,
-    pub single_pixel_buffer_state: SinglePixelBufferState,
-    pub viewporter_state: ViewporterState,
-    pub content_type_state: ContentTypeState,
-    pub alpha_modifier_state: AlphaModifierState,
-    pub pointer_constraints_state: PointerConstraintsState,
-    pub fractional_scale_state: FractionalScaleManagerState,
-    pub presentation_state: PresentationState,
     pub xdg_shell_state: XdgShellState,
-    #[allow(dead_code)]
-    pub output_state: OutputManagerState,
     pub frame_router: FrameRouter,
     pub frame_cache: Option<FrameCache>,
     pub dmabuf_state: DmabufState,
@@ -326,7 +317,7 @@ impl WlState {
         let compositor_state = CompositorState::new_v6::<Self>(&dh);
         let shm_state = ShmState::new::<Self>(&dh, vec![]);
         let xdg_shell_state = XdgShellState::new::<Self>(&dh);
-        let output_state = OutputManagerState::new_with_xdg_output::<Self>(&dh);
+        let _output_state = OutputManagerState::new_with_xdg_output::<Self>(&dh);
         let frame_router = FrameRouter::new();
         let blit_engine = BlitEngine::new();
 
@@ -342,6 +333,11 @@ impl WlState {
         let pointer_constraints_state = PointerConstraintsState::new::<Self>(&dh);
         let fractional_scale_state = FractionalScaleManagerState::new::<Self>(&dh);
         let presentation_state = PresentationState::new::<Self>(&dh, 1); // CLOCK_MONOTONIC
+        // Global registration only — the state is owned by the display's
+        // global infrastructure, the values are intentionally dropped.
+        let _ = (single_pixel_buffer_state, viewporter_state, content_type_state,
+                 alpha_modifier_state, pointer_constraints_state,
+                 fractional_scale_state, presentation_state);
 
         let mut seat_state = SeatState::new();
         let mut seat = seat_state.new_wl_seat(&dh, "seat-0");
@@ -380,10 +376,8 @@ impl WlState {
         let _global = output.create_global::<Self>(&dh);
 
         let mut state = Self {
-            display, compositor_state, shm_state, single_pixel_buffer_state,
-            viewporter_state, content_type_state, alpha_modifier_state, pointer_constraints_state,
-            fractional_scale_state, presentation_state,
-            xdg_shell_state, output_state, frame_router, frame_cache: None, blit_engine,
+            display, compositor_state, shm_state,
+            xdg_shell_state, frame_router, frame_cache: None, blit_engine,
             dmabuf_state,
             app_session: None, land_listener: None, land_source: None,
             clock_epoch: std::time::Instant::now(),
@@ -617,7 +611,7 @@ impl WlState {
         if !active {
             return;
         }
-        let Some((fd, w, h, format, modifier)) = self.pending_frames.take(buffer_id) else {
+        let Some((fd, w, h, format, _modifier)) = self.pending_frames.take(buffer_id) else {
             return; // SHM-path commit or already processed — nothing stashed
         };
 
@@ -630,7 +624,7 @@ impl WlState {
                 self.frame_images.remove(&old_key);
                 self.blit_engine.destroy_image(old_handle);
             }
-            match self.blit_engine.import_dmabuf(fd, w, h, format, modifier) {
+            match self.blit_engine.import_dmabuf(fd, w, h, format) {
                 Ok(handle) => {
                     self.frame_images.insert(buffer_id, handle);
                     handle
@@ -840,10 +834,6 @@ impl CompositorHandler for WlState {
                         let actions = self.frame_router.handle(
                             crate::frame_router::RouterEvent::Commit {
                                 buffer_id: buf_key,
-                                has_fds: true,
-                                // The router assigns its own incremented serial on
-                                // Commit; the anticipated one is passed through here.
-                                serial: self.frame_router.current_serial() + 1,
                             },
                         );
                         crate::dispatch_router_actions(self, &actions);
@@ -884,8 +874,6 @@ impl CompositorHandler for WlState {
             let _actions = self.frame_router.handle(
                 crate::frame_router::RouterEvent::Commit {
                     buffer_id,
-                    has_fds: false,
-                    serial: 0,
                 },
             );
         }

@@ -22,7 +22,6 @@ pub enum AppState {
     Init = 0,
     Handshake = 1,
     Active = 2,
-    Error = 3,
     /// CONN-STATE: the recv thread's run_loop failed (server died / socket
     /// error). Java's status overlay maps this to "Disconnected"; while the
     /// reconnect loop is retrying it stays Disconnected ("Reconnection").
@@ -243,7 +242,7 @@ extern "system" fn Java_com_wl_android_NativeBridge_nativeInit(
                             }
                         },
                         move |serial, buffer_id, width, height, fence_fd: Option<OwnedFd>, pixel_fd: Option<OwnedFd>| {
-                            log::info!("FRAME: serial={serial} {width}x{height} buf={buffer_id} fence={} pixels={}", fence_fd.is_some(), pixel_fd.is_some());
+                            log::debug!("FRAME: serial={serial} {width}x{height} buf={buffer_id} fence={} pixels={}", fence_fd.is_some(), pixel_fd.is_some());
                             if let Some(fence) = fence_fd {
                                 // Fence path (F-12, lane 30): the server already blitted into
                                 // swapchain slot buffer_id and shipped the sync_file fence
@@ -359,29 +358,13 @@ extern "system" fn Java_com_wl_android_NativeBridge_nativeInit(
                     }
                 };
                 if let Some(fd) = frame.pixel_fd {
-                    // PERF: Vulkan upload+present when the swapchain is up
-                    // (GPU path — no ANativeWindow CPU copy); fall back to
-                    // the CPU render when the swapchain is absent/uninit.
-                    // WL_APP_FORCE_CPU=1 disables Vulkan (debug A/B).
-                    let force_cpu = std::env::var("WL_APP_FORCE_CPU")
-                        .map(|v| v == "1")
-                        .unwrap_or(false);
-                    let use_vulkan = !force_cpu
-                        && render_state
-                            .lock()
-                            .map(|g| g.render.initialized)
-                            .unwrap_or(false);
-                    if use_vulkan {
-                        let mut inner = render_state.lock().unwrap();
-                        let _ = inner.render.upload_and_present(
-                            frame.width, frame.height, &fd,
-                        );
-                    } else {
-                        #[allow(deprecated)]
-                        let _ = crate::jni_bridge::render_frame_fd(
-                            frame.serial, frame.width, frame.height, &fd,
-                        );
-                    }
+                    // Pixel-fd frames only occur in SHM/CPU mode (the swapchain
+                    // is never armed there — nativeSetSurface early-returns on
+                    // SERVER_CAP_SHM), so the CPU present is the only path.
+                    #[allow(deprecated)]
+                    let _ = crate::jni_bridge::render_frame_fd(
+                        frame.serial, frame.width, frame.height, &fd,
+                    );
                 }
                 // fence frames need no render-side work (present already ran)
             }
@@ -539,7 +522,7 @@ fn present_fence_frame(state: &StateRef, serial: u64, buffer_id: u32, fence: &Ow
     }
     match present_result {
         Ok(()) => {
-            log::info!("present: slot={buffer_id} (serial={serial}, fence-waited) — AHB blit + swapchain present OK");
+            log::debug!("present: slot={buffer_id} (serial={serial}, fence-waited) — AHB blit + swapchain present OK");
             inner.consecutive_present_failures = 0;
         }
         Err(e) => {
@@ -698,17 +681,8 @@ fn send_input_message(state: &StateRef, msg: &wl_android_common::proto::Message)
 }
 
 #[unsafe(no_mangle)]
-extern "system" fn Java_com_wl_android_NativeBridge_nativeGetState(
-    _env: JNIEnv, _class: JClass, handle: jlong,
-) -> jint {
-    find(handle)
-        .map(|s| s.lock().unwrap().state as jint)
-        .unwrap_or(AppState::Error as jint)
-}
-
-#[unsafe(no_mangle)]
 extern "system" fn Java_com_wl_android_NativeBridge_nativeSetStatusListener(
-    mut env: JNIEnv, _class: JClass, handle: jlong, listener: jobject,
+    env: JNIEnv, _class: JClass, handle: jlong, listener: jobject,
 ) {
     let _ = handle;
     if listener.is_null() {
@@ -726,18 +700,6 @@ extern "system" fn Java_com_wl_android_NativeBridge_nativeSetStatusListener(
         }
         Err(e) => log::error!("nativeSetStatusListener: new_global_ref failed: {e}"),
     }
-}
-
-#[unsafe(no_mangle)]
-extern "system" fn Java_com_wl_android_NativeBridge_nativeGetSocketFd(
-    _env: JNIEnv, _class: JClass, handle: jlong,
-) -> jint {
-    find(handle)
-        .and_then(|s| {
-            let inner = s.lock().unwrap();
-            inner.session.as_ref().map(|s| s.socket_fd())
-        })
-        .unwrap_or(-1)
 }
 
 #[unsafe(no_mangle)]

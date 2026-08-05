@@ -594,7 +594,7 @@ CI 层可测的部分由 X-xx 规则覆盖；V-xx 专指需要真机环境（设
 
 | 编号 | 验收项 | 方法 |
 |------|--------|------|
-| V-05 | App 连接 land.sock | App 调试页显示 State=Active, protocol_version=1, mode=blit |
+| V-05 | App 连接 land.sock | App 调试页显示 State=Active, protocol_version=2, mode=blit |
 | V-06 | blit slot 池注册 | 3/3 TBUF 消息完成，slot fd 已发至容器 |
 | V-07 | 帧循环稳定 | Frame serial 递增、Ack 匹配、无 buffer 冻结（容器 log 无 "pool exhausted"） |
 | V-08 | 视觉输出正确 | `weston-simple-dmabuf-egl` 测试 pattern 渲染正确，颜色无花屏 |
