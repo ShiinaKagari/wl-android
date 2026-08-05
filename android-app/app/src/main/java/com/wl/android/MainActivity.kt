@@ -7,7 +7,6 @@ import android.os.Bundle
 import android.view.SurfaceHolder
 import android.view.SurfaceView
 import android.view.KeyEvent
-import android.view.MotionEvent
 import android.view.WindowManager
 import android.widget.TextView
 
@@ -16,10 +15,19 @@ class MainActivity : Activity(), SurfaceHolder.Callback, StatusListener {
     private lateinit var statusText: TextView
     private lateinit var collector: ScreenInfoCollector
     private lateinit var touchForwarder: TouchForwarder
+    private lateinit var settingsPanel: android.widget.LinearLayout
+    private lateinit var scaleLabel: TextView
+    private lateinit var modeLabel: TextView
     private var nativeHandle: Long = 0
     private val socketPath = "/data/local/tmp/wl-android/land.sock"
-    private val scaleOptions = floatArrayOf(0.5f, 1f, 1.5f, 2f)
-    private var scaleIndex = 1 // default 1x
+    // Render scale: only ≤1x is safe — >1x makes KWin render ABOVE the
+    // physical panel resolution, which crashed it (black screen). ≤1x
+    // renders at a lower resolution and SurfaceFlinger stretches the
+    // smaller buffer to fill the fullscreen SurfaceView.
+    private val scaleOptions = floatArrayOf(0.5f, 0.75f, 1f)
+    private val scaleLabels = arrayOf("0.5x", "0.75x", "1x")
+    private var scaleIndex = 2 // default 1x
+    private val modeNames = arrayOf("Free", "Vsync-align", "Performance", "Power-save")
 
     // CONN-STATE: event-driven — native calls onStateChanged on connection
     // state changes (no polling). Runs on the native recv thread; hop to the
@@ -78,10 +86,13 @@ class MainActivity : Activity(), SurfaceHolder.Callback, StatusListener {
                     android.widget.FrameLayout.LayoutParams.MATCH_PARENT,
                     android.widget.FrameLayout.LayoutParams.MATCH_PARENT
                 ))
-                addView(buildControlPanel(), android.widget.FrameLayout.LayoutParams(
-                    android.widget.FrameLayout.LayoutParams.MATCH_PARENT,
+                addView(buildSettingsPanel(), android.widget.FrameLayout.LayoutParams(
+                    android.widget.FrameLayout.LayoutParams.WRAP_CONTENT,
                     android.widget.FrameLayout.LayoutParams.WRAP_CONTENT
-                ).apply { gravity = android.view.Gravity.BOTTOM })
+                ).apply { gravity = android.view.Gravity.RIGHT or android.view.Gravity.CENTER_VERTICAL })
+                addView(buildSettingsHandle(), android.widget.FrameLayout.LayoutParams(
+                    dp(48), dp(48)
+                ).apply { gravity = android.view.Gravity.RIGHT or android.view.Gravity.CENTER_VERTICAL })
             }
         )
 
@@ -105,8 +116,14 @@ class MainActivity : Activity(), SurfaceHolder.Callback, StatusListener {
         }
 
         collector = ScreenInfoCollector(this) { w, h, ref, dpi, mode ->
-            touchForwarder.screenWidth = w
-            touchForwarder.screenHeight = h
+            // Touch normalization must use the PHYSICAL SurfaceView size
+            // (event.getX/Y are physical coords), NOT the render target
+            // size w/h — the server maps the normalized [0,1] coords onto
+            // its own render resolution. Using w/h here shifts every touch
+            // by the scale factor.
+            val m = resources.displayMetrics
+            touchForwarder.screenWidth = m.widthPixels
+            touchForwarder.screenHeight = m.heightPixels
             if (nativeHandle != 0L) {
                 NativeBridge.nativeOnConfig(nativeHandle, w, h, ref, dpi, mode)
             }
@@ -121,50 +138,99 @@ class MainActivity : Activity(), SurfaceHolder.Callback, StatusListener {
         }
     }
 
-    /** Bottom control panel: render-scale cycling button + frame-pacing mode
-     * cycling button. Scale multiplies the physical mode into the render
-     * target resolution sent to the backend; mode selects pacing on the
-     * server (0 free, 1 vsync-align, 2 performance, 3 power-save). */
-    private fun buildControlPanel(): android.view.View {
-        val scaleBtn = android.widget.Button(this).apply {
+    /** Sidebar settings menu: a translucent panel on the right edge with the
+     * render-scale selector and the frame-pacing mode selector. Each selector
+     * is a label + cycling button; tapping the panel toggles it. The panel
+     * does not steal touches from the SurfaceView when collapsed. */
+    private fun buildSettingsPanel(): android.view.View {
+        scaleLabel = TextView(this).apply {
+            setTextColor(android.graphics.Color.WHITE)
+            textSize = 16f
             text = "Scale: 1x"
+        }
+        val scaleBtn = android.widget.Button(this).apply {
+            text = "0.5x / 0.75x / 1x"
             setOnClickListener {
                 scaleIndex = (scaleIndex + 1) % scaleOptions.size
-                text = "Scale: ${scaleOptions[scaleIndex]}x"
-                collector.scale = scaleOptions[scaleIndex]
-                // Set the App-side buffer geometry to the render target too,
-                // so ANativeWindow_lock hands back the scaled size. Use
-                // displayMetrics (rotated to the App orientation) like the
-                // collector — Display.Mode reports panel-native portrait.
-                if (nativeHandle != 0L) {
-                    val m = resources.displayMetrics
-                    val rw = (m.widthPixels * collector.scale).toInt().coerceAtLeast(1)
-                    val rh = (m.heightPixels * collector.scale).toInt().coerceAtLeast(1)
-                    NativeBridge.nativeSetRenderSize(nativeHandle, rw, rh)
-                }
-                collector.emit()
+                applyScale()
             }
+        }
+        modeLabel = TextView(this).apply {
+            setTextColor(android.graphics.Color.WHITE)
+            textSize = 16f
+            text = "Pacing: Free"
         }
         val modeBtn = android.widget.Button(this).apply {
-            text = "Pacing: Free"
+            text = "Free / Vsync / Perf / Power"
             setOnClickListener {
                 collector.frameMode = (collector.frameMode + 1) % 4
-                text = when (collector.frameMode) {
-                    1 -> "Pacing: Vsync-align"
-                    2 -> "Pacing: Performance"
-                    3 -> "Pacing: Power-save"
-                    else -> "Pacing: Free"
-                }
+                modeLabel.text = "Pacing: ${modeNames[collector.frameMode]}"
                 collector.emit()
             }
         }
-        return android.widget.LinearLayout(this).apply {
-            orientation = android.widget.LinearLayout.HORIZONTAL
-            setBackgroundColor(android.graphics.Color.argb(140, 0, 0, 0))
-            addView(scaleBtn, android.widget.LinearLayout.LayoutParams(0, android.widget.LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
-            addView(modeBtn, android.widget.LinearLayout.LayoutParams(0, android.widget.LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        settingsPanel = android.widget.LinearLayout(this).apply {
+            orientation = android.widget.LinearLayout.VERTICAL
+            setPadding(dp(12), dp(12), dp(12), dp(12))
+            background = android.graphics.drawable.ColorDrawable(android.graphics.Color.argb(190, 20, 20, 20))
+            addView(scaleLabel)
+            addView(scaleBtn, android.widget.LinearLayout.LayoutParams(
+                android.widget.LinearLayout.LayoutParams.MATCH_PARENT,
+                android.widget.LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = dp(4); bottomMargin = dp(8) })
+            addView(modeLabel)
+            addView(modeBtn, android.widget.LinearLayout.LayoutParams(
+                android.widget.LinearLayout.LayoutParams.MATCH_PARENT,
+                android.widget.LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = dp(4) })
+        }
+        // A close button collapses the panel. The buttons inside get their
+        // clicks directly (Android event dispatch: the deepest view consumes
+        // first; a panel-wide click listener would only fire on empty area).
+        val closeBtn = android.widget.Button(this).apply {
+            text = "✕ Close"
+            setOnClickListener {
+                settingsPanel.visibility = android.view.View.GONE
+            }
+        }
+        settingsPanel.addView(closeBtn, android.widget.LinearLayout.LayoutParams(
+            android.widget.LinearLayout.LayoutParams.MATCH_PARENT,
+            android.widget.LinearLayout.LayoutParams.WRAP_CONTENT
+        ).apply { topMargin = dp(8) })
+        settingsPanel.visibility = android.view.View.GONE
+        return settingsPanel
+    }
+
+    /** Small handle on the right edge that toggles the settings panel open. */
+    private fun buildSettingsHandle(): android.view.View {
+        return android.widget.TextView(this).apply {
+            text = "⚙"
+            textSize = 24f
+            gravity = android.view.Gravity.CENTER
+            setTextColor(android.graphics.Color.WHITE)
+            background = android.graphics.drawable.ColorDrawable(android.graphics.Color.argb(150, 20, 20, 20))
+            setOnClickListener {
+                settingsPanel.visibility = android.view.View.VISIBLE
+            }
         }
     }
+
+    private fun applyScale() {
+        collector.scale = scaleOptions[scaleIndex]
+        scaleLabel.text = "Scale: ${scaleLabels[scaleIndex]}"
+        // Set the App-side buffer geometry to the render target too, so
+        // ANativeWindow_lock hands back the scaled size; SurfaceFlinger
+        // stretches it to the fullscreen SurfaceView. Use displayMetrics
+        // (rotated to the App orientation) like the collector.
+        if (nativeHandle != 0L) {
+            val m = resources.displayMetrics
+            val rw = (m.widthPixels * collector.scale).toInt().coerceAtLeast(1)
+            val rh = (m.heightPixels * collector.scale).toInt().coerceAtLeast(1)
+            NativeBridge.nativeSetRenderSize(nativeHandle, rw, rh)
+        }
+        collector.emit()
+    }
+
+    private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
 
     override fun onResume() {
         super.onResume()
