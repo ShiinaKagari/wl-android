@@ -77,10 +77,10 @@ fn fourcc_to_vk(fourcc: drm_fourcc::DrmFourcc) -> ash::vk::Format {
 }
 
 fn extract_from_buffer(
-    wl_buffer: &smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer,
+    wl_buffer: smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer,
     frame_cache: &mut Option<FrameCache>,
 ) -> Option<ExtractedFrame> {
-    let shm_result = shm::with_buffer_contents(wl_buffer, |ptr, _pool_len, data| {
+    let shm_result = shm::with_buffer_contents(&wl_buffer, |ptr, _pool_len, data| {
         let stride = data.stride as usize;
         let height = data.height as usize;
         if height == 0 || stride == 0 { return None; }
@@ -119,14 +119,14 @@ fn extract_from_buffer(
             }
         })
     }).unwrap_or(None);
-    let (sw, sh) = shm::with_buffer_contents(wl_buffer, |_ptr, _len, data| {
+    let (sw, sh) = shm::with_buffer_contents(&wl_buffer, |_ptr, _len, data| {
         (data.stride as u32 / 4, data.height as u32)
     }).unwrap_or((0, 0));
     if let Some(fd) = shm_result {
             return Some(ExtractedFrame::Shm(sw, sh, fd));
         }
 
-    if let Ok(dmabuf) = get_dmabuf(wl_buffer) {
+    if let Ok(dmabuf) = get_dmabuf(&wl_buffer) {
         let w = dmabuf.width();
         let h = dmabuf.height();
         let format = dmabuf.format();
@@ -711,7 +711,14 @@ impl CompositorHandler for WlState {
             let extracted: Option<ExtractedFrame> = 'extract: {
                 let parent_data = compositor::with_states(surface, |states| {
                     let mut guard = states.cached_state.get::<SurfaceAttributes>();
-                    match &guard.current().buffer {
+                    // ASYNC-RELEASE: take the buffer out and clear the field —
+                    // smithay's docs allow this ("free to set this field to
+                    // None to avoid processing it several times"). The buffer
+                    // is released once we're done with it, so KWin never
+                    // blocks waiting for its buffer pool. If the buffer is a
+                    // fresh one we haven't copied yet, extract it here.
+                    let buffer = guard.current().buffer.take();
+                    match buffer {
                         Some(BufferAssignment::NewBuffer(wl_buffer)) => {
                             extract_from_buffer(wl_buffer, &mut self.frame_cache)
                         }
@@ -723,7 +730,8 @@ impl CompositorHandler for WlState {
                 for child in &children {
                     let child_data = compositor::with_states(child, |states| {
                         let mut guard = states.cached_state.get::<SurfaceAttributes>();
-                        match &guard.current().buffer {
+                        let buffer = guard.current().buffer.take();
+                        match buffer {
                             Some(BufferAssignment::NewBuffer(wl_buffer)) => {
                                 extract_from_buffer(wl_buffer, &mut self.frame_cache)
                             }
