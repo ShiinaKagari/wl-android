@@ -70,6 +70,7 @@ android_logger、insta、proptest、cargo-ndk。
 - ❌ App 层面申请 root 权限
 - ❌ 引入消息队列 / IPC 框架（仅裸二进制 socket 协议）
 - ❌ 修改 Wayland 协议或发明私有 Wayland 扩展
+- ❌ 修改测试后端的环境变量、文件权限、系统参数（见 §8.1 测试后端不可变原则）
 
 ## 6. 兼容性承诺
 
@@ -101,3 +102,23 @@ android_logger、insta、proptest、cargo-ndk。
 禁止 tarball / 手工拷贝等非 git 源码同步（见 §2 禁止清单）。部署产物（编译出的二进制）
 例外：可按既有机制经 bind mount（`/data/local/tmp/wl-android` ↔ `/run/wl-android`）传递，
 但源码必须走 git。
+
+### 8.1 测试后端不可变原则（测试后端即标准环境）
+
+**测试后端就是标准环境。** 以下改动对 agent 一律禁止，任何情况下不得执行：
+
+- ❌ 修改测试后端的环境变量（容器配置、启动脚本 export、`/etc/environment`、`/etc/profile` 等一切生效路径）
+- ❌ 修改测试后端的文件权限 / 属主 / 所有权（`chmod` / `chown` / `chattr` / `setcap` / ACL）
+- ❌ 修改测试后端的系统参数（容器配置 `container.config`、`sysctl`、SELinux 策略、`setenforce`、`droidspaces` 启动参数、Magisk/sepolicy 规则）
+- ❌ 为"修复运行问题"而临时改任何后端状态（`setcap` 二进制、`chown` 目录、改写启动脚本等）
+
+**运行失败时的归因规则：**
+
+- 若程序（server / Plasma / KWin / App）在标准环境下无法正常运行，
+  **默认视为项目自身的问题**——优先排查 wl-android 代码、构建产物、协议实现、运行时假设；
+- 环境相关怀疑（驱动、权限、配置）必须先以**只读方式验证**（查看状态、对比日志、在
+  不修改任何状态的前提下诊断），确认是环境缺陷后**报告用户**，由用户决定是否调整环境；
+- agent 不得自行以修改环境为手段"修复"问题。
+
+> 例外：用户**明确、实时**指示的临时环境操作（如本次会话中用户指示的 `setenforce 0`），
+> 仅在指示范围内执行，且操作前后必须向用户明示差异。
