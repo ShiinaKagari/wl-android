@@ -1092,17 +1092,53 @@ impl RenderState {
                     .map_memory(staging_mem, 0, mem_req.size, vk::MemoryMapFlags::empty())
                     .map_err(|e| format!("upload: map_memory: {e}"))?
             };
-            // SAFETY: dst_ptr is HOST_VISIBLE memory of size mem_req.size;
-            // src_ptr is the fstat-guarded mmap.
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    src_ptr as *const u8,
-                    dst_ptr as *mut u8,
-                    map_len.min(mem_req.size as usize),
-                );
+            // Channel-order conversion: KWin's SHM pixels are BGRX memory
+            // order, but the swapchain image may be R8G8B8A8_UNORM (the
+            // device picked the fallback format). A raw copy would swap R/B
+            // → wrong colors / dark screen. Convert row-wise when needed.
+            let copy_len = map_len.min(mem_req.size as usize);
+            log::info!(
+                "upload: slot={slot} fmt={:?} copy={}B (fd={}, req={})",
+                self.image_format, copy_len, map_len, mem_req.size,
+            );
+            if self.image_format == vk::Format::R8G8B8A8_UNORM {
+                // SAFETY: both pointers are valid for copy_len bytes.
+                let src = src_ptr as *const u8;
+                let dst = dst_ptr as *mut u8;
+                unsafe {
+                    for i in (0..copy_len).step_by(4) {
+                        let b = *src.add(i);
+                        let r = *src.add(i + 2);
+                        *dst.add(i) = r;
+                        *dst.add(i + 1) = *src.add(i + 1);
+                        *dst.add(i + 2) = b;
+                        *dst.add(i + 3) = *src.add(i + 3);
+                    }
+                }
+            } else {
+                // B8G8R8A8_UNORM: memory order matches BGRX — direct copy.
+                // SAFETY: dst_ptr is HOST_VISIBLE memory of size mem_req.size;
+                // src_ptr is the fstat-guarded mmap.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        src_ptr as *const u8,
+                        dst_ptr as *mut u8,
+                        copy_len,
+                    );
+                }
             }
             unsafe {
                 device.unmap_memory(staging_mem);
+            }
+            // DEBUG: first pixel of the staging buffer (after conversion).
+            unsafe {
+                let probe = dst_ptr as *const u8;
+                log::info!(
+                    "upload: staging[0..4]={:02x} {:02x} {:02x} {:02x} (src={:02x} {:02x} {:02x} {:02x})",
+                    *probe, *probe.add(1), *probe.add(2), *probe.add(3),
+                    *(src_ptr as *const u8), *(src_ptr as *const u8).add(1),
+                    *(src_ptr as *const u8).add(2), *(src_ptr as *const u8).add(3),
+                );
             }
 
             // 3. Record copy: staging buffer -> swapchain image.
@@ -1224,9 +1260,15 @@ impl RenderState {
             // device borrow above).
             self.present(slot, &[copy_sem])?;
 
-            // 5. Release staging resources + the copy semaphore.
+            // 5. Release staging resources + the copy semaphore. The GPU may
+            // still be reading the staging buffer (present waits on the
+            // semaphore, but the read happens before present signals) —
+            // wait idle so destroying the buffer/memory is safe.
             let device = self.device.as_ref().expect("device set");
             unsafe {
+                device
+                    .device_wait_idle()
+                    .map_err(|e| format!("upload: wait_idle: {e}"))?;
                 device.destroy_semaphore(copy_sem, None);
                 device.destroy_buffer(buffer, None);
                 device.free_memory(staging_mem, None);

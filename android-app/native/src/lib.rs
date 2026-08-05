@@ -348,10 +348,15 @@ extern "system" fn Java_com_wl_android_NativeBridge_nativeInit(
                     // PERF: Vulkan upload+present when the swapchain is up
                     // (GPU path — no ANativeWindow CPU copy); fall back to
                     // the CPU render when the swapchain is absent/uninit.
-                    let use_vulkan = render_state
-                        .lock()
-                        .map(|g| g.render.initialized)
+                    // WL_APP_FORCE_CPU=1 disables Vulkan (debug A/B).
+                    let force_cpu = std::env::var("WL_APP_FORCE_CPU")
+                        .map(|v| v == "1")
                         .unwrap_or(false);
+                    let use_vulkan = !force_cpu
+                        && render_state
+                            .lock()
+                            .map(|g| g.render.initialized)
+                            .unwrap_or(false);
                     if use_vulkan {
                         let mut inner = render_state.lock().unwrap();
                         let _ = inner.render.upload_and_present(
@@ -392,6 +397,17 @@ extern "system" fn Java_com_wl_android_NativeBridge_nativeSetSurface(
         return;
     };
     let mut inner = state.lock().unwrap();
+
+    // SERVER_CAP_SHM (LAND_MODE=shm): frames are pixel fds, the CPU path
+    // renders them via ANativeWindow_lock. MUST NOT init the Vulkan swapchain
+    // here — a live swapchain owns the ANativeWindow and lock() then fails
+    // with -22 (EINVAL). The Vulkan GPU-upload present (upload_and_present)
+    // is only reachable when the swapchain is armed by a non-SHM server.
+    let caps = inner.server_caps.load(std::sync::atomic::Ordering::Relaxed);
+    if caps & wl_android_common::proto::SERVER_CAP_SHM != 0 {
+        log::info!("nativeSetSurface: SERVER_CAP_SHM — CPU presentation path (no Vulkan swapchain)");
+        return;
+    }
 
     if inner.render.initialized {
         log::warn!(
@@ -435,14 +451,6 @@ extern "system" fn Java_com_wl_android_NativeBridge_nativeSetSurface(
     // shipped as TBUF + AHB native_handle. Done HERE — not in run_loop, which
     // spawned before the surface existed and already warned+skipped with an
     // empty list (see the ordering analysis in `register_swapchain_slots`).
-    // SERVER_CAP_SHM: blit slots are irrelevant (the server ships pixel fds,
-    // not fence frames) — skip registration, the swapchain serves the
-    // upload_and_present path only.
-    let caps = inner.server_caps.load(std::sync::atomic::Ordering::Relaxed);
-    if caps & wl_android_common::proto::SERVER_CAP_SHM != 0 {
-        log::info!("nativeSetSurface: SERVER_CAP_SHM — swapchain armed for GPU-upload present (no blit slots)");
-        return;
-    }
     if let Err(e) = register_swapchain_slots(&mut inner) {
         log::error!("nativeSetSurface: slot registration failed: {e} — blit will stall; server gates frames on {} TBUFs", wl_android_common::proto::SLOT_COUNT);
         return;
