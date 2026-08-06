@@ -13,7 +13,6 @@ use smithay::delegate_viewporter;
 use smithay::delegate_xdg_shell;
 use smithay::delegate_alpha_modifier;
 use smithay::backend::input::{ButtonState, KeyState};
-use smithay::wayland::buffer::BufferHandler;
 use smithay::input::keyboard::{FilterResult, Keycode, XkbConfig};
 use smithay::input::pointer::{ButtonEvent, MotionEvent as PointerMotionEvent};
 use smithay::input::{Seat, SeatHandler, SeatState};
@@ -83,12 +82,25 @@ fn damage_to_rects(damage: &[compositor::Damage], scale: i32, w: u32, h: u32) ->
     out
 }
 
+/// Extract a committed buffer's pixels into the FrameCache memfd, returning
+/// the pixel fd for the App. Two sources:
+///
+/// * SHM: copy straight out of the pool (PERF-12, damage-optimized).
+/// * dmabuf (KWin GPU rendering): map plane 0 and copy — only LINEAR
+///   buffers are CPU-readable; QCOM_COMPRESSED buffers are dropped (the App
+///   is a CPU consumer and cannot import them).
 fn extract_from_buffer(
     wl_buffer: &smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer,
     frame_cache: &mut Option<FrameCache>,
     damage: &[compositor::Damage],
     buffer_scale: i32,
 ) -> Option<ExtractedFrame> {
+    // dmabuf path (KWin EGL): linear → mmap + copy.
+    if let Ok(dmabuf) = smithay::wayland::dmabuf::get_dmabuf(wl_buffer) {
+        return extract_from_dmabuf(dmabuf, frame_cache, damage, buffer_scale);
+    }
+
+    // SHM path (KWin software rendering).
     let shm_result = shm::with_buffer_contents(wl_buffer, |ptr, _pool_len, data| {
         let stride = data.stride as usize;
         let height = data.height as usize;
@@ -148,11 +160,100 @@ fn extract_from_buffer(
     None
 }
 
+/// dmabuf source: map plane 0 (LINEAR only) and copy into the FrameCache.
+/// Returns None when the buffer is compressed (not CPU-readable) or the map
+/// fails — the frame is dropped, the next linear frame proceeds normally.
+fn extract_from_dmabuf(
+    dmabuf: &smithay::backend::allocator::dmabuf::Dmabuf,
+    frame_cache: &mut Option<FrameCache>,
+    damage: &[compositor::Damage],
+    buffer_scale: i32,
+) -> Option<ExtractedFrame> {
+    use smithay::backend::allocator::Buffer;
+    use smithay::backend::allocator::dmabuf::{DmabufMappingMode, DmabufSyncFlags};
+
+    // Only LINEAR dmabufs are CPU-readable. Compressed (UBWC) buffers would
+    // need GPU import — the App is a CPU consumer, so drop them.
+    if dmabuf.has_modifier() {
+        tracing::warn!(
+            modifier = ?dmabuf.format().modifier,
+            "dmabuf with non-linear modifier — CPU read-back unsupported, dropping frame"
+        );
+        return None;
+    }
+
+    let w = dmabuf.width();
+    let h = dmabuf.height();
+    if w == 0 || h == 0 {
+        return None;
+    }
+
+    let mapping = match dmabuf.map_plane(0, DmabufMappingMode::READ) {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!(err = ?e, "dmabuf map_plane failed — dropping frame");
+            return None;
+        }
+    };
+    let stride = match dmabuf.strides().next() {
+        Some(s) => s as usize,
+        None => {
+            tracing::warn!("dmabuf without plane 0 stride — dropping frame");
+            return None;
+        }
+    };
+    // dmabuf_sync: ensure the GPU finished writing before we read (KWin
+    // renders on the GPU; without this the copy may see a torn frame).
+    let _ = dmabuf.sync_plane(0, DmabufSyncFlags::READ | DmabufSyncFlags::START);
+    let _ = dmabuf.sync_plane(0, DmabufSyncFlags::READ | DmabufSyncFlags::END);
+
+    let src_ptr = mapping.ptr() as *const u8;
+    let cache = if frame_cache.is_none() {
+        match FrameCache::new(w, h) {
+            Ok(c) => {
+                *frame_cache = Some(c);
+                frame_cache.as_mut().unwrap()
+            }
+            Err(e) => {
+                tracing::error!(err = %e, "FrameCache::new failed");
+                return None;
+            }
+        }
+    } else {
+        frame_cache.as_mut().unwrap()
+    };
+    cache.set_dimensions(w, h);
+    let rects = damage_to_rects(damage, buffer_scale, w, h);
+    let result = cache.push_damaged(w, h, &rects, |dst, effective| {
+        let row_bytes = w as usize * 4;
+        for r in effective {
+            for y in r.y..r.y + r.h {
+                let src_row = y as usize * stride;
+                let dst_row = y as usize * row_bytes;
+                if src_row + row_bytes <= mapping.length()
+                    && dst_row + row_bytes <= dst.len()
+                    && r.x as usize * 4 + r.w as usize * 4 <= stride
+                {
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            src_ptr.add(src_row + r.x as usize * 4),
+                            dst.as_mut_ptr().add(dst_row + r.x as usize * 4),
+                            r.w as usize * 4,
+                        );
+                    }
+                }
+            }
+        }
+    });
+    result.map(|fd| ExtractedFrame::Shm(w, h, Some(fd)))
+}
+
 pub struct WlState {
     pub display: Display<Self>,
     pub compositor_state: CompositorState,
     pub shm_state: ShmState,
     pub xdg_shell_state: XdgShellState,
+    pub dmabuf_state: smithay::wayland::dmabuf::DmabufState,
     pub frame_cache: Option<FrameCache>,
     pub app_session: Option<AppSession>,
     pub land_listener: Option<UnixListener>,
@@ -191,6 +292,14 @@ impl WlState {
         let shm_state = ShmState::new::<Self>(&dh, vec![]);
         let xdg_shell_state = XdgShellState::new::<Self>(&dh);
         let _output_state = OutputManagerState::new_with_xdg_output::<Self>(&dh);
+
+        // KWin GPU rendering: advertise zwp_linux_dmabuf_v1 so Mesa's EGL
+        // wayland platform can allocate GPU buffers (KWin's EGL backend
+        // requires it; without it KWin falls back to software rendering).
+        let mut dmabuf_state = smithay::wayland::dmabuf::DmabufState::new();
+        let dmabuf_feedback = crate::comp::dmabuf::build_default_feedback();
+        let _dmabuf_global =
+            dmabuf_state.create_global_with_default_feedback::<Self>(&dh, &dmabuf_feedback);
 
 
         let single_pixel_buffer_state = SinglePixelBufferState::new::<Self>(&dh);
@@ -243,7 +352,7 @@ impl WlState {
         let _global = output.create_global::<Self>(&dh);
 
         let state = Self {
-            display, compositor_state, shm_state, xdg_shell_state,
+            display, compositor_state, shm_state, xdg_shell_state, dmabuf_state,
             frame_cache: None,
             app_session: None, land_listener: None, land_source: None,
             clock_epoch: std::time::Instant::now(),
@@ -629,12 +738,6 @@ impl CompositorHandler for WlState {
 }
 
 delegate_compositor!(WlState);
-
-impl BufferHandler for WlState {
-    fn buffer_destroyed(&mut self, _buffer: &smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer) {
-        // SHM-only path: FrameCache owns the memfd, nothing to release here.
-    }
-}
 
 delegate_shm!(WlState);
 

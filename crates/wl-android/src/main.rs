@@ -10,6 +10,7 @@ use crate::state::WlState;
 use crate::transport::Transport;
 
 mod app_link;
+mod comp;
 mod doctor;
 mod frame_cache;
 mod state;
