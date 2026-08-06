@@ -280,7 +280,7 @@ fn accept_land_connections(state: &mut WlState, event_handle: &calloop::LoopHand
         }
     }
     state.land_listener = listener_opt;
-
+    dispatch_router_actions(state, &connect_actions);
 }
 /// Drain one App land-socket message (handshake / slot registration / active
 /// input) and apply it to the compositor state. Returns true when the session
