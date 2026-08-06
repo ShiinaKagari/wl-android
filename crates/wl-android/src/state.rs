@@ -18,6 +18,7 @@ use smithay::input::pointer::{ButtonEvent, MotionEvent as PointerMotionEvent};
 use smithay::input::{Seat, SeatHandler, SeatState};
 use smithay::utils::{Logical, Point, Serial};
 use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
+use smithay::reexports::wayland_server::backend::ClientData;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::Resource as WlResource;
 use smithay::reexports::wayland_server::Display;
@@ -438,6 +439,20 @@ impl WlState {
 
 // ── Compositor ──
 
+/// PER-CLIENT compositor state, attached to each wayland client at
+/// `insert_client` time. The previous implementation used ONE thread-local
+/// `CompositorClientState` shared by EVERY client — once plasmashell /
+/// Xwayland connected as a second client, its commits polluted KWin's
+/// transaction queue and frame callbacks: KWin's render loop froze (only
+/// input events woke it — "tap to continue"), EGL surfaces corrupted
+/// (eglSwapBuffers 0x3001), and KWin crash-looped (Graphics device lost).
+#[derive(Default)]
+pub struct WlClientState {
+    pub compositor: CompositorClientState,
+}
+
+impl ClientData for WlClientState {}
+
 /// SURFACE-FILTER: is `target` inside the surface tree rooted at `root`
 /// (root itself, its subsurfaces, and recursively their children)? KWin
 /// renders its wayland output through a subsurface CHILD of the xdg_toplevel,
@@ -495,20 +510,15 @@ impl CompositorHandler for WlState {
 
     fn client_compositor_state<'a>(
         &self,
-        _client: &'a smithay::reexports::wayland_server::Client,
+        client: &'a smithay::reexports::wayland_server::Client,
     ) -> &'a CompositorClientState {
-        // C3: Use thread-local static to avoid Box::leak — one per process is fine
-        // since we only have one client (KWin nested) in our use case.
-        use std::cell::RefCell;
-        thread_local! {
-            static STATE: RefCell<CompositorClientState> = RefCell::new(CompositorClientState::default());
-        }
-        // SAFETY: The returned reference must live as long as 'a.
-        // The thread_local lives for the process lifetime, satisfying 'a.
-        STATE.with(|s| {
-            let ptr = s.as_ptr() as *const CompositorClientState;
-            unsafe { &*ptr }
-        })
+        // PER-CLIENT: one CompositorClientState per client, attached at
+        // insert_client time. (The old thread_local single instance shared
+        // state across all clients — see WlClientState docs.)
+        &client
+            .get_data::<WlClientState>()
+            .expect("client inserted with WlClientState")
+            .compositor
     }
 
     fn commit(&mut self, surface: &WlSurface) {
@@ -555,15 +565,30 @@ impl CompositorHandler for WlState {
 
             match extracted {
                 Some(ExtractedFrame::Dmabuf(bw, bh, fd)) => {
-                    tracing::info!(bw, bh, "dmabuf frame — fd forwarded directly (zero copy)");
-                    if let Some(session) = &mut self.app_session {
-                        let _ = session.send_frame(bw, bh, fd);
+                    // FRAME-SIZE-FILTER: only frames matching the output
+                    // size reach the App. KWin's cursor sprite is a
+                    // subsurface INSIDE the toplevel tree (32x32, animates
+                    // at frame rate while the desktop is static), so the
+                    // surface-tree filter cannot exclude it — forwarding it
+                    // would let the App's latest-wins renderer paint the
+                    // tiny cursor frame as the whole picture.
+                    if bw == self.screen_width && bh == self.screen_height {
+                        tracing::info!(bw, bh, "dmabuf frame — fd forwarded directly (zero copy)");
+                        if let Some(session) = &mut self.app_session {
+                            let _ = session.send_frame(bw, bh, fd);
+                        }
+                    } else {
+                        tracing::info!(bw, bh, "dropping non-output frame (cursor/aux)");
                     }
                 }
                 Some(ExtractedFrame::Shm(bw, bh, fd)) => {
-                    tracing::info!(bw, bh, "SHM frame — copied into frame buffer");
-                    if let Some(session) = &mut self.app_session {
-                        let _ = session.send_frame(bw, bh, fd);
+                    if bw == self.screen_width && bh == self.screen_height {
+                        tracing::info!(bw, bh, "SHM frame — copied into frame buffer");
+                        if let Some(session) = &mut self.app_session {
+                            let _ = session.send_frame(bw, bh, fd);
+                        }
+                    } else {
+                        tracing::info!(bw, bh, "dropping non-output frame (cursor/aux)");
                     }
                 }
                 None => {

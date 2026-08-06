@@ -6,7 +6,7 @@ use smithay::wayland::socket::ListeningSocketSource;
 use tracing::{error, info, warn};
 
 use crate::app_link::AppSession;
-use crate::state::WlState;
+use crate::state::{WlClientState, WlState};
 use crate::transport::Transport;
 
 mod app_link;
@@ -128,7 +128,11 @@ fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     event_loop
         .handle()
         .insert_source(wayland_socket, move |stream, _, state| {
-            let client = match state.display.handle().insert_client(stream, Arc::new(())) {
+            let client = match state
+                .display
+                .handle()
+                .insert_client(stream, Arc::new(WlClientState::default()))
+            {
                 Ok(c) => c,
                 Err(e) => { error!(err = %e, "failed to insert wayland client"); return; }
             };
