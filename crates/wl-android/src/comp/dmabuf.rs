@@ -7,19 +7,17 @@ use tracing::{debug, warn};
 use crate::state::WlState;
 
 /// Default dmabuf feedback: advertise the container's render node plus the
-/// formats KWin's EGL stack may allocate. QCOM_COMPRESSED is advertised
-/// because kgsl/gbm can produce it, but the CPU read-back path only works
-/// for LINEAR — a compressed buffer is logged and the frame dropped (the
-/// App cannot import it either).
+/// formats KWin's EGL stack may allocate. ONLY LINEAR is advertised — the
+/// CPU read-back path (extract_from_dmabuf) cannot handle QCOM_COMPRESSED
+/// (UBWC) buffers, and advertising them invites gbm to pick the compressed
+/// modifier, which would make every frame unreadable. KWin rendering into
+/// linear buffers is still GPU-accelerated, just without UBWC compression.
 pub fn build_default_feedback() -> DmabufFeedback {
     use drm_fourcc::DrmFourcc;
     use drm_fourcc::DrmModifier;
     use smithay::backend::allocator::Format;
 
-    let modifiers = &[
-        DrmModifier::Linear,
-        DrmModifier::from(0x0800_0000_0000_0005u64), // QCOM_COMPRESSED
-    ];
+    let modifiers = &[DrmModifier::Linear];
     let fourccs = &[
         DrmFourcc::Xrgb8888,
         DrmFourcc::Argb8888,
