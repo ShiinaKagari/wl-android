@@ -286,10 +286,20 @@ impl FrameCache {
 
     /// Bookkeeping after a FULL frame write into the target buffer: only the
     /// target's pending list is satisfied (its content now IS the current
-    /// frame). The other buffer keeps its accumulated damage — its content
-    /// is still stale, and it needs every intermediate rect to catch up.
+    /// frame). Every OTHER buffer must learn about the whole frame — its
+    /// content is stale everywhere, so its pending list gets the full-frame
+    /// rect to force a complete repaint on its next turn. (Without this, a
+    /// later partial write into that buffer would leave regions from before
+    /// the full frame untouched.)
     fn after_full_write(&mut self) {
-        self.pending[self.next].clear();
+        let full = Rect::full(self.width, self.height);
+        for (i, pending) in self.pending.iter_mut().enumerate() {
+            if i == self.next {
+                pending.clear();
+            } else {
+                Self::union_rect(pending, full);
+            }
+        }
         self.valid[self.next] = true;
     }
 
@@ -819,5 +829,56 @@ mod tests {
         write_rect(&mut expected_a, &r1, 4, &f3);
         write_rect(&mut expected_a, &r2, 4, &f3);
         assert_eq!(a, expected_a, "buffer A = frame N + rects from N+1 and N+2");
+    }
+
+    // PERF-DAMAGE regression: after a FULL frame write into one buffer, the
+    // OTHER buffer must repaint its whole area on its next (partial) write —
+    // its content is stale everywhere, not just in the damaged rects.
+    #[test]
+    fn full_write_then_partial_on_other_buffer_repaints_all() {
+        let _serial = fd_guard_lock().lock().unwrap();
+        let _guard = FdCountGuard::new("full_write_then_partial_on_other_buffer_repaints_all");
+        let mut cache = FrameCache::new(4, 4).unwrap();
+        let frame1 = fill_pattern(4, 4, 1);
+
+        // Frame 1: FULL write into buffer A (the production `push_from` path).
+        cache
+            .push_from(4, 4, |dst| dst.copy_from_slice(&frame1))
+            .expect("frame 1 (full)");
+
+        // Frame 2: partial write into buffer B. B was never written, so this
+        // is a full frame of pattern 2 — and A's pending list must now carry
+        // the full-frame rect (A missed frame 2 entirely).
+        let frame2 = fill_pattern(4, 4, 2);
+        cache
+            .push_damaged(4, 4, &[Rect { x: 1, y: 1, w: 1, h: 1 }], |dst, effective| {
+                assert_eq!(effective, &[Rect { x: 0, y: 0, w: 4, h: 4 }], "B's first write must be full-frame");
+                for r in effective {
+                    write_rect(dst, r, 4, &frame2);
+                }
+            })
+            .expect("frame 2");
+
+        // Frame 3: partial write back into A with a small rect. A's pending
+        // accumulated frame 2's rect (1,1) plus this frame's rect (2,2) — A
+        // must repaint exactly those (its content = frame 1 everywhere else,
+        // and frame 2 only changed (1,1) relative to frame 1).
+        let frame3 = fill_pattern(4, 4, 3);
+        let fd = cache
+            .push_damaged(4, 4, &[Rect { x: 2, y: 2, w: 1, h: 1 }], |dst, effective| {
+                let mut expected = vec![Rect { x: 1, y: 1, w: 1, h: 1 }, Rect { x: 2, y: 2, w: 1, h: 1 }];
+                expected.sort_by_key(|r| (r.x, r.y));
+                let mut eff = effective.to_vec();
+                eff.sort_by_key(|r| (r.x, r.y));
+                assert_eq!(eff, expected, "A repaints every rect it missed since its last write");
+                for r in effective {
+                    write_rect(dst, r, 4, &frame3);
+                }
+            })
+            .expect("frame 3");
+        let mut expected_a = frame1.clone();
+        write_rect(&mut expected_a, &Rect { x: 1, y: 1, w: 1, h: 1 }, 4, &frame3);
+        write_rect(&mut expected_a, &Rect { x: 2, y: 2, w: 1, h: 1 }, 4, &frame3);
+        assert_eq!(read_fd(&fd), expected_a, "A = frame 1 + both missed rects (full convergence)");
     }
 }
