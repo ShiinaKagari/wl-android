@@ -230,14 +230,22 @@ pub fn render_frame(width: u32, height: u32, pixel_data: &[u8]) -> Result<(), St
     Ok(())
 }
 
-/// RENDER-DECOUPLE: per-fd mmap cache. KWin's buffer pool is small (2-3
-/// fds) and rotates, so caching the mapping per fd avoids mmap+munmap of
-/// the whole frame (32MB page-table churn ≈ 20ms) on every frame. Owned by
-/// the render thread only — no locking needed. The mappings live for the
-/// process lifetime (fds are dup'd per frame; entries are reused or grow
-/// the cache by at most the pool size).
+/// RENDER-DECOUPLE: per-buffer mmap cache. KWin's buffer pool is small
+/// (2-3 dmabufs) and rotates, so caching the mapping per BUFFER avoids
+/// mmap+munmap of the whole frame (32MB page-table churn ≈ 20ms) on every
+/// frame.
+///
+/// The key is the dmabuf's (st_dev, st_ino) identity, NOT the fd number:
+/// the server dups a fresh fd per frame, and the kernel reuses closed fd
+/// numbers — a raw fd-keyed cache would hit a stale mapping of a DIFFERENT
+/// buffer and freeze the picture (only a buffer-pool rotation that happens
+/// to use a fresh fd number would refresh it). Same-inode mappings are
+/// MAP_SHARED, so their contents follow the buffer's updates.
+///
+/// Owned by the render thread only — no locking needed. The mappings live
+/// for the process lifetime (bounded by the buffer pool size).
 pub struct FdMmapCache {
-    maps: std::collections::HashMap<i32, (usize, *mut u8)>,
+    maps: std::collections::HashMap<(u64, u64), (usize, *mut u8)>,
 }
 
 // SAFETY: only used from the render thread; pointers are into private
@@ -249,9 +257,15 @@ impl FdMmapCache {
         Self { maps: std::collections::HashMap::new() }
     }
 
-    /// Map `fd` if not cached; returns (ptr, len) of the readable mapping.
+    /// Map `fd` if its backing buffer is not cached; returns (ptr, len).
     fn map(&mut self, fd: i32, len: usize) -> Option<(*const u8, usize)> {
-        if let Some(&(cached_len, ptr)) = self.maps.get(&fd) {
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstat(fd, &mut st) } != 0 {
+            log::error!("FdMmapCache: fstat failed for fd {fd}");
+            return None;
+        }
+        let key = (st.st_dev, st.st_ino);
+        if let Some(&(cached_len, ptr)) = self.maps.get(&key) {
             return Some((ptr as *const u8, cached_len));
         }
         let ptr = unsafe {
@@ -268,7 +282,7 @@ impl FdMmapCache {
             log::error!("FdMmapCache: mmap failed for fd {fd}");
             return None;
         }
-        self.maps.insert(fd, (len, ptr as *mut u8));
+        self.maps.insert(key, (len, ptr as *mut u8));
         Some((ptr as *const u8, len))
     }
 }
