@@ -8,6 +8,7 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 pub const MAGIC_HELO: u32 = u32::from_le_bytes(*b"HELO");
 pub const MAGIC_CONF: u32 = u32::from_le_bytes(*b"CONF");
+pub const MAGIC_CONFU: u32 = u32::from_le_bytes(*b"CONU");
 pub const MAGIC_LAND: u32 = u32::from_le_bytes(*b"LAND");
 pub const MAGIC_FACK: u32 = u32::from_le_bytes(*b"FACK");
 pub const MAGIC_TOUC: u32 = u32::from_le_bytes(*b"TOUC");
@@ -98,7 +99,7 @@ impl Default for HelloMessage {
 }
 
 // =============================================================================
-// 4.2 ConfigMessage (App → server, 32 B)
+// 4.2 ConfigMessage (App → server, 32 B; server → App as ConfigUpdate, 32 B)
 // =============================================================================
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout)]
@@ -129,6 +130,18 @@ impl ConfigMessage {
             app_caps,
             frame_mode,
         }
+    }
+
+    /// Server → App variant of the same 32 B layout: signals a display
+    /// geometry/DPI/refresh change the App must apply (resize the render
+    /// window, update HiDPI scale). `app_caps` carries no meaning here.
+    pub fn as_config_update(mut self) -> Self {
+        self.magic = MAGIC_CONFU;
+        self
+    }
+
+    pub fn is_config_update(&self) -> bool {
+        self.magic == MAGIC_CONFU
     }
 }
 
@@ -263,6 +276,9 @@ impl KeyMessage {
 pub enum Message {
     Hello(HelloMessage),
     Config(ConfigMessage),
+    /// Server → App display-geometry/DPI/refresh change (same 32 B layout as
+    /// ConfigMessage, `MAGIC_CONFU`; see [`ConfigMessage::as_config_update`]).
+    ConfigUpdate(ConfigMessage),
     Frame(FrameMessage, Vec<OwnedFd>),
     Ack(FrameAck),
     Touch(TouchMessage),
@@ -274,6 +290,7 @@ impl PartialEq for Message {
         match (self, other) {
             (Self::Hello(a), Self::Hello(b)) => a == b,
             (Self::Config(a), Self::Config(b)) => a == b,
+            (Self::ConfigUpdate(a), Self::ConfigUpdate(b)) => a == b,
             (Self::Frame(a, fa), Self::Frame(b, fb)) => a == b && fa.len() == fb.len(),
             (Self::Ack(a), Self::Ack(b)) => a == b,
             (Self::Touch(a), Self::Touch(b)) => a == b,
@@ -334,6 +351,7 @@ pub fn encode(msg: &Message) -> Vec<u8> {
     match msg {
         Message::Hello(m) => m.as_bytes().to_vec(),
         Message::Config(m) => m.as_bytes().to_vec(),
+        Message::ConfigUpdate(m) => m.as_bytes().to_vec(),
         Message::Frame(m, _) => m.as_bytes().to_vec(),
         Message::Ack(m) => m.as_bytes().to_vec(),
         Message::Touch(m) => m.as_bytes().to_vec(),
@@ -371,6 +389,11 @@ pub fn decode(buf: &[u8], fds: Vec<OwnedFd>) -> Result<Message, ProtoError> {
             check_len::<ConfigMessage>(buf)?;
             let (m, _) = ConfigMessage::read_from_prefix(buf).unwrap();
             Ok(Message::Config(m))
+        }
+        MAGIC_CONFU => {
+            check_len::<ConfigMessage>(buf)?;
+            let (m, _) = ConfigMessage::read_from_prefix(buf).unwrap();
+            Ok(Message::ConfigUpdate(m))
         }
         MAGIC_LAND => {
             check_len::<FrameMessage>(buf)?;

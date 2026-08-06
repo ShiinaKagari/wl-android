@@ -237,6 +237,10 @@ extern "system" fn Java_com_wl_android_NativeBridge_nativeInit(
                                 crate::FRAME_CV.notify_one();
                             }
                         },
+                        move |w, h, _r, _dpi, _mode| {
+                            log::info!("config_update: {w}x{h}");
+                            crate::jni_bridge::set_render_size(w, h);
+                        },
                     );
                     match result {
                         Ok(()) => log::info!("run_loop exited cleanly"),

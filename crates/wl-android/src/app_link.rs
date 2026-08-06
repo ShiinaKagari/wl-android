@@ -134,6 +134,15 @@ impl AppSession {
         }
     }
 
+    /// Server → App display-geometry/DPI/refresh update. Sent when the server
+    /// buckets the DPI (e.g. 289 → 288) or applies a size/refresh change, so
+    /// the App resizes its render window / HiDPI scale to match.
+    pub fn send_config_update(&mut self, w: u32, h: u32, refresh_millihz: u32, dpi: u32, frame_mode: u32) -> io::Result<()> {
+        let conf = proto::ConfigMessage::new(w, h, refresh_millihz, dpi, 0, frame_mode)
+            .as_config_update();
+        self.transport.send(&Message::ConfigUpdate(conf))
+    }
+
     /// Receive any message from the App (non-blocking). Pure passthrough of
     /// the transport decode — the blit/TBUF/slot path was removed, so the
     /// only messages expected here are Ack/Touch/Key/Config.

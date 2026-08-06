@@ -273,8 +273,6 @@ fn handle_land_input(state: &mut WlState) -> bool {
             Ok(true) => {
                 info!("handshake complete, mode={:?}", session.mode());
                 // 握手完成后，把缓存的当前帧发给新客户端，避免黑屏。
-                // H-04: blit waits for SLOT_COUNT TBUFs — only direct mode
-                // (Active immediately) replays here; blit replays on activation.
                 if session.mode() == SessionMode::Active
                     && let Some(cache) = &state.frame_cache
                     && let Some((fd, seq, cw, ch)) = cache.current_frame()
@@ -282,6 +280,15 @@ fn handle_land_input(state: &mut WlState) -> bool {
                     let _ = session.send_frame(
                         seq, 0, state.screen_width, state.screen_height,
                         cw, ch, Some(fd), None,
+                    );
+                }
+                // 握手后立即推送 bucket 化 DPI（289→288），让 App 的 HiDPI
+                // 缩放从第一帧起就与 KWin 几何一致。
+                if session.mode() == SessionMode::Active {
+                    let _ = session.send_config_update(
+                        state.screen_width, state.screen_height,
+                        state.refresh_millihz, WlState::bucket_dpi(state.dpi),
+                        state.frame_mode,
                     );
                 }
                 false

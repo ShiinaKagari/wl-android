@@ -194,6 +194,7 @@ impl AppSession {
         server_caps: Arc<std::sync::atomic::AtomicU32>,
         on_connected: impl FnOnce(),
         on_frame: impl Fn(u64, u32, u32, u32, Option<OwnedFd>, Option<OwnedFd>),
+        on_config_update: impl Fn(u32, u32, u32, u32, u32),
     ) -> io::Result<()> {
         log::debug!("run_loop: entered");
         let mut reader = PendingReader::new(read_stream);
@@ -258,6 +259,13 @@ impl AppSession {
                     dispatch_frame(&fm, fds, &on_frame);
                     // F-14: ack the frame (FACK). SHM-only protocol — no BRDY.
                     send_fack(&mut wr, &fm)?;
+                }
+                Message::ConfigUpdate(c) => {
+                    log::info!(
+                        "ConfigUpdate received: {}x{} @{}mHz dpi={} mode={}",
+                        c.width, c.height, c.refresh_millihz, c.dpi, c.frame_mode,
+                    );
+                    on_config_update(c.width, c.height, c.refresh_millihz, c.dpi, c.frame_mode);
                 }
                 other => {
                     log::warn!("unexpected message: {:?}", other);

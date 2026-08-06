@@ -104,6 +104,20 @@ fn golden_config() {
 }
 
 #[test]
+fn golden_config_update() {
+    let msg = ConfigMessage::new(2400, 3392, 144000, 288, 0, 0).as_config_update();
+    assert!(msg.is_config_update(), "as_config_update must flip the magic");
+    assert_eq!(msg.magic, MAGIC_CONFU);
+    let bytes = encode(&Message::ConfigUpdate(msg));
+    assert_eq!(bytes.len(), 32);
+    assert_eq!(bytes[0..4], *b"CONU");
+    insta::assert_debug_snapshot!(&bytes);
+    // Same layout, different magic: a plain Config must NOT decode as Update.
+    let plain = ConfigMessage::new(3392, 2400, 144000, 289, 0, 0);
+    assert!(!plain.is_config_update());
+}
+
+#[test]
 fn golden_frame() {
     let fd = memfd_fake_dmabuf(3392 * 2400 * 4);
     let mut msg = FrameMessage {
@@ -212,6 +226,15 @@ proptest! {
     #[test]
     fn rt_config(width in 100u32..8000, height in 100u32..8000, refresh in 1000u32..240000, dpi in 96u32..600, caps in 0u32..1) {
         let msg = Message::Config(ConfigMessage::new(width, height, refresh, dpi, caps, 0));
+        let got = decode_roundtrip(&msg)?;
+        assert_eq!(got, msg);
+    }
+
+    #[test]
+    fn rt_config_update(width in 100u32..8000, height in 100u32..8000, refresh in 1000u32..240000, dpi in 96u32..600, mode in 0u32..4) {
+        let msg = Message::ConfigUpdate(
+            ConfigMessage::new(width, height, refresh, dpi, 0, mode).as_config_update(),
+        );
         let got = decode_roundtrip(&msg)?;
         assert_eq!(got, msg);
     }

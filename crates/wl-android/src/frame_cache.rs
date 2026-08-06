@@ -9,13 +9,59 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 // ANativeWindow_lock. There is no dmabuf/blit path (turnip import of App AHB
 // SIGSEGVs on this device — device-verified).
 //
-// PERF: the three memfds are mapped ONCE at pool build time and kept mapped
-// for the pool's lifetime (PERF-12). The previous implementation mmap'd +
-// munmap'd 32MB per push, which cost ~20ms/frame on top of the memcpy itself
+// PERF: the memfds are mapped ONCE at pool build time and kept mapped for the
+// pool's lifetime (PERF-12). The previous implementation mmap'd + munmap'd
+// 32MB per push, which cost ~20ms/frame on top of the memcpy itself
 // (page-table churn, TLB shootdowns). Writing straight into the resident
 // mapping cuts the push cost to the raw memcpy; `push_from` additionally lets
 // the caller copy directly from the SHM pool (single copy, no intermediate
 // Vec).
+//
+// PERF-DAMAGE: two buffers alternate strictly (frame N → buffer 0, N+1 →
+// buffer 1, N+2 → buffer 0, ...). Each buffer keeps a `pending` damage list:
+// every commit unions its damage rects into BOTH buffers' pending lists, and
+// the target buffer copies exactly its accumulated rects out of the fresh
+// KWin frame. The target's untouched regions keep their previous content —
+// which, because every intermediate frame's damage was accumulated, is
+// exactly the current frame there. First write after (re)build is a full
+// frame (fresh memfd content is garbage).
+
+/// A rectangle in pixel coordinates (clamped to the frame bounds).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Rect {
+    pub x: u32,
+    pub y: u32,
+    pub w: u32,
+    pub h: u32,
+}
+
+impl Rect {
+    fn full(w: u32, h: u32) -> Self {
+        Self { x: 0, y: 0, w, h }
+    }
+
+    fn contains(&self, other: &Rect) -> bool {
+        other.x >= self.x
+            && other.y >= self.y
+            && other.x + other.w <= self.x + self.w
+            && other.y + other.h <= self.y + self.h
+    }
+
+    fn mergeable(&self, other: &Rect) -> bool {
+        // Overlapping or adjacent (touching) rects merge into one.
+        let overlap_x = self.x < other.x + other.w && other.x < self.x + self.w;
+        let overlap_y = self.y < other.y + other.h && other.y < self.y + self.h;
+        overlap_x && overlap_y
+    }
+
+    fn merged(&self, other: &Rect) -> Rect {
+        let x1 = self.x.min(other.x);
+        let y1 = self.y.min(other.y);
+        let x2 = (self.x + self.w).max(other.x + other.w);
+        let y2 = (self.y + self.h).max(other.y + other.h);
+        Rect { x: x1, y: y1, w: x2 - x1, h: y2 - y1 }
+    }
+}
 
 pub struct FrameCache {
     buffers: Vec<OwnedFd>,
@@ -27,6 +73,12 @@ pub struct FrameCache {
     seq: u64,
     width: u32,
     height: u32,
+    /// Per-buffer accumulated damage since its last full write. Every commit
+    /// unions its rects into all buffers; the target copies its own list.
+    pending: Vec<Vec<Rect>>,
+    /// A buffer whose content has never been written (fresh after build or
+    /// resize) must be filled entirely on first use.
+    valid: Vec<bool>,
 }
 
 // SAFETY: `maps` are pointers into private memfds; FrameCache is not Send/Sync
@@ -36,11 +88,11 @@ unsafe impl Send for FrameCache {}
 impl FrameCache {
     pub fn new(width: u32, height: u32) -> Result<Self, String> {
         let size = width as usize * height as usize * 4;
-        let mut buffers = Vec::with_capacity(3);
-        let mut maps = Vec::with_capacity(3);
-        let mut sizes = Vec::with_capacity(3);
+        let mut buffers = Vec::with_capacity(2);
+        let mut maps = Vec::with_capacity(2);
+        let mut sizes = Vec::with_capacity(2);
 
-        for _ in 0..3 {
+        for _ in 0..2 {
             let memfd = nix::sys::memfd::memfd_create(
                 "wl-frame-cache",
                 nix::sys::memfd::MFdFlags::MFD_CLOEXEC
@@ -64,6 +116,8 @@ impl FrameCache {
             seq: 0,
             width,
             height,
+            pending: vec![Vec::new(), Vec::new()],
+            valid: vec![false, false],
         })
     }
 
@@ -121,9 +175,10 @@ impl FrameCache {
         }
     }
 
-    /// Push pixel data into the next buffer of the triple-buffer rotation.
+    /// Push pixel data into the next buffer of the double-buffer rotation.
     /// Returns a dup'd fd for SCM_RIGHTS transfer (the caller owns it).
-    /// Production uses `push_from`; `push` is exercised by the F-15 tests.
+    /// Production uses `push_from`/`push_damaged`; `push` is exercised by the
+    /// F-15 tests.
     #[allow(dead_code)]
     pub fn push(&mut self, data: &[u8], width: u32, height: u32) -> Option<OwnedFd> {
         let needed = width as usize * height as usize * 4;
@@ -138,6 +193,7 @@ impl FrameCache {
         unsafe {
             std::ptr::copy_nonoverlapping(data.as_ptr(), self.maps[self.next], needed);
         }
+        self.after_full_write();
         self.rotate(needed)
     }
 
@@ -147,6 +203,8 @@ impl FrameCache {
     ///
     /// The closure receives the full `width * height * 4` writable slice.
     /// On size mismatch the frame is dropped (None) like `push`.
+    /// Production uses `push_damaged`; kept for the PERF-12 tests.
+    #[allow(dead_code)]
     pub fn push_from<F: FnOnce(&mut [u8])>(
         &mut self,
         width: u32,
@@ -160,14 +218,86 @@ impl FrameCache {
         // SAFETY: maps[next] is a valid mapping of at least `needed` bytes.
         let dst = unsafe { std::slice::from_raw_parts_mut(self.maps[self.next], needed) };
         write(dst);
+        self.after_full_write();
         self.rotate(needed)
+    }
+
+    /// PERF-DAMAGE: write only the damaged rects into the next buffer. The
+    /// caller's closure receives the target slice and the EFFECTIVE rect
+    /// list (clamped to the frame; a full frame on the first write after a
+    /// build/resize) and copies each rect out of the fresh KWin frame. The
+    /// target's untouched regions keep their previous content, which — with
+    /// the per-buffer pending accumulation — equals the current frame there.
+    ///
+    /// Every commit must pass its damage rects here (possibly empty: a
+    /// zero-damage commit still advances the rotation so the App sees a
+    /// fresh fd for the unchanged frame).
+    pub fn push_damaged<F: FnOnce(&mut [u8], &[Rect])>(
+        &mut self,
+        width: u32,
+        height: u32,
+        rects: &[Rect],
+        write: F,
+    ) -> Option<OwnedFd> {
+        let needed = width as usize * height as usize * 4;
+        if !self.ensure_size(self.next, needed) {
+            return None;
+        }
+
+        // Union the new damage into EVERY buffer's pending list: the buffer
+        // we are about to write consumes its own list now; the other buffer
+        // must still learn about this frame's changes for its next turn.
+        for pending in &mut self.pending {
+            for r in rects {
+                Self::union_rect(pending, *r);
+            }
+        }
+
+        // First write after build/resize: the memfd content is garbage, so
+        // the effective region is the whole frame regardless of `rects`.
+        let effective: Vec<Rect> = if !self.valid[self.next] {
+            vec![Rect::full(self.width, self.height)]
+        } else {
+            std::mem::take(&mut self.pending[self.next])
+        };
+
+        // SAFETY: maps[next] is a valid mapping of at least `needed` bytes.
+        let dst = unsafe { std::slice::from_raw_parts_mut(self.maps[self.next], needed) };
+        write(dst, &effective);
+        self.pending[self.next].clear();
+        self.valid[self.next] = true;
+        self.rotate(needed)
+    }
+
+    /// Insert `r` into `list`, merging with any overlapping/adjacent rect so
+    /// the list stays small (damage from consecutive frames coalesces).
+    fn union_rect(list: &mut Vec<Rect>, r: Rect) {
+        for existing in list.iter_mut() {
+            if existing.contains(&r) {
+                return;
+            }
+            if existing.mergeable(&r) {
+                *existing = existing.merged(&r);
+                return;
+            }
+        }
+        list.push(r);
+    }
+
+    /// Bookkeeping after a FULL frame write into the target buffer: only the
+    /// target's pending list is satisfied (its content now IS the current
+    /// frame). The other buffer keeps its accumulated damage — its content
+    /// is still stale, and it needs every intermediate rect to catch up.
+    fn after_full_write(&mut self) {
+        self.pending[self.next].clear();
+        self.valid[self.next] = true;
     }
 
     /// Advance the rotation after a successful write and hand out a dup'd fd.
     fn rotate(&mut self, _needed: usize) -> Option<OwnedFd> {
         let prev_next = self.next;
         self.current = prev_next;
-        self.next = (self.next + 1) % 3;
+        self.next = (self.next + 1) % 2;
         self.seq += 1;
 
         let raw = unsafe { libc::dup(self.buffers[self.current].as_raw_fd()) };
@@ -215,11 +345,11 @@ impl FrameCache {
         }
 
         let size = width as usize * height as usize * 4;
-        let mut buffers = Vec::with_capacity(3);
-        let mut maps = Vec::with_capacity(3);
-        let mut sizes = Vec::with_capacity(3);
+        let mut buffers = Vec::with_capacity(2);
+        let mut maps = Vec::with_capacity(2);
+        let mut sizes = Vec::with_capacity(2);
 
-        for _ in 0..3 {
+        for _ in 0..2 {
             let memfd = match nix::sys::memfd::memfd_create(
                 "wl-frame-cache",
                 nix::sys::memfd::MFdFlags::MFD_CLOEXEC
@@ -259,6 +389,10 @@ impl FrameCache {
         self.current = 0;
         self.width = width;
         self.height = height;
+        // Fresh pool: content is garbage, so every buffer needs a full frame
+        // on first use; the old pending lists are meaningless at the new size.
+        self.pending = vec![Vec::new(), Vec::new()];
+        self.valid = vec![false, false];
         // seq deliberately not reset: monotonic across resizes (F-15).
     }
 }
@@ -398,18 +532,18 @@ mod tests {
 
         // Fill the whole pool so `next` wraps back to buffer 0.
         let mut inos = Vec::new();
-        for _ in 0..3 {
+        for _ in 0..2 {
             inos.push(fstat_ino(&cache.push(&frame_data(100, 100, 1), 100, 100).unwrap()));
         }
         let seq_before = cache.seq();
-        assert_eq!(seq_before, 3);
+        assert_eq!(seq_before, 2);
 
         cache.set_dimensions(100, 100);
 
         assert_eq!(cache.seq(), seq_before, "no-op resize must not touch seq");
         let fd = cache.push(&frame_data(100, 100, 2), 100, 100).unwrap();
         assert_eq!(fstat_size(&fd), 100 * 100 * 4, "buffer size unchanged");
-        // Same pool, index rotation untouched: the 4th push lands on buffer 0 again.
+        // Same pool, index rotation untouched: the 3rd push lands on buffer 0 again.
         assert_eq!(fstat_ino(&fd), inos[0], "no-op resize must not rebuild the pool");
         let (_, _, w, h) = cache.current_frame().expect("current frame");
         assert_eq!((w, h), (100, 100));
@@ -496,7 +630,7 @@ mod tests {
     }
 
     // PERF-12: the resident mapping must stay writable across rotations
-    // (buffer 0 gets reused on the 4th push and must not be stale-locked).
+    // (buffer 0 gets reused on the 3rd push and must not be stale-locked).
     #[test]
     fn push_from_rotation_wraps_cleanly() {
         let _serial = fd_guard_lock().lock().unwrap();
@@ -516,9 +650,174 @@ mod tests {
             assert_eq!(cache.seq(), (i + 1) as u64);
         }
 
-        // 4th push wraps to buffer 0; 5th to buffer 1 — inos repeat in rotation.
-        assert_eq!(inos[3], inos[0], "4th push must reuse buffer 0");
-        assert_eq!(inos[4], inos[1], "5th push must reuse buffer 1");
+        // 3rd push wraps to buffer 0; 4th to buffer 1 — inos repeat in rotation.
+        assert_eq!(inos[2], inos[0], "3rd push must reuse buffer 0");
+        assert_eq!(inos[3], inos[1], "4th push must reuse buffer 1");
+        assert_eq!(inos[4], inos[0], "5th push must reuse buffer 0");
         assert_eq!(cache.seq(), 5, "seq counts every push");
+    }
+
+    fn read_fd(fd: &OwnedFd) -> Vec<u8> {
+        let size = fstat_size(fd);
+        assert!(size > 0, "fd must be a sized memfd");
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                size as usize,
+                libc::PROT_READ,
+                libc::MAP_SHARED,
+                fd.as_raw_fd(),
+                0,
+            )
+        };
+        assert_ne!(ptr, libc::MAP_FAILED, "mmap for read-back failed");
+        let bytes = unsafe { std::slice::from_raw_parts(ptr as *const u8, size as usize) }.to_vec();
+        unsafe { libc::munmap(ptr, size as usize) };
+        bytes
+    }
+
+    fn fill_pattern(w: u32, h: u32, seed: u8) -> Vec<u8> {
+        let mut v = vec![0u8; w as usize * h as usize * 4];
+        for (i, b) in v.iter_mut().enumerate() {
+            *b = seed.wrapping_add(i as u8);
+        }
+        v
+    }
+
+    fn write_rect(dst: &mut [u8], rect: &Rect, w: u32, src: &[u8]) {
+        let stride = w as usize * 4;
+        for y in rect.y..rect.y + rect.h {
+            let row = y as usize * stride + rect.x as usize * 4;
+            let bytes = rect.w as usize * 4;
+            dst[row..row + bytes].copy_from_slice(&src[row..row + bytes]);
+        }
+    }
+
+    // PERF-DAMAGE: the first write after a fresh pool is a FULL frame even
+    // when the caller reports a small damage rect (memfd content is garbage).
+    #[test]
+    fn push_damaged_first_write_is_full_frame() {
+        let _serial = fd_guard_lock().lock().unwrap();
+        let _guard = FdCountGuard::new("push_damaged_first_write_is_full_frame");
+        let mut cache = FrameCache::new(4, 4).unwrap();
+        let full = fill_pattern(4, 4, 1);
+
+        let fd = cache
+            .push_damaged(4, 4, &[Rect { x: 0, y: 0, w: 1, h: 1 }], |dst, effective| {
+                assert_eq!(effective, &[Rect { x: 0, y: 0, w: 4, h: 4 }], "first write must be full-frame");
+                for r in effective {
+                    write_rect(dst, r, 4, &full);
+                }
+            })
+            .expect("push_damaged");
+        assert_eq!(read_fd(&fd), full, "first frame must contain the full pattern");
+    }
+
+    // PERF-DAMAGE: after both buffers hold a full frame, a partial write
+    // updates only the damaged rect; untouched regions keep the previous
+    // content written into that buffer.
+    #[test]
+    fn push_damaged_partial_write_preserves_untouched() {
+        let _serial = fd_guard_lock().lock().unwrap();
+        let _guard = FdCountGuard::new("push_damaged_partial_write_preserves_untouched");
+        let mut cache = FrameCache::new(4, 4).unwrap();
+        let frame1 = fill_pattern(4, 4, 1);
+        let frame2 = fill_pattern(4, 4, 2);
+        let frame3 = fill_pattern(4, 4, 3);
+
+        // Frame 1: full write of pattern 1 into buffer A.
+        cache
+            .push_damaged(4, 4, &[Rect { x: 0, y: 0, w: 4, h: 4 }], |dst, effective| {
+                for r in effective {
+                    write_rect(dst, r, 4, &frame1);
+                }
+            })
+            .expect("frame 1");
+        // Frame 2: full write of pattern 2 into buffer B (first write after a
+        // fresh pool is always a full frame, even for a small reported rect).
+        cache
+            .push_damaged(4, 4, &[Rect { x: 0, y: 0, w: 1, h: 1 }], |dst, effective| {
+                assert_eq!(effective, &[Rect { x: 0, y: 0, w: 4, h: 4 }], "B's first write must be full-frame");
+                for r in effective {
+                    write_rect(dst, r, 4, &frame2);
+                }
+            })
+            .expect("frame 2");
+
+        // Frame 3: only the top-left 2x2 rect changed (pattern 3) in buffer A,
+        // which already holds frame 1's pattern.
+        let rect = Rect { x: 0, y: 0, w: 2, h: 2 };
+        let fd = cache
+            .push_damaged(4, 4, &[rect], |dst, effective| {
+                assert_eq!(effective, &[rect], "partial write must only repaint the damaged rect");
+                for r in effective {
+                    write_rect(dst, r, 4, &frame3);
+                }
+            })
+            .expect("frame 3");
+
+        let got = read_fd(&fd);
+        let mut expected = frame1.clone();
+        write_rect(&mut expected, &rect, 4, &frame3);
+        assert_eq!(got, expected, "damaged rect updated, untouched regions preserved");
+    }
+
+    // PERF-DAMAGE: the alternating double buffer accumulates damage across
+    // frames. Buffer A holds frame N; frame N+1 writes B (full, first write);
+    // frame N+2 writes A again and must carry BOTH N+1's and N+2's changes
+    // (A's untouched regions still show frame N).
+    #[test]
+    fn push_damaged_alternation_accumulates_both_frames() {
+        let _serial = fd_guard_lock().lock().unwrap();
+        let _guard = FdCountGuard::new("push_damaged_alternation_accumulates_both_frames");
+        let mut cache = FrameCache::new(4, 4).unwrap();
+        let full = fill_pattern(4, 4, 1);
+
+        // Frame N (buffer A): full frame.
+        cache
+            .push_damaged(4, 4, &[Rect { x: 0, y: 0, w: 4, h: 4 }], |dst, effective| {
+                for r in effective {
+                    write_rect(dst, r, 4, &full);
+                }
+            })
+            .expect("frame N");
+
+        // Frame N+1 (buffer B): B is a fresh buffer, so this write is a FULL
+        // frame of pattern 2 — B does not inherit A's content.
+        let f2 = fill_pattern(4, 4, 2);
+        cache
+            .push_damaged(4, 4, &[Rect { x: 0, y: 0, w: 1, h: 1 }], |dst, effective| {
+                assert_eq!(effective, &[Rect { x: 0, y: 0, w: 4, h: 4 }], "B's first write must be full-frame");
+                for r in effective {
+                    write_rect(dst, r, 4, &f2);
+                }
+            })
+            .expect("frame N+1");
+        assert_eq!(read_fd(&cache.current_frame().unwrap().0), f2, "B = full pattern 2");
+
+        // Frame N+2 (buffer A again): A still holds frame N. Every commit
+        // unions its damage into BOTH buffers' pending lists, so A's list
+        // covers N+1's rect (0,0,1,1) AND this frame's rect — A must repaint
+        // everything it missed since its last write (frame N).
+        let r1 = Rect { x: 0, y: 0, w: 1, h: 1 };
+        let r2 = Rect { x: 2, y: 2, w: 1, h: 1 };
+        let f3 = fill_pattern(4, 4, 3);
+        let fd = cache
+            .push_damaged(4, 4, &[r2], |dst, effective| {
+                let mut expected = vec![r1, r2];
+                expected.sort_by_key(|r| (r.x, r.y));
+                let mut eff = effective.to_vec();
+                eff.sort_by_key(|r| (r.x, r.y));
+                assert_eq!(eff, expected, "A must repaint every rect since its last write (N+1's and this frame's)");
+                for r in effective {
+                    write_rect(dst, r, 4, &f3);
+                }
+            })
+            .expect("frame N+2");
+        let a = read_fd(&fd);
+        let mut expected_a = full.clone();
+        write_rect(&mut expected_a, &r1, 4, &f3);
+        write_rect(&mut expected_a, &r2, 4, &f3);
+        assert_eq!(a, expected_a, "buffer A = frame N + rects from N+1 and N+2");
     }
 }

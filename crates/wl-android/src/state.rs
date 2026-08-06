@@ -50,9 +50,42 @@ enum ExtractedFrame {
 
 
 
+/// Convert smithay's per-commit surface damage into pixel rects (clamped to
+/// the frame), so the FrameCache can copy only the changed regions
+/// (PERF-DAMAGE). `Buffer` damage is already in pixels; `Surface` damage is
+/// logical and must be scaled by the surface's buffer_scale. Rectangles are
+/// clamped into [0, w] × [0, h]; anything fully outside is dropped.
+fn damage_to_rects(damage: &[compositor::Damage], scale: i32, w: u32, h: u32) -> Vec<crate::frame_cache::Rect> {
+    let mut out = Vec::new();
+    for d in damage {
+        let (x, y, rw, rh): (i32, i32, i32, i32) = match d {
+            compositor::Damage::Buffer(r) => (r.loc.x, r.loc.y, r.size.w, r.size.h),
+            compositor::Damage::Surface(r) => (
+                r.loc.x * scale,
+                r.loc.y * scale,
+                r.size.w * scale,
+                r.size.h * scale,
+            ),
+        };
+        let x = x.max(0);
+        let y = y.max(0);
+        let rw = rw.max(0);
+        let rh = rh.max(0);
+        if x >= w as i32 || y >= h as i32 || rw == 0 || rh == 0 {
+            continue;
+        }
+        let rw = rw.min(w as i32 - x);
+        let rh = rh.min(h as i32 - y);
+        out.push(crate::frame_cache::Rect { x: x as u32, y: y as u32, w: rw as u32, h: rh as u32 });
+    }
+    out
+}
+
 fn extract_from_buffer(
     wl_buffer: &smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer,
     frame_cache: &mut Option<FrameCache>,
+    damage: &[compositor::Damage],
+    buffer_scale: i32,
 ) -> Option<ExtractedFrame> {
     let shm_result = shm::with_buffer_contents(wl_buffer, |ptr, _pool_len, data| {
         let stride = data.stride as usize;
@@ -75,19 +108,27 @@ fn extract_from_buffer(
         }
         let cache = frame_cache.as_mut().unwrap();
         cache.set_dimensions(w, height as u32);
-        // PERF-12: copy straight out of the pool into the resident memfd
-        // mapping — no intermediate Vec allocation + memcpy.
-        cache.push_from(w, height as u32, |dst| {
-            for y in 0..height {
-                let src = unsafe { ptr.add(offset + y * stride) };
-                let dst_row = y * stride;
-                if dst_row + stride <= dst.len() {
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(
-                            src,
-                            dst.as_mut_ptr().add(dst_row),
-                            stride,
-                        );
+        let rects = damage_to_rects(damage, buffer_scale, w, height as u32);
+        // PERF-12 + PERF-DAMAGE: copy the damaged rects straight out of the
+        // pool into the resident memfd mapping — no intermediate Vec
+        // allocation + memcpy, and untouched regions are preserved from the
+        // previous frame (the FrameCache accumulates damage per buffer).
+        cache.push_damaged(w, height as u32, &rects, |dst, effective| {
+            for r in effective {
+                let row_bytes = r.w as usize * 4;
+                for y in r.y..r.y + r.h {
+                    let src = unsafe { ptr.add(offset + y as usize * stride + r.x as usize * 4) };
+                    let dst_row = y as usize * stride;
+                    // dst stride == src stride == w*4 (FrameCache built at
+                    // w = stride/4), so the same row math applies.
+                    if dst_row + row_bytes <= dst.len() && r.x as usize * 4 + row_bytes <= stride {
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                src,
+                                dst.as_mut_ptr().add(dst_row + r.x as usize * 4),
+                                row_bytes,
+                            );
+                        }
                     }
                 }
             }
@@ -180,7 +221,7 @@ impl WlState {
         let w = 3392;
         let h = 2400;
         let refresh = 144_000;
-        let dpi = 289;
+        let dpi = Self::bucket_dpi(289);
 
         let touch_injector = TouchInjector::new(w, h);
 
@@ -367,6 +408,35 @@ impl WlState {
             });
             tl.send_configure();
         }
+
+        // Push the bucketed DPI back so the App's HiDPI scale matches the
+        // geometry we advertise to KWin (289 → 288 keeps an integer 2× scale).
+        if let Some(session) = &mut self.app_session
+            && session.mode() == SessionMode::Active
+        {
+            let _ = session.send_config_update(w, h, refresh_millihz, Self::bucket_dpi(dpi), frame_mode);
+        }
+    }
+
+    /// Map a raw display DPI to the nearest bucket in {96, 120, 144, 160,
+    /// 192, 240, 288, 384}. Integer multiples of 96 keep Qt/GTK HiDPI scales
+    /// integral (289 DPI on the panel would otherwise produce a fractional
+    /// 2.007× scale); the panel reports 289 → 288.
+    pub fn bucket_dpi(raw: u32) -> u32 {
+        const BUCKETS: [u32; 8] = [96, 120, 144, 160, 192, 240, 288, 384];
+        if raw <= BUCKETS[0] {
+            return BUCKETS[0];
+        }
+        let mut best = BUCKETS[0];
+        for &b in &BUCKETS {
+            if raw >= b {
+                best = b;
+            } else {
+                // The bucket just below raw; decide by distance.
+                return if raw - best <= b - raw { best } else { b };
+            }
+        }
+        best
     }
 
     /// PACING: decide whether a freshly-committed frame may be sent to the App
@@ -447,9 +517,15 @@ impl CompositorHandler for WlState {
                     // blocks waiting for its buffer pool. If the buffer is a
                     // fresh one we haven't copied yet, extract it here.
                     let buffer = guard.current().buffer.take();
+                    // PERF-DAMAGE: this commit's damage rects (smithay moves
+                    // them into `current` on commit) drive the partial copy.
+                    // `Damage` is not Clone; take() empties the vec, which is
+                    // fine — commit handling already consumed it.
+                    let damage = std::mem::take(&mut guard.current().damage);
+                    let scale = guard.current().buffer_scale;
                     match buffer {
                         Some(BufferAssignment::NewBuffer(wl_buffer)) => {
-                            let r = extract_from_buffer(&wl_buffer, &mut self.frame_cache);
+                            let r = extract_from_buffer(&wl_buffer, &mut self.frame_cache, &damage, scale);
                             // ASYNC-RELEASE: the frame is now copied into the
                             // resident FrameCache (our shared memory), so KWin's
                             // buffer is free — release it immediately. Dropping
@@ -467,9 +543,11 @@ impl CompositorHandler for WlState {
                     let child_data = compositor::with_states(child, |states| {
                         let mut guard = states.cached_state.get::<SurfaceAttributes>();
                         let buffer = guard.current().buffer.take();
+                        let damage = std::mem::take(&mut guard.current().damage);
+                        let scale = guard.current().buffer_scale;
                         match buffer {
                             Some(BufferAssignment::NewBuffer(wl_buffer)) => {
-                                let r = extract_from_buffer(&wl_buffer, &mut self.frame_cache);
+                                let r = extract_from_buffer(&wl_buffer, &mut self.frame_cache, &damage, scale);
                                 wl_buffer.release();
                                 r
                             }
@@ -673,5 +751,25 @@ mod tests {
     fn malformed_state_defaults_to_released() {
         assert_eq!(WlState::key_state_from_u32(7), KeyState::Released);
         assert_eq!(WlState::key_state_from_u32(u32::MAX), KeyState::Released);
+    }
+
+    #[test]
+    fn bucket_dpi_maps_panel_289_to_288() {
+        assert_eq!(WlState::bucket_dpi(289), 288, "panel DPI must bucket to the 2x integer");
+    }
+
+    #[test]
+    fn bucket_dpi_exact_values_pass_through() {
+        for dpi in [96u32, 120, 144, 160, 192, 240, 288, 384] {
+            assert_eq!(WlState::bucket_dpi(dpi), dpi, "exact bucket must be identity");
+        }
+    }
+
+    #[test]
+    fn bucket_dpi_rounds_to_nearest_bucket() {
+        assert_eq!(WlState::bucket_dpi(90), 96, "below the smallest bucket rounds up");
+        assert_eq!(WlState::bucket_dpi(110), 120, "midway rounds to the larger bucket");
+        assert_eq!(WlState::bucket_dpi(0), 96, "degenerate input clamps to the smallest");
+        assert_eq!(WlState::bucket_dpi(1000), 384, "above the largest bucket saturates");
     }
 }
