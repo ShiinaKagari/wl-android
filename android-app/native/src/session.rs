@@ -6,16 +6,13 @@ use std::sync::Arc;
 use wl_android_common::proto;
 use wl_android_common::proto::Message;
 
-
 /// Read-ahead buffered reader for the App side of the land socket.
 ///
 /// The transport is SOCK_STREAM (DESIGN.md P-01 deviation): the kernel may
 /// split one length-prefixed message across recvmsg calls, or coalesce
-/// several (a frame's FACK + a Touch/Key from the JNI path) into one. The
-/// server's Transport buffers with `pending`; this mirrors that so the App
-/// recv thread never sees a partial length prefix ("recv too short" crash —
-/// previously triggered once input sends gained their own write path and
-/// could interleave with FACK bytes).
+/// several (a frame + a Touch/Key from the JNI path) into one. This mirrors
+/// the server's Transport: the App recv thread never sees a partial length
+/// prefix.
 struct PendingReader {
     stream: UnixStream,
     buf: Vec<u8>,
@@ -107,50 +104,38 @@ fn safe_mmap_len(fd: &impl AsRawFd, requested: usize) -> usize {
     (st.st_size as usize).min(requested)
 }
 
-/// Split a received Frame's fds per the wire contract (P-08) and route the
-/// frame to `on_frame`. SHM-only protocol: `fds[0]` is the pixel fd. It is
-/// fstat-guarded and handed to `on_frame` by ownership (no mmap here) — the
-/// recv thread enqueues it and the render thread does the mmap+copy. A
-/// truncated frame is reported instead of SIGBUSing in the render thread.
+/// Route a received Frame to `on_frame`. Stateless protocol: the frame's
+/// pixel fd (fds[0]) is fstat-guarded and handed to `on_frame` by ownership
+/// (no mmap here) — the recv thread enqueues it and the render thread does
+/// the mmap+copy. A truncated frame is reported instead of SIGBUSing in the
+/// render thread.
 fn dispatch_frame(
     fm: &proto::FrameMessage,
     fds: Vec<OwnedFd>,
-    on_frame: &impl Fn(u64, u32, u32, u32, Option<OwnedFd>, Option<OwnedFd>),
+    on_frame: &impl Fn(u32, u32, Option<OwnedFd>),
 ) {
     let size = fm.width as usize * fm.height as usize * 4;
     let mut fds = fds;
     if fds.is_empty() {
-        on_frame(fm.serial, fm.buffer_id, fm.width, fm.height, None, None);
+        log::warn!("frame without pixel fd: {}x{}", fm.width, fm.height);
         return;
     }
     let safe_len = safe_mmap_len(&fds[0], size);
     if safe_len == 0 {
         log::warn!(
-            "frame fd unusable (fstat failed or empty fd): requested={size}B; continuing with empty data"
+            "frame fd unusable (fstat failed or empty fd): requested={size}B; dropping frame"
         );
-        drop(fds);
-        on_frame(fm.serial, fm.buffer_id, fm.width, fm.height, None, None);
-    } else {
-        if safe_len < size {
-            log::warn!(
-                "frame fd smaller than expected: requested={size}B, actual={safe_len}B (serial={serial}); mapping truncated slice",
-                serial = fm.serial
-            );
-        }
-        let pixel = fds.remove(0);
-        on_frame(fm.serial, fm.buffer_id, fm.width, fm.height, None, Some(pixel));
-        drop(fds);
+        return;
     }
+    if safe_len < size {
+        log::warn!(
+            "frame fd smaller than expected: requested={size}B, actual={safe_len}B; truncating"
+        );
+    }
+    let pixel = fds.remove(0);
+    on_frame(fm.width, fm.height, Some(pixel));
+    drop(fds);
 }
-
-
-/// F-14: ack a frame (FACK). SHM-only protocol — frames carry no slot
-/// semantics, so no BRDY follows the FACK.
-fn send_fack(wr: &mut UnixStream, fm: &proto::FrameMessage) -> io::Result<()> {
-    let ack = proto::encode(&Message::Ack(proto::FrameAck::new(fm.serial)));
-    AppSession::write_msg_on(wr, &ack)
-}
-
 
 pub struct AppSession {
     pub write_stream: Arc<UnixStream>,
@@ -186,45 +171,40 @@ impl AppSession {
         self.send_message(&Message::Config(conf))
     }
 
+    /// Buffer-ownership signal: the App finished consuming a frame's pixel
+    /// fd and the server may reuse that memfd. Order-only (FIFO on the
+    /// server side) — one release per consumed frame.
+    pub fn send_release(&self) -> io::Result<()> {
+        self.send_message(&Message::Release(proto::ReleaseMessage::new()))
+    }
+
     // ── Recv (blocking, runs on dedicated thread) ──
 
+    /// Stateless receive loop: send the initial CONF event, then drain
+    /// Frame / ConfigUpdate events. No handshake, no ack — every message is
+    /// an independent event.
     pub fn run_loop(
         read_stream: UnixStream,
         write_stream: UnixStream,
-        server_caps: Arc<std::sync::atomic::AtomicU32>,
         on_connected: impl FnOnce(),
-        on_frame: impl Fn(u64, u32, u32, u32, Option<OwnedFd>, Option<OwnedFd>),
+        on_frame: impl Fn(u32, u32, Option<OwnedFd>),
         on_config_update: impl Fn(u32, u32, u32, u32, u32),
     ) -> io::Result<()> {
         log::debug!("run_loop: entered");
         let mut reader = PendingReader::new(read_stream);
         let mut wr = write_stream;
 
-        // 1. Receive HELO
-        log::debug!("recv_thread: waiting for HELO...");
-        let (data, _fds) = reader.next_message()?;
-        let msg = proto::decode(&data, vec![])
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-        if let Message::Hello(helo) = msg {
-            server_caps.store(helo.server_caps, std::sync::atomic::Ordering::Relaxed);
-            log::info!("HELO received (caps={:#x})", helo.server_caps);
-        } else {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "expected HELO"));
-        }
-
-        // 2. Send CONF
+        // 1. Send CONF (a plain event, not a handshake) — the server applies
+        // it and mirrors the effective geometry back via ConfigUpdate.
         let conf_data = proto::encode(&Message::Config(proto::ConfigMessage::new(3392, 2400, 144000, 289, 0, 0)));
         let len = (conf_data.len() as u32).to_le_bytes();
         wr.write_all(&len)?;
         wr.write_all(&conf_data)?;
         wr.flush()?;
-        log::info!("CONF sent, entering frame loop");
-        // CONN-STATE: the handshake is complete — the session is live even
-        // before any frame arrives (KWin may be idle). Mark Active so the
-        // status overlay hides immediately on reconnect.
+        log::info!("CONF sent, entering event loop");
         on_connected();
 
-        // 3. Frame ← Ack loop
+        // 2. Event loop
         loop {
             let (data, fds) = match reader.next_message() {
                 Ok(v) => v,
@@ -246,19 +226,14 @@ impl AppSession {
             match msg {
                 Message::Frame(fm, fds) => {
                     log::debug!(
-                        "Frame received: serial={} {}x{} fds={}",
-                        fm.serial,
+                        "Frame received: {}x{} fds={}",
                         fm.width,
                         fm.height,
                         fds.len(),
                     );
-                    // P-08: dispatch the frame's pixel fd to on_frame — see
-                    // dispatch_frame. on_frame runs synchronously, so the
-                    // CPU-present (wired in lib.rs, render thread) completes
-                    // before the FACK below.
+                    // Stateless: hand the pixel fd to on_frame (the render
+                    // thread consumes it and replies with a RELEASE).
                     dispatch_frame(&fm, fds, &on_frame);
-                    // F-14: ack the frame (FACK). SHM-only protocol — no BRDY.
-                    send_fack(&mut wr, &fm)?;
                 }
                 Message::ConfigUpdate(c) => {
                     log::info!(
@@ -276,6 +251,7 @@ impl AppSession {
 
     /// P-05 framing onto an arbitrary write end (run_loop owns its stream
     /// rather than a session instance): u32 LE length, then the payload.
+    #[allow(dead_code)]
     fn write_msg_on(wr: &mut UnixStream, data: &[u8]) -> io::Result<()> {
         let len = (data.len() as u32).to_le_bytes();
         wr.write_all(&len)?;
@@ -367,32 +343,48 @@ mod tests {
         assert_eq!(safe_mmap_len(&InvalidFd, 100), 0);
     }
 
-    /// F-14: an SHM frame is FACK'd and nothing else follows — it has no slot
-    /// semantics, so no BRDY may appear on the wire after the FACK.
+    /// Stateless: an SHM frame's pixel fd is handed to on_frame by ownership.
     #[test]
-    fn send_fack_only_for_shm_frame() {
-        let (mut app, mut srv) = UnixStream::pair().unwrap();
-        let fm = shm_frame(1);
-        send_fack(&mut app, &fm).expect("send FACK");
-
-        let first = read_wire_frame(&mut srv).unwrap();
-        match proto::decode(&first, vec![]).expect("decode FACK") {
-            Message::Ack(a) => assert_eq!(a.serial, 7),
-            other => panic!("expected Ack, got {other:?}"),
+    fn dispatch_shm_frame_hands_pixel_fd() {
+        let _g = FdCountGuard::new();
+        let fm = proto::FrameMessage::new(64, 64);
+        let mut fd = memfd_of_size(64 * 64 * 4);
+        {
+            let buf = vec![0xABu8; 64 * 64 * 4];
+            let rc = unsafe {
+                libc::write(
+                    fd.as_raw_fd(),
+                    buf.as_ptr().cast(),
+                    buf.len(),
+                )
+            };
+            assert_eq!(rc, buf.len() as isize);
         }
-        srv.set_nonblocking(true).unwrap();
-        let mut probe = [0u8; 4];
-        let e = srv.read_exact(&mut probe).unwrap_err();
-        assert_eq!(e.kind(), io::ErrorKind::WouldBlock, "no BRDY may follow an SHM FACK");
+        let got = std::cell::Cell::new(None);
+        dispatch_frame(&fm, vec![fd], &|w, h, pixels| {
+            assert_eq!((w, h), (64, 64));
+            let p = pixels.expect("SHM path must hand the pixel fd");
+            got.set(Some(p.as_raw_fd()));
+        });
+        assert!(got.get().is_some(), "pixel fd must be handed to on_frame");
     }
 
-    fn read_wire_frame(srv: &mut UnixStream) -> io::Result<Vec<u8>> {
+    /// Stateless: a RELEASE carries no fds and decodes cleanly.
+    #[test]
+    fn release_message_roundtrip() {
+        let (app, mut srv) = UnixStream::pair().unwrap();
+        let session = AppSession { write_stream: Arc::new(app) };
+        session.send_release().expect("send RELEASE");
+
         use std::io::Read;
         let mut len_buf = [0u8; 4];
-        srv.read_exact(&mut len_buf)?;
+        srv.read_exact(&mut len_buf).unwrap();
         let len = u32::from_le_bytes(len_buf) as usize;
         let mut data = vec![0u8; len];
-        srv.read_exact(&mut data)?;
-        Ok(data)
+        srv.read_exact(&mut data).unwrap();
+        match proto::decode(&data, vec![]).expect("decode RELEASE") {
+            Message::Release(_) => {}
+            other => panic!("expected Release, got {other:?}"),
+        }
     }
 }

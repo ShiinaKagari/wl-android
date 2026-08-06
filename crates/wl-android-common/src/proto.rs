@@ -6,11 +6,10 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 // Magic constants (§4, P-04)
 // =============================================================================
 
-pub const MAGIC_HELO: u32 = u32::from_le_bytes(*b"HELO");
 pub const MAGIC_CONF: u32 = u32::from_le_bytes(*b"CONF");
 pub const MAGIC_CONFU: u32 = u32::from_le_bytes(*b"CONU");
 pub const MAGIC_LAND: u32 = u32::from_le_bytes(*b"LAND");
-pub const MAGIC_FACK: u32 = u32::from_le_bytes(*b"FACK");
+pub const MAGIC_RLSE: u32 = u32::from_le_bytes(*b"RLSE");
 pub const MAGIC_TOUC: u32 = u32::from_le_bytes(*b"TOUC");
 pub const MAGIC_KEYM: u32 = u32::from_le_bytes(*b"KEYM");
 
@@ -18,20 +17,13 @@ pub const MAGIC_KEYM: u32 = u32::from_le_bytes(*b"KEYM");
 // Version
 // =============================================================================
 
-pub const PROTOCOL_VERSION: u32 = 2;
-
-// =============================================================================
-// Caps bits
-// =============================================================================
-
-pub const SERVER_CAP_SHM: u32 = 1 << 0;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 // =============================================================================
 // Frame flags
 // =============================================================================
 
 pub const FRAME_CARRIES_FDS: u32 = 1 << 0;
-pub const FRAME_CARRIES_FENCE: u32 = 1 << 1;
 
 // =============================================================================
 // Touch phases
@@ -64,42 +56,11 @@ const fn fourcc(s: &[u8; 4]) -> u32 {
 }
 
 // =============================================================================
-// Plane descriptor (sub-struct reused in Frame) — P-03
-// =============================================================================
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout)]
-#[repr(C)]
-pub struct PlaneDesc {
-    pub offset: u32,
-    pub stride: u32,
-}
-
-// =============================================================================
-// 4.1 HelloMessage (server → App, 16 B) — P-01..P-03
-// =============================================================================
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout)]
-#[repr(C)]
-pub struct HelloMessage {
-    pub magic: u32,
-    pub protocol_version: u32,
-    pub server_caps: u32,
-    pub _reserved: u32,
-}
-
-impl Default for HelloMessage {
-    fn default() -> Self {
-        Self {
-            magic: MAGIC_HELO,
-            protocol_version: PROTOCOL_VERSION,
-            server_caps: SERVER_CAP_SHM,
-            _reserved: 0,
-        }
-    }
-}
-
-// =============================================================================
-// 4.2 ConfigMessage (App → server, 32 B; server → App as ConfigUpdate, 32 B)
+// 4.1 ConfigMessage (App → server, 32 B; server → App as ConfigUpdate, 32 B)
+//
+// Stateless protocol: CONF is a plain event the App sends whenever the
+// display geometry/refresh/DPI/frame-mode changes (no handshake). The server
+// applies it and mirrors the effective (DPI-bucketed) values back via CONFU.
 // =============================================================================
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout)]
@@ -146,70 +107,65 @@ impl ConfigMessage {
 }
 
 // =============================================================================
-// 4.3 FrameMessage (server → App, 80 B) — P-08/P-09
+// 4.2 FrameMessage (server → App, 16 B + 1 pixel fd)
+//
+// Stateless frame push: the server sends the CURRENT frame whenever KWin
+// commits; the App renders it and replies with a ReleaseMessage. There is no
+// serial, no ack, no ordering contract — latest-wins on both ends.
 // =============================================================================
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout)]
 #[repr(C)]
 pub struct FrameMessage {
     pub magic: u32,
-    pub num_planes: u32,
-    pub serial: u64,
-    pub modifier: u64,
     pub width: u32,
     pub height: u32,
-    pub drm_format: u32,
     pub flags: u32,
-    pub buffer_id: u32,
-    pub _reserved: u32,
-    pub planes: [PlaneDesc; 4],
 }
 
 impl FrameMessage {
+    pub fn new(width: u32, height: u32) -> Self {
+        Self {
+            magic: MAGIC_LAND,
+            width,
+            height,
+            flags: FRAME_CARRIES_FDS,
+        }
+    }
+
     pub fn carries_fds(&self) -> bool {
         self.flags & FRAME_CARRIES_FDS != 0
-    }
-
-    pub fn set_carries_fds(&mut self, v: bool) {
-        if v {
-            self.flags |= FRAME_CARRIES_FDS;
-        } else {
-            self.flags &= !FRAME_CARRIES_FDS;
-        }
-    }
-
-    pub fn carries_fence(&self) -> bool {
-        self.flags & FRAME_CARRIES_FENCE != 0
-    }
-
-    pub fn set_carries_fence(&mut self, v: bool) {
-        if v {
-            self.flags |= FRAME_CARRIES_FENCE;
-        } else {
-            self.flags &= !FRAME_CARRIES_FENCE;
-        }
     }
 }
 
 // =============================================================================
-// 4.4 FrameAck (App → server, 16 B) — P-11
+// 4.3 ReleaseMessage (App → server, 8 B)
+//
+// Buffer-ownership signal: the App has finished consuming the most recently
+// received frame's pixel fd and the server may reuse that memfd. No payload
+// needed — the server tracks its double-buffer rotation and frees the
+// oldest in-flight buffer per release (FIFO), so releases are order-only.
 // =============================================================================
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout)]
 #[repr(C)]
-pub struct FrameAck {
+pub struct ReleaseMessage {
     pub magic: u32,
     pub _reserved: u32,
-    pub serial: u64,
 }
 
-impl FrameAck {
-    pub fn new(serial: u64) -> Self {
+impl ReleaseMessage {
+    pub fn new() -> Self {
         Self {
-            magic: MAGIC_FACK,
+            magic: MAGIC_RLSE,
             _reserved: 0,
-            serial,
         }
+    }
+}
+
+impl Default for ReleaseMessage {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -274,13 +230,13 @@ impl KeyMessage {
 
 #[derive(Debug)]
 pub enum Message {
-    Hello(HelloMessage),
     Config(ConfigMessage),
     /// Server → App display-geometry/DPI/refresh change (same 32 B layout as
     /// ConfigMessage, `MAGIC_CONFU`; see [`ConfigMessage::as_config_update`]).
     ConfigUpdate(ConfigMessage),
     Frame(FrameMessage, Vec<OwnedFd>),
-    Ack(FrameAck),
+    /// App → server buffer-ownership signal (see [`ReleaseMessage`]).
+    Release(ReleaseMessage),
     Touch(TouchMessage),
     Key(KeyMessage),
 }
@@ -288,11 +244,10 @@ pub enum Message {
 impl PartialEq for Message {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
-            (Self::Hello(a), Self::Hello(b)) => a == b,
             (Self::Config(a), Self::Config(b)) => a == b,
             (Self::ConfigUpdate(a), Self::ConfigUpdate(b)) => a == b,
             (Self::Frame(a, fa), Self::Frame(b, fb)) => a == b && fa.len() == fb.len(),
-            (Self::Ack(a), Self::Ack(b)) => a == b,
+            (Self::Release(a), Self::Release(b)) => a == b,
             (Self::Touch(a), Self::Touch(b)) => a == b,
             (Self::Key(a), Self::Key(b)) => a == b,
             _ => false,
@@ -332,13 +287,11 @@ impl std::error::Error for ProtoError {}
 // =============================================================================
 
 const _: () = {
-    assert!(size_of::<HelloMessage>() == 16);
     assert!(size_of::<ConfigMessage>() == 32);
-    assert!(size_of::<FrameMessage>() == 80);
-    assert!(size_of::<FrameAck>() == 16);
+    assert!(size_of::<FrameMessage>() == 16);
+    assert!(size_of::<ReleaseMessage>() == 8);
     assert!(size_of::<TouchMessage>() == 24);
     assert!(size_of::<KeyMessage>() == 16);
-    assert!(size_of::<PlaneDesc>() == 8);
 };
 
 // =============================================================================
@@ -349,11 +302,10 @@ const _: () = {
 /// message (if any) when calling Transport::send.
 pub fn encode(msg: &Message) -> Vec<u8> {
     match msg {
-        Message::Hello(m) => m.as_bytes().to_vec(),
         Message::Config(m) => m.as_bytes().to_vec(),
         Message::ConfigUpdate(m) => m.as_bytes().to_vec(),
         Message::Frame(m, _) => m.as_bytes().to_vec(),
-        Message::Ack(m) => m.as_bytes().to_vec(),
+        Message::Release(m) => m.as_bytes().to_vec(),
         Message::Touch(m) => m.as_bytes().to_vec(),
         Message::Key(m) => m.as_bytes().to_vec(),
     }
@@ -362,11 +314,8 @@ pub fn encode(msg: &Message) -> Vec<u8> {
 /// Returns the number of fds that must accompany this message via SCM_RIGHTS.
 pub fn fd_count(msg: &Message) -> usize {
     match msg {
-        // P-08: CARRIES_FDS → num_planes fds
-        // P-08b: CARRIES_FENCE → +1 fence fd (coexistable)
         Message::Frame(m, _) => {
-            (if m.carries_fds() { m.num_planes as usize } else { 0 })
-                + (if m.carries_fence() { 1 } else { 0 })
+            if m.carries_fds() { 1 } else { 0 }
         }
         _ => 0,
     }
@@ -380,11 +329,6 @@ pub fn decode(buf: &[u8], fds: Vec<OwnedFd>) -> Result<Message, ProtoError> {
     let magic = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
 
     match magic {
-        MAGIC_HELO => {
-            check_len::<HelloMessage>(buf)?;
-            let (m, _) = HelloMessage::read_from_prefix(buf).unwrap();
-            Ok(Message::Hello(m))
-        }
         MAGIC_CONF => {
             check_len::<ConfigMessage>(buf)?;
             let (m, _) = ConfigMessage::read_from_prefix(buf).unwrap();
@@ -398,17 +342,16 @@ pub fn decode(buf: &[u8], fds: Vec<OwnedFd>) -> Result<Message, ProtoError> {
         MAGIC_LAND => {
             check_len::<FrameMessage>(buf)?;
             let (m, _) = FrameMessage::read_from_prefix(buf).unwrap();
-            let expected = (if m.carries_fds() { m.num_planes as usize } else { 0 })
-                + (if m.carries_fence() { 1 } else { 0 });
+            let expected = if m.carries_fds() { 1 } else { 0 };
             if fds.len() != expected {
                 return Err(ProtoError::FdMismatch { expected, got: fds.len() });
             }
             Ok(Message::Frame(m, fds))
         }
-        MAGIC_FACK => {
-            check_len::<FrameAck>(buf)?;
-            let (m, _) = FrameAck::read_from_prefix(buf).unwrap();
-            Ok(Message::Ack(m))
+        MAGIC_RLSE => {
+            check_len::<ReleaseMessage>(buf)?;
+            let (m, _) = ReleaseMessage::read_from_prefix(buf).unwrap();
+            Ok(Message::Release(m))
         }
         MAGIC_TOUC => {
             check_len::<TouchMessage>(buf)?;

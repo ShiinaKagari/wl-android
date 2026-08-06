@@ -5,7 +5,7 @@ use calloop::{EventLoop, Interest, Mode};
 use smithay::wayland::socket::ListeningSocketSource;
 use tracing::{error, info, warn};
 
-use crate::app_link::{AppSession, SessionMode};
+use crate::app_link::AppSession;
 use crate::state::WlState;
 use crate::transport::Transport;
 
@@ -234,11 +234,25 @@ fn accept_land_connections(state: &mut WlState, event_handle: &calloop::LoopHand
                         match event_handle.insert_source(source, cb) {
                             Ok(token) => {
                                 state.land_source = Some(token);
-                                // Handshake is driven by the source's
-                                // readiness (the App's HELO arrives right
-                                // after connect); kick it here too so the
-                                // first message is consumed even if the
-                                // fd event raced ahead of insert_source.
+                                // Stateless protocol: the App is ready the
+                                // moment it connects. Push the current
+                                // geometry (bucketed DPI) immediately so the
+                                // App's render window matches, and replay the
+                                // cached frame (if any) to avoid a black
+                                // screen until the next KWin commit.
+                                if let Some(session) = &mut state.app_session {
+                                    let _ = session.send_config_update(
+                                        state.screen_width, state.screen_height,
+                                        state.refresh_millihz, WlState::bucket_dpi(state.dpi),
+                                        state.frame_mode,
+                                    );
+                                    if let Some(cache) = &mut state.frame_cache
+                                        && let Some((fd, _seq, cw, ch)) = cache.current_frame()
+                                    {
+                                        cache.mark_current_in_flight();
+                                        let _ = session.send_frame(cw, ch, fd);
+                                    }
+                                }
                                 let _ = handle_land_input(state);
                             }
                             Err(e) => {
@@ -257,9 +271,10 @@ fn accept_land_connections(state: &mut WlState, event_handle: &calloop::LoopHand
     }
     state.land_listener = listener_opt;
 }
-/// Drain one App land-socket message (handshake / slot registration / active
-/// input) and apply it to the compositor state. Returns true when the session
-/// must be torn down (protocol error or disconnect).
+/// Drain one App land-socket message (stateless: Config / Touch / Key /
+/// Release — each is an independent event) and apply it to the compositor
+/// state. Returns true when the session must be torn down (protocol error or
+/// disconnect).
 ///
 /// Event-driven (PERF-13): called from the Generic land source readiness
 /// check inside the event loop, so App input is handled as soon as the fd is
@@ -268,67 +283,40 @@ fn handle_land_input(state: &mut WlState) -> bool {
     let Some(session) = &mut state.app_session else {
         return false;
     };
-    match session.mode() {
-        SessionMode::Handshake => match session.do_handshake() {
-            Ok(true) => {
-                info!("handshake complete, mode={:?}", session.mode());
-                // 握手完成后，把缓存的当前帧发给新客户端，避免黑屏。
-                if session.mode() == SessionMode::Active
-                    && let Some(cache) = &state.frame_cache
-                    && let Some((fd, seq, cw, ch)) = cache.current_frame()
-                {
-                    let _ = session.send_frame(
-                        seq, 0, state.screen_width, state.screen_height,
-                        cw, ch, Some(fd), None,
-                    );
-                }
-                // 握手后立即推送 bucket 化 DPI（289→288），让 App 的 HiDPI
-                // 缩放从第一帧起就与 KWin 几何一致。
-                if session.mode() == SessionMode::Active {
-                    let _ = session.send_config_update(
-                        state.screen_width, state.screen_height,
-                        state.refresh_millihz, WlState::bucket_dpi(state.dpi),
-                        state.frame_mode,
-                    );
+    match session.recv_message() {
+        Ok(Some(msg)) => match msg {
+            // Buffer-ownership signal: the App consumed the oldest in-flight
+            // frame's pixel fd — the FrameCache frees that memfd (FIFO).
+            wl_android_common::proto::Message::Release(_) => {
+                if let Some(cache) = &mut state.frame_cache {
+                    cache.on_release();
                 }
                 false
             }
-            Ok(false) => false,
-            Err(e) => {
-                warn!(err = %e, "handshake failed");
-                true
+            wl_android_common::proto::Message::Touch(tm) => {
+                state.handle_touch(&tm);
+                false
             }
+            wl_android_common::proto::Message::Key(km) => {
+                state.handle_key(&km);
+                false
+            }
+            wl_android_common::proto::Message::Config(conf) => {
+                // Stateless config event: apply it and mirror the effective
+                // (DPI-bucketed) geometry back via CONFU.
+                state.apply_config(
+                    conf.width, conf.height,
+                    conf.refresh_millihz, conf.dpi,
+                    conf.frame_mode,
+                );
+                false
+            }
+            _ => false,
         },
-        SessionMode::Active => {
-            match session.recv_message() {
-                Ok(Some(msg)) => match msg {
-                    // SHM path: the App cum-acks every frame serial; with no
-                    // blit slot pool there is nothing to free, just accept it.
-                    wl_android_common::proto::Message::Ack(_) => false,
-                    wl_android_common::proto::Message::Touch(tm) => {
-                        state.handle_touch(&tm);
-                        false
-                    }
-                    wl_android_common::proto::Message::Key(km) => {
-                        state.handle_key(&km);
-                        false
-                    }
-                    wl_android_common::proto::Message::Config(conf) => {
-                        state.apply_config(
-                            conf.width, conf.height,
-                            conf.refresh_millihz, conf.dpi,
-                            conf.frame_mode,
-                        );
-                        false
-                    }
-                    _ => false,
-                },
-                Ok(None) => false,
-                Err(e) => {
-                    warn!(err = %e, "session read error");
-                    true
-                }
-            }
+        Ok(None) => false,
+        Err(e) => {
+            warn!(err = %e, "session read error");
+            true
         }
     }
 }

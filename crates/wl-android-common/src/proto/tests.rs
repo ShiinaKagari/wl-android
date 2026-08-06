@@ -8,23 +8,18 @@ use proptest::prelude::*;
 // =============================================================================
 
 #[test]
-fn hello_size_is_16() {
-    assert_eq!(size_of::<HelloMessage>(), 16);
-}
-
-#[test]
 fn config_size_is_32() {
     assert_eq!(size_of::<ConfigMessage>(), 32);
 }
 
 #[test]
-fn frame_size_is_80() {
-    assert_eq!(size_of::<FrameMessage>(), 80);
+fn frame_size_is_16() {
+    assert_eq!(size_of::<FrameMessage>(), 16);
 }
 
 #[test]
-fn ack_size_is_16() {
-    assert_eq!(size_of::<FrameAck>(), 16);
+fn release_size_is_8() {
+    assert_eq!(size_of::<ReleaseMessage>(), 8);
 }
 
 #[test]
@@ -33,13 +28,7 @@ fn touch_size_is_24() {
 }
 
 #[test]
-fn plane_desc_size_is_8() {
-    assert_eq!(size_of::<PlaneDesc>(), 8);
-}
-
-#[test]
 fn key_size_is_16() {
-    // P-03: KeyMessage (v2, §4.8) is exactly 16 B
     assert_eq!(size_of::<KeyMessage>(), 16);
 }
 
@@ -48,13 +37,13 @@ fn key_size_is_16() {
 // =============================================================================
 
 #[test]
-fn magic_helo_is_ascii_helo() {
-    assert_eq!(MAGIC_HELO, u32::from_le_bytes(*b"HELO"));
+fn magic_conf_is_ascii_conf() {
+    assert_eq!(MAGIC_CONF, u32::from_le_bytes(*b"CONF"));
 }
 
 #[test]
-fn magic_conf_is_ascii_conf() {
-    assert_eq!(MAGIC_CONF, u32::from_le_bytes(*b"CONF"));
+fn magic_confu_is_ascii_conu() {
+    assert_eq!(MAGIC_CONFU, u32::from_le_bytes(*b"CONU"));
 }
 
 #[test]
@@ -63,8 +52,8 @@ fn magic_land_is_ascii_land() {
 }
 
 #[test]
-fn magic_fack_is_ascii_fack() {
-    assert_eq!(MAGIC_FACK, u32::from_le_bytes(*b"FACK"));
+fn magic_rlse_is_ascii_rlse() {
+    assert_eq!(MAGIC_RLSE, u32::from_le_bytes(*b"RLSE"));
 }
 
 #[test]
@@ -79,20 +68,7 @@ fn magic_keym_is_ascii_keym() {
 
 // =============================================================================
 // golden bytes: each message type encoded → stable snapshot (insta)
-// P-03 precise byte layout
 // =============================================================================
-
-#[test]
-fn golden_hello() {
-    let msg = HelloMessage::default();
-    let bytes = encode(&Message::Hello(msg));
-    assert_eq!(bytes.len(), 16);
-    assert_eq!(bytes[0..4], *b"HELO");
-    assert_eq!(u32::from_le_bytes(bytes[4..8].try_into().unwrap()), PROTOCOL_VERSION);
-    assert_eq!(u32::from_le_bytes(bytes[8..12].try_into().unwrap()), SERVER_CAP_SHM);
-    assert_eq!(u32::from_le_bytes(bytes[12..16].try_into().unwrap()), 0);
-    insta::assert_debug_snapshot!(&bytes);
-}
 
 #[test]
 fn golden_config() {
@@ -120,42 +96,22 @@ fn golden_config_update() {
 #[test]
 fn golden_frame() {
     let fd = memfd_fake_dmabuf(3392 * 2400 * 4);
-    let mut msg = FrameMessage {
-        magic: MAGIC_LAND,
-        num_planes: 1,
-        serial: 42,
-        modifier: DRM_FORMAT_MOD_LINEAR,
-        width: 3392,
-        height: 2400,
-        drm_format: DRM_FORMAT_ABGR8888,
-        flags: FRAME_CARRIES_FDS,
-        buffer_id: 1,
-        _reserved: 0,
-        planes: [
-            PlaneDesc { offset: 0, stride: 3392 * 4 },
-            PlaneDesc { offset: 0, stride: 0 },
-            PlaneDesc { offset: 0, stride: 0 },
-            PlaneDesc { offset: 0, stride: 0 },
-        ],
-    };
+    let msg = FrameMessage::new(3392, 2400);
     assert!(msg.carries_fds());
-    msg.set_carries_fds(false);
-    assert!(!msg.carries_fds());
-    msg.set_carries_fds(true);
 
     let bytes = encode(&Message::Frame(msg, vec![fd]));
-    assert_eq!(bytes.len(), 80);
+    assert_eq!(bytes.len(), 16);
     assert_eq!(bytes[0..4], *b"LAND");
     assert_eq!(fd_count(&Message::Frame(msg, vec![])), 1);
     insta::assert_debug_snapshot!(&bytes);
 }
 
 #[test]
-fn golden_ack() {
-    let msg = FrameAck::new(42);
-    let bytes = encode(&Message::Ack(msg));
-    assert_eq!(bytes.len(), 16);
-    assert_eq!(bytes[0..4], *b"FACK");
+fn golden_release() {
+    let msg = ReleaseMessage::new();
+    let bytes = encode(&Message::Release(msg));
+    assert_eq!(bytes.len(), 8);
+    assert_eq!(bytes[0..4], *b"RLSE");
     insta::assert_debug_snapshot!(&bytes);
 }
 
@@ -168,41 +124,12 @@ fn golden_touch() {
     insta::assert_debug_snapshot!(&bytes);
 }
 
-// P-03: golden bytes for v2 messages (§4.8 KeyMessage, §4.9 BufferReady, §4.3 FENCE)
-
 #[test]
 fn keym_message_golden() {
     let msg = KeyMessage::new(30, 1, 12345);
     let bytes = encode(&Message::Key(msg));
     assert_eq!(bytes.len(), 16);
     assert_eq!(bytes[0..4], *b"KEYM");
-    insta::assert_debug_snapshot!(&bytes);
-}
-
-#[test]
-fn frame_carries_fence_golden() {
-    let mut msg = FrameMessage {
-        magic: MAGIC_LAND,
-        num_planes: 0,
-        serial: 43,
-        modifier: DRM_FORMAT_MOD_LINEAR,
-        width: 3392,
-        height: 2400,
-        drm_format: DRM_FORMAT_ABGR8888,
-        flags: FRAME_CARRIES_FENCE,
-        buffer_id: 2,
-        _reserved: 0,
-        planes: [PlaneDesc { offset: 0, stride: 0 }; 4],
-    };
-    assert!(msg.carries_fence());
-    msg.set_carries_fence(false);
-    assert!(!msg.carries_fence());
-    msg.set_carries_fence(true);
-
-    let bytes = encode(&Message::Frame(msg, vec![]));
-    assert_eq!(bytes.len(), 80);
-    assert_eq!(bytes[0..4], *b"LAND");
-    assert_eq!(fd_count(&Message::Frame(msg, vec![])), 1);
     insta::assert_debug_snapshot!(&bytes);
 }
 
@@ -213,7 +140,7 @@ fn frame_carries_fence_golden() {
 fn decode_roundtrip(msg: &Message) -> Result<Message, ProtoError> {
     let bytes = encode(msg);
     let fds: Vec<_> = match msg {
-        Message::Frame(m, fds) if m.carries_fds() || m.carries_fence() => fds
+        Message::Frame(m, fds) if m.carries_fds() => fds
             .iter()
             .map(|fd| fd.try_clone().unwrap())
             .collect(),
@@ -240,8 +167,8 @@ proptest! {
     }
 
     #[test]
-    fn rt_ack(serial in 0u64..) {
-        let msg = Message::Ack(FrameAck::new(serial));
+    fn rt_release(_dummy in 0u32..1) {
+        let msg = Message::Release(ReleaseMessage::new());
         let got = decode_roundtrip(&msg)?;
         assert_eq!(got, msg);
     }
@@ -254,67 +181,18 @@ proptest! {
     }
 
     #[test]
-    fn rt_frame(
-        num_planes in 1u32..=4u32,
-        serial in 0u64..,
-        modifier in 0u64..,
-        width in 100u32..8000,
-        height in 100u32..8000,
-        format in 0u32..,
-        flags in 0u32..2,
-        buffer_id in 0u32..1024,
-        offset0 in 0u32..65535, stride0 in 256u32..65535,
-        offset1 in 0u32..65535, stride1 in 0u32..65535,
-        offset2 in 0u32..65535, stride2 in 0u32..65535,
-        offset3 in 0u32..65535, stride3 in 0u32..65535,
-    ) {
-        let mut msg = FrameMessage {
-            magic: MAGIC_LAND,
-            num_planes,
-            serial,
-            modifier,
-            width,
-            height,
-            drm_format: format,
-            flags,
-            buffer_id,
-            _reserved: 0,
-            planes: [
-                PlaneDesc { offset: offset0, stride: stride0 },
-                PlaneDesc { offset: offset1, stride: stride1 },
-                PlaneDesc { offset: offset2, stride: stride2 },
-                PlaneDesc { offset: offset3, stride: stride3 },
-            ],
-        };
+    fn rt_frame(width in 100u32..8000, height in 100u32..8000) {
+        let msg = FrameMessage::new(width, height);
+        let fds = vec![memfd_fake_dmabuf(1024)];
+        let got = decode_roundtrip(&Message::Frame(msg, fds))?;
 
-        // For rt, always carry fds if num_planes > 0
-        if num_planes > 0 {
-            msg.flags |= FRAME_CARRIES_FDS;
-        }
-
-        let fds: Vec<_> = (0..num_planes as usize)
-            .map(|_| memfd_fake_dmabuf(1024))
-            .collect();
-
-        let _bytes = encode(&Message::Frame(msg, vec![]));
-        let msg_with_fds = Message::Frame(msg, fds);
-        let got = decode_roundtrip(&msg_with_fds)?;
-
-        // Compare fields (ignore fds which are just memfds)
         match &got {
             Message::Frame(got_m, _) => {
                 assert_eq!(got_m.magic, msg.magic);
-                assert_eq!(got_m.serial, msg.serial);
-                assert_eq!(got_m.modifier, msg.modifier);
                 assert_eq!(got_m.width, msg.width);
                 assert_eq!(got_m.height, msg.height);
-                assert_eq!(got_m.drm_format, msg.drm_format);
                 assert_eq!(got_m.flags, msg.flags);
-                assert_eq!(got_m.buffer_id, msg.buffer_id);
-                assert_eq!(got_m.num_planes, msg.num_planes);
-                for i in 0..4 {
-                    assert_eq!(got_m.planes[i], msg.planes[i]);
-                }
+                assert!(got_m.carries_fds());
             }
             _ => panic!("expected Frame"),
         }
@@ -325,59 +203,6 @@ proptest! {
         let msg = Message::Key(KeyMessage::new(keycode, state, time_ms));
         let got = decode_roundtrip(&msg)?;
         assert_eq!(got, msg);
-    }
-
-    #[test]
-    fn rt_frame_fence(
-        num_planes in 1u32..=4u32,
-        serial in 0u64..,
-        width in 100u32..8000,
-        height in 100u32..8000,
-        buffer_id in 0u32..1024,
-        offset0 in 0u32..65535, stride0 in 256u32..65535,
-    ) {
-        // P-08b: FRAME_CARRIES_FENCE ⇒ exactly 1 fence fd alongside
-        let msg = FrameMessage {
-            magic: MAGIC_LAND,
-            num_planes,
-            serial,
-            modifier: 0,
-            width,
-            height,
-            drm_format: DRM_FORMAT_ABGR8888,
-            flags: FRAME_CARRIES_FENCE,
-            buffer_id,
-            _reserved: 0,
-            planes: [
-                PlaneDesc { offset: offset0, stride: stride0 },
-                PlaneDesc { offset: 0, stride: 0 },
-                PlaneDesc { offset: 0, stride: 0 },
-                PlaneDesc { offset: 0, stride: 0 },
-            ],
-        };
-        assert_eq!(fd_count(&Message::Frame(msg, vec![])), 1);
-
-        let fds = vec![memfd_fake_dmabuf(64)];
-        let msg_with_fds = Message::Frame(msg, fds);
-        let got = decode_roundtrip(&msg_with_fds)?;
-
-        match &got {
-            Message::Frame(got_m, _) => {
-                assert_eq!(got_m.magic, msg.magic);
-                assert_eq!(got_m.serial, msg.serial);
-                assert_eq!(got_m.width, msg.width);
-                assert_eq!(got_m.height, msg.height);
-                assert_eq!(got_m.drm_format, msg.drm_format);
-                assert_eq!(got_m.flags, msg.flags);
-                assert_eq!(got_m.buffer_id, msg.buffer_id);
-                assert_eq!(got_m.num_planes, msg.num_planes);
-                assert!(got_m.carries_fence());
-                for i in 0..4 {
-                    assert_eq!(got_m.planes[i], msg.planes[i]);
-                }
-            }
-            _ => panic!("expected Frame"),
-        }
     }
 }
 
@@ -405,10 +230,10 @@ fn decode_bad_length() {
 
 #[test]
 fn decode_truncated_frame() {
-    let mut buf = [0u8; 40]; // LAND needs 80 bytes
+    let mut buf = [0u8; 8]; // LAND needs 16 bytes
     buf[0..4].copy_from_slice(b"LAND");
     let err = decode(&buf, vec![]).unwrap_err();
-    assert_eq!(err, ProtoError::BadLength { expected: 80, got: 40 });
+    assert_eq!(err, ProtoError::BadLength { expected: 16, got: 8 });
 }
 
 #[test]
@@ -419,130 +244,50 @@ fn decode_truncated_keym() {
     assert_eq!(err, ProtoError::BadLength { expected: 16, got: 8 });
 }
 
+#[test]
+fn decode_truncated_release() {
+    let mut buf = [0u8; 4]; // RLSE needs 8 bytes
+    buf[0..4].copy_from_slice(b"RLSE");
+    let err = decode(&buf, vec![]).unwrap_err();
+    assert_eq!(err, ProtoError::BadLength { expected: 8, got: 4 });
+}
+
 // =============================================================================
-// P-08, P-09: FD counts in Frame
+// P-08: FD counts in Frame
 // =============================================================================
 
 #[test]
-fn frame_carries_fds_reports_plane_count() {
-    let fd = memfd_fake_dmabuf(1024);
-    let msg = Message::Frame(
-        FrameMessage {
-            magic: MAGIC_LAND,
-            num_planes: 2,
-            serial: 1,
-            modifier: 0,
-            width: 1920,
-            height: 1080,
-            drm_format: 0,
-            flags: FRAME_CARRIES_FDS,
-            buffer_id: 1,
-            _reserved: 0,
-            planes: [PlaneDesc { offset: 0, stride: 0 }; 4],
-        },
-        vec![fd],
-    );
-    assert_eq!(fd_count(&msg), 2);
+fn frame_carries_fds_reports_one() {
+    let msg = Message::Frame(FrameMessage::new(1920, 1080), vec![memfd_fake_dmabuf(1024)]);
+    assert_eq!(fd_count(&msg), 1);
 }
 
 #[test]
 fn frame_without_fds_reports_zero() {
-    let msg = Message::Frame(
-        FrameMessage {
-            magic: MAGIC_LAND,
-            num_planes: 2,
-            serial: 1,
-            modifier: 0,
-            width: 1920,
-            height: 1080,
-            drm_format: 0,
-            flags: 0,
-            buffer_id: 1,
-            _reserved: 0,
-            planes: [PlaneDesc { offset: 0, stride: 0 }; 4],
-        },
-        vec![],
-    );
-    assert_eq!(fd_count(&msg), 0);
-}
-
-fn fence_frame(flags: u32, num_planes: u32) -> FrameMessage {
-    FrameMessage {
-        magic: MAGIC_LAND,
-        num_planes,
-        serial: 1,
-        modifier: 0,
-        width: 1920,
-        height: 1080,
-        drm_format: 0,
-        flags,
-        buffer_id: 1,
-        _reserved: 0,
-        planes: [PlaneDesc { offset: 0, stride: 0 }; 4],
-    }
+    let msg = FrameMessage::new(1920, 1080);
+    assert_eq!(fd_count(&Message::Frame(msg, vec![])), 1, "frames always carry the pixel fd");
 }
 
 #[test]
-fn frame_fence_requires_exactly_one_fd() {
-    // P-08b: FRAME_CARRIES_FENCE ⇔ exactly 1 fence fd
-    let msg = Message::Frame(fence_frame(FRAME_CARRIES_FENCE, 0), vec![memfd_fake_dmabuf(64)]);
-    assert_eq!(fd_count(&msg), 1);
-    let got = decode_roundtrip(&msg).unwrap();
-    match got {
-        Message::Frame(m, _) => assert!(m.carries_fence()),
-        _ => panic!("expected Frame"),
-    }
-}
-
-#[test]
-fn frame_fence_missing_fd_is_fd_mismatch() {
-    // P-08b: FENCE set but no fd → FdMismatch
-    let bytes = encode(&Message::Frame(fence_frame(FRAME_CARRIES_FENCE, 0), vec![]));
+fn frame_missing_fd_is_fd_mismatch() {
+    let bytes = encode(&Message::Frame(FrameMessage::new(1920, 1080), vec![]));
     let err = decode(&bytes, vec![]).unwrap_err();
     assert_eq!(err, ProtoError::FdMismatch { expected: 1, got: 0 });
 }
 
 #[test]
-fn frame_fence_extra_fd_is_fd_mismatch() {
-    // P-08b: FENCE set with 2 fds → FdMismatch
-    let bytes = encode(&Message::Frame(fence_frame(FRAME_CARRIES_FENCE, 0), vec![]));
+fn frame_extra_fd_is_fd_mismatch() {
+    let bytes = encode(&Message::Frame(FrameMessage::new(1920, 1080), vec![]));
     let fds = vec![memfd_fake_dmabuf(64), memfd_fake_dmabuf(64)];
     let err = decode(&bytes, fds).unwrap_err();
     assert_eq!(err, ProtoError::FdMismatch { expected: 1, got: 2 });
 }
 
 #[test]
-fn frame_fence_and_fds_carry_planes_plus_one() {
-    // P-08b: FENCE + FDS coexist → num_planes + 1 fds
-    let msg = Message::Frame(
-        fence_frame(FRAME_CARRIES_FDS | FRAME_CARRIES_FENCE, 2),
-        vec![],
-    );
-    assert_eq!(fd_count(&msg), 3);
-    let fds = vec![
-        memfd_fake_dmabuf(1024),
-        memfd_fake_dmabuf(1024),
-        memfd_fake_dmabuf(64),
-    ];
-    let bytes = encode(&msg);
-    let got = decode(&bytes, fds).unwrap();
-    match got {
-        Message::Frame(m, got_fds) => {
-            assert_eq!(got_fds.len(), 3);
-            assert!(m.carries_fds() && m.carries_fence());
-        }
-        _ => panic!("expected Frame"),
-    }
-}
-
-#[test]
-fn reuse_frame_requires_zero_fds() {
-    // P-09: reuse frame (flags=0) requires 0 fds; extra fd → FdMismatch
-    let msg = Message::Frame(fence_frame(0, 0), vec![]);
-    assert_eq!(fd_count(&msg), 0);
-    let bytes = encode(&msg);
-    let err = decode(&bytes, vec![memfd_fake_dmabuf(64)]).unwrap_err();
-    assert_eq!(err, ProtoError::FdMismatch { expected: 0, got: 1 });
+fn release_carries_no_fds() {
+    let bytes = encode(&Message::Release(ReleaseMessage::new()));
+    let got = decode(&bytes, vec![]).unwrap();
+    assert!(matches!(got, Message::Release(_)));
 }
 
 // =============================================================================
@@ -554,22 +299,7 @@ fn reuse_frame_requires_zero_fds() {
 fn fd_count_guard_no_leak_roundtrip() {
     let guard = FdCountGuard::new("fd-no-leak-rt");
     let fd = memfd_fake_dmabuf(1024);
-    let msg = Message::Frame(
-        FrameMessage {
-            magic: MAGIC_LAND,
-            num_planes: 1,
-            serial: 1,
-            modifier: 0,
-            width: 1920,
-            height: 1080,
-            drm_format: 0,
-            flags: FRAME_CARRIES_FDS,
-            buffer_id: 1,
-            _reserved: 0,
-            planes: [PlaneDesc { offset: 0, stride: 0 }; 4],
-        },
-        vec![fd],
-    );
+    let msg = Message::Frame(FrameMessage::new(1920, 1080), vec![fd]);
     let decoded = decode_roundtrip(&msg).unwrap();
     drop(decoded);
     drop(msg);

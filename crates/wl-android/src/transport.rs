@@ -197,14 +197,12 @@ impl Transport {
             return 0;
         }
         let magic = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
-        // FrameMessage layout: magic@0, num_planes@4, ..., flags@36.
-        if magic != proto::MAGIC_LAND || body.len() < 40 {
+        // FrameMessage layout: magic@0, width@4, height@8, flags@12.
+        if magic != proto::MAGIC_LAND || body.len() < 16 {
             return 0;
         }
-        let num_planes = u32::from_le_bytes([body[4], body[5], body[6], body[7]]) as usize;
-        let flags = u32::from_le_bytes([body[36], body[37], body[38], body[39]]);
-        (if flags & proto::FRAME_CARRIES_FDS != 0 { num_planes } else { 0 })
-            + (if flags & proto::FRAME_CARRIES_FENCE != 0 { 1 } else { 0 })
+        let flags = u32::from_le_bytes([body[12], body[13], body[14], body[15]]);
+        if flags & proto::FRAME_CARRIES_FDS != 0 { 1 } else { 0 }
     }
 
     fn recv_raw_inner(&mut self, flags: MsgFlags) -> io::Result<(Vec<u8>, Vec<OwnedFd>)> {
@@ -256,52 +254,10 @@ impl AsRawFd for Transport {
 mod tests {
     use super::*;
     use std::os::unix::net::UnixStream;
-    use wl_android_common::proto::HelloMessage;
-
-    // X-04: fd leak guard — /proc/self/fd is process-global, so guard tests are
-    // only deterministic while no other fd-touching test runs concurrently.
-    // Combine with `--test-threads=1` (the crate's established convention).
-    static FD_GUARD_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-
-    fn fd_guard_lock() -> &'static std::sync::Mutex<()> {
-        FD_GUARD_LOCK.get_or_init(|| std::sync::Mutex::new(()))
-    }
-
-    struct FdCountGuard {
-        initial: usize,
-        label: &'static str,
-    }
-
-    impl FdCountGuard {
-        fn new(label: &'static str) -> Self {
-            let initial = std::fs::read_dir("/proc/self/fd")
-                .map(|entries| entries.count())
-                .unwrap_or(0);
-            Self { initial, label }
-        }
-    }
-
-    impl Drop for FdCountGuard {
-        fn drop(&mut self) {
-            let current = std::fs::read_dir("/proc/self/fd")
-                .map(|entries| entries.count())
-                .unwrap_or(0);
-            assert_eq!(
-                current, self.initial,
-                "FdCountGuard [{}]: fd count changed: {} != {} (leak detected)",
-                self.label, current, self.initial
-            );
-        }
-    }
 
     fn socketpair() -> (UnixStream, UnixStream) {
         UnixStream::pair().expect("socketpair")
     }
-
-
-    // GraphicBuffer::flatten wire format (what AHardwareBuffer_sendHandleToUnixSocket
-    // actually sends on Android 15+): 13-int 'GB01' header + ints; fds via
-    // SCM_RIGHTS. transportNumFds at word 10, transportNumInts at word 11.
 
     fn poll_recv(t: &mut Transport) -> Message {
         for _ in 0..100 {
@@ -319,13 +275,13 @@ mod tests {
     /// dup through SCM_RIGHTS must still be a socket).
 
     #[test]
-    fn send_recv_hello_roundtrip() {
+    fn send_recv_config_roundtrip() {
         let (srv, cli) = socketpair();
         let mut transport = Transport::new(srv).unwrap();
         let mut reader = Transport::new(cli).unwrap();
 
-        let helo = HelloMessage::default();
-        transport.send(&Message::Hello(helo)).unwrap();
+        let conf = proto::ConfigMessage::new(800, 600, 60000, 96, 0, 0);
+        transport.send(&Message::Config(conf)).unwrap();
 
         // Non-blocking recv: data may arrive asynchronously
         let mut attempts = 0;
@@ -341,7 +297,7 @@ mod tests {
                 }
             }
         };
-        assert!(matches!(received, Message::Hello(_)));
+        assert!(matches!(received, Message::Config(_)));
     }
 
 

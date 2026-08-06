@@ -1,11 +1,12 @@
 // mock-client — lightweight binary that tests the wl-android protocol.
-// Connects to land.sock, does HELO→CONF handshake, sends touch events, receives frames.
+// Connects to land.sock, sends CONF event + touch events, receives frames,
+// replies with RELEASE (stateless protocol: no handshake, no ack).
 // No Smithay/Vulkan dependencies — just nix + wl-android-common.
 
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use wl_android_common::proto;
-use wl_android_common::proto::{ConfigMessage, FrameAck, Message};
+use wl_android_common::proto::{ConfigMessage, Message};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let socket_path = std::env::args()
@@ -16,13 +17,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut stream = UnixStream::connect(&socket_path)?;
     println!("Connected");
 
-    // Receive HELO
-    let (data, _fds) = recv_raw(&mut stream)?;
-    let msg = proto::decode(&data, vec![])?;
-    assert!(matches!(msg, Message::Hello(_)), "expected HELO");
-    println!("✅ HELO");
-
-    // Send CONF (3392x2400 @144Hz, 289 DPI, blit mode)
+    // Send CONF (3392x2400 @144Hz, 289 DPI) — a plain event, no handshake.
     let conf = ConfigMessage::new(3392, 2400, 144000, 289, 0, 0);
     send_msg(&mut stream, &Message::Config(conf))?;
     println!("✅ CONF");
@@ -43,15 +38,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Try to receive a frame
     stream.set_read_timeout(Some(std::time::Duration::from_secs(3)))?;
     match recv_raw(&mut stream) {
-        Ok((data, _)) => {
-            let msg = proto::decode(&data, vec![])?;
+        Ok((data, fds)) => {
+            let msg = proto::decode(&data, fds)?;
             match msg {
                 Message::Frame(fm, _) => {
-                    println!("✅ Frame: serial={} {}x{}", fm.serial, fm.width, fm.height);
-                    send_msg(&mut stream, &Message::Ack(FrameAck::new(fm.serial)))?;
-                    println!("✅ Ack sent");
+                    println!("✅ Frame: {}x{} fds={}", fm.width, fm.height, fm.carries_fds());
+                    send_msg(&mut stream, &Message::Release(proto::ReleaseMessage::new()))?;
+                    println!("✅ RELEASE sent");
                 }
-                Message::Config(c) => {
+                Message::ConfigUpdate(c) => {
                     println!("📐 Config update: {}x{} @{}mHz", c.width, c.height, c.refresh_millihz);
                 }
                 _ => println!("📩 Other message: {msg:?}"),

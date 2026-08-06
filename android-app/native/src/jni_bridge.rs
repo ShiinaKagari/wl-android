@@ -133,7 +133,7 @@ fn copy_row_bgra(
 /// SHM/CPU render path: BGRX→BGRA row copy into the ANativeWindow via
 /// `ANativeWindow_lock`. This is the only presentation path (SHM-only
 /// protocol — frames are pixel fds).
-pub fn render_frame(serial: u64, width: u32, height: u32, pixel_data: &[u8]) -> Result<(), String> {
+pub fn render_frame(width: u32, height: u32, pixel_data: &[u8]) -> Result<(), String> {
     let guard = WINDOW.lock().unwrap();
     let window = match *guard {
         Some(w) if w != 0 => w,
@@ -226,7 +226,7 @@ pub fn render_frame(serial: u64, width: u32, height: u32, pixel_data: &[u8]) -> 
     }
 
     unsafe { wl_unlock_and_post(window as _); }
-    log::debug!("render_frame: serial={serial} {}x{}", width, height);
+    log::debug!("render_frame: {}x{}", width, height);
     Ok(())
 }
 
@@ -234,7 +234,6 @@ pub fn render_frame(serial: u64, width: u32, height: u32, pixel_data: &[u8]) -> 
 /// the fd; this runs on the dedicated render thread). fstat-guarded mmap of
 /// the fd, then the same BGRX→BGRA row copy as `render_frame`, then munmap.
 pub fn render_frame_fd(
-    serial: u64,
     width: u32,
     height: u32,
     pixel_fd: &std::os::fd::OwnedFd,
@@ -267,7 +266,7 @@ pub fn render_frame_fd(
     }
     // SAFETY: ptr is a live readable mapping of map_len bytes (fstat-guarded).
     let slice = unsafe { std::slice::from_raw_parts(ptr as *const u8, map_len) };
-    let result = render_frame(serial, width, height, slice);
+    let result = render_frame(width, height, slice);
     unsafe { libc::munmap(ptr, map_len); }
     result
 }

@@ -37,14 +37,16 @@ use smithay::wayland::presentation::Refresh;
 use tracing::info;
 use wayland_protocols::xdg::shell::server::xdg_toplevel;
 
-use crate::app_link::{AppSession, SessionMode};
+use crate::app_link::AppSession;
 use crate::frame_cache::FrameCache;
 use crate::touch::TouchInjector;
 use wl_android_common::proto::{TouchMessage, TOUCH_PHASE_DOWN, TOUCH_PHASE_MOVE, TOUCH_PHASE_UP};
 
 enum ExtractedFrame {
-    /// SHM frame extracted directly into the FrameCache memfd.
-    Shm(u32, u32, OwnedFd),
+    /// SHM frame extracted directly into the FrameCache memfd. The fd is
+    /// None when the frame was DROPPED (target buffer still in the App's
+    /// hands — latest-wins, no fd to send).
+    Shm(u32, u32, Option<OwnedFd>),
 }
 
 
@@ -137,8 +139,8 @@ fn extract_from_buffer(
     let (sw, sh) = shm::with_buffer_contents(&wl_buffer, |_ptr, _len, data| {
         (data.stride as u32 / 4, data.height as u32)
     }).unwrap_or((0, 0));
-    if let Some(fd) = shm_result {
-            return Some(ExtractedFrame::Shm(sw, sh, fd));
+    if shm_result.is_some() {
+            return Some(ExtractedFrame::Shm(sw, sh, shm_result));
         }
 
 
@@ -411,9 +413,8 @@ impl WlState {
 
         // Push the bucketed DPI back so the App's HiDPI scale matches the
         // geometry we advertise to KWin (289 → 288 keeps an integer 2× scale).
-        if let Some(session) = &mut self.app_session
-            && session.mode() == SessionMode::Active
-        {
+        // Stateless protocol: a connected App is always ready for this event.
+        if let Some(session) = &mut self.app_session {
             let _ = session.send_config_update(w, h, refresh_millihz, Self::bucket_dpi(dpi), frame_mode);
         }
     }
@@ -499,13 +500,6 @@ impl CompositorHandler for WlState {
 
     fn commit(&mut self, surface: &WlSurface) {
         tracing::info!("surface commit");
-
-        let buffer_id = {
-            use std::hash::{Hash, Hasher};
-            let mut h = std::collections::hash_map::DefaultHasher::new();
-            surface.hash(&mut h);
-            h.finish() as u32
-        };
         {
             let extracted: Option<ExtractedFrame> = 'extract: {
                 let parent_data = compositor::with_states(surface, |states| {
@@ -562,17 +556,16 @@ impl CompositorHandler for WlState {
             match extracted {
                 Some(ExtractedFrame::Shm(bw, bh, fd)) => {
                     tracing::info!(bw, bh, "frame extracted from SHM");
-                    let seq = self.frame_cache.as_ref().map(|c| c.seq()).unwrap_or(0);
-                    let paced = self.pacing_gate();
-                    if let Some(session) = &mut self.app_session
-                        && session.mode() == SessionMode::Active
-                        && paced
-                    {
-                        let serial = seq;
-                        tracing::info!(serial, bw, bh, "sending frame to App");
-                        let _ = session.send_frame(
-                            serial, buffer_id, bw, bh, bw, bh, Some(fd), None,
-                        );
+                    // push_damaged returned None when the target buffer was
+                    // still in the App's hands (frame dropped, latest-wins).
+                    if fd.is_some() {
+                        let paced = self.pacing_gate();
+                        if let Some(session) = &mut self.app_session
+                            && paced
+                        {
+                            tracing::info!(bw, bh, "sending frame to App");
+                            let _ = session.send_frame(bw, bh, fd.expect("fd checked above"));
+                        }
                     }
                 }
                 None => {
@@ -584,18 +577,15 @@ impl CompositorHandler for WlState {
                             Err(e) => tracing::error!(err = %e, "FrameCache::new failed"),
                         }
                     }
+                    let paced = self.pacing_gate();
                     if let Some(cache) = &mut self.frame_cache {
                         if let Some(fd) = cache.current_frame() {
-                            let paced = self.pacing_gate();
                             if let Some(session) = &mut self.app_session
-                                && session.mode() == SessionMode::Active
                                 && paced
                             {
-                                let (fd, seq, cw, ch) = fd;
-                                let _ = session.send_frame(
-                                    seq, buffer_id, self.screen_width, self.screen_height,
-                                    cw, ch, Some(fd), None,
-                                );
+                                let (fd, _seq, cw, ch) = fd;
+                                cache.mark_current_in_flight();
+                                let _ = session.send_frame(cw, ch, fd);
                             }
                         }
                     }

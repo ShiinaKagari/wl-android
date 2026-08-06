@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::num::NonZeroUsize;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
@@ -79,6 +80,11 @@ pub struct FrameCache {
     /// A buffer whose content has never been written (fresh after build or
     /// resize) must be filled entirely on first use.
     valid: Vec<bool>,
+    /// FIFO of buffers whose pixel fd is currently held by the App (sent but
+    /// not yet released). A release pops the OLDEST entry — the App consumes
+    /// frames in order, so FIFO ownership tracking is exact. A buffer still
+    /// in this queue must not be written (the App may be reading it).
+    in_flight: VecDeque<usize>,
 }
 
 // SAFETY: `maps` are pointers into private memfds; FrameCache is not Send/Sync
@@ -118,6 +124,7 @@ impl FrameCache {
             height,
             pending: vec![Vec::new(), Vec::new()],
             valid: vec![false, false],
+            in_flight: VecDeque::new(),
         })
     }
 
@@ -232,6 +239,12 @@ impl FrameCache {
     /// Every commit must pass its damage rects here (possibly empty: a
     /// zero-damage commit still advances the rotation so the App sees a
     /// fresh fd for the unchanged frame).
+    ///
+    /// Returns None when the target buffer is still held by the App (in
+    /// flight): the frame is DROPPED (latest-wins) — the damage is still
+    /// accumulated so the next writable buffer catches up, but no fd is sent.
+    /// On success the written buffer is automatically marked in flight (the
+    /// App must release it before it can be written again).
     pub fn push_damaged<F: FnOnce(&mut [u8], &[Rect])>(
         &mut self,
         width: u32,
@@ -241,6 +254,13 @@ impl FrameCache {
     ) -> Option<OwnedFd> {
         let needed = width as usize * height as usize * 4;
         if !self.ensure_size(self.next, needed) {
+            return None;
+        }
+
+        // The App still holds the target buffer's fd — writing now would
+        // race its read. Drop the frame (latest-wins); the pending list
+        // below still records the damage for the next writable turn.
+        if self.in_flight.contains(&self.next) {
             return None;
         }
 
@@ -266,7 +286,18 @@ impl FrameCache {
         write(dst, &effective);
         self.pending[self.next].clear();
         self.valid[self.next] = true;
-        self.rotate(needed)
+        let fd = self.rotate(needed);
+        if fd.is_some() {
+            self.in_flight.push_back(self.current);
+        }
+        fd
+    }
+
+    /// The App finished consuming the most recently received frame: the
+    /// OLDEST in-flight buffer is freed (FIFO — the App consumes in order).
+    /// Extra releases (when no buffer is in flight) are ignored.
+    pub fn on_release(&mut self) {
+        self.in_flight.pop_front();
     }
 
     /// Insert `r` into `list`, merging with any overlapping/adjacent rect so
@@ -327,6 +358,15 @@ impl FrameCache {
             Some((unsafe { OwnedFd::from_raw_fd(raw) }, self.seq, self.width, self.height))
         } else {
             None
+        }
+    }
+
+    /// Mark the current buffer as handed to the App (used by the reconnect
+    /// replay path, which hands out `current_frame`'s dup'd fd without going
+    /// through `push_damaged`). No-op when the buffer is already in flight.
+    pub fn mark_current_in_flight(&mut self) {
+        if !self.in_flight.contains(&self.current) {
+            self.in_flight.push_back(self.current);
         }
     }
 
@@ -743,6 +783,8 @@ mod tests {
                 }
             })
             .expect("frame 1");
+        // App consumed frame 1's fd — the buffer returns to the writable pool.
+        cache.on_release();
         // Frame 2: full write of pattern 2 into buffer B (first write after a
         // fresh pool is always a full frame, even for a small reported rect).
         cache
@@ -753,6 +795,7 @@ mod tests {
                 }
             })
             .expect("frame 2");
+        cache.on_release();
 
         // Frame 3: only the top-left 2x2 rect changed (pattern 3) in buffer A,
         // which already holds frame 1's pattern.
@@ -812,6 +855,9 @@ mod tests {
         let r1 = Rect { x: 0, y: 0, w: 1, h: 1 };
         let r2 = Rect { x: 2, y: 2, w: 1, h: 1 };
         let f3 = fill_pattern(4, 4, 3);
+        // Frame N's buffer is still in flight; N+1's is not. To write A again
+        // the App must have released frame N's fd (FIFO: oldest first).
+        cache.on_release();
         let fd = cache
             .push_damaged(4, 4, &[r2], |dst, effective| {
                 let mut expected = vec![r1, r2];

@@ -1,10 +1,10 @@
 use std::io;
 use std::os::unix::net::UnixListener;
 
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::transport::Transport;
-use wl_android_common::proto::{self, HelloMessage, Message, PROTOCOL_VERSION};
+use wl_android_common::proto::{self, Message};
 
 // ── Listener ──
 
@@ -25,113 +25,31 @@ pub fn create_listener(path: &str) -> io::Result<UnixListener> {
 }
 
 // ── Session ──
+//
+// Stateless session: no handshake, no serial, no ack. The server pushes the
+// current frame whenever KWin commits (the App replies with RELEASE to hand
+// the memfd back); the App sends CONF/TOUC/KEYM as plain events. Every
+// message is independently processable — there is no ordering contract.
 
 pub struct AppSession {
     transport: Transport,
-    mode: SessionMode,
-    sent_helo: bool,
-    server_caps: u32,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum SessionMode {
-    Handshake,
-    Active,
 }
 
 impl AppSession {
     pub fn new(transport: Transport) -> Self {
-        Self { transport, mode: SessionMode::Handshake, sent_helo: false, server_caps: 0 }
+        Self { transport }
     }
 
-    pub fn mode(&self) -> SessionMode {
-        self.mode
-    }
-
-    pub fn do_handshake(&mut self) -> io::Result<bool> {
-        if !self.sent_helo {
-            let mut helo = HelloMessage::default();
-            // SHM/CPU frame path: advertise the SHM cap so the App skips the
-            // Vulkan swapchain (CPU lock + swapchain conflict) and presents
-            // pixel frames via the CPU path. The blit path was removed — the
-            // only frame path is SHM memfd forwarding.
-            helo.server_caps |= proto::SERVER_CAP_SHM;
-            self.server_caps = helo.server_caps;
-            self.transport.send(&Message::Hello(helo))?;
-            info!("sent HELO (v{} caps={:#x})", PROTOCOL_VERSION, self.server_caps);
-            self.sent_helo = true;
-        }
-
-        match self.transport.recv() {
-            Ok(Some(Message::Config(conf))) => {
-                // H-03: version check
-                if conf.protocol_version != PROTOCOL_VERSION {
-                    warn!(got = conf.protocol_version, expected = PROTOCOL_VERSION, "protocol version mismatch");
-                    return Err(io::Error::new(io::ErrorKind::InvalidData, "protocol version mismatch"));
-                }
-                info!(w = conf.width, h = conf.height, "received CONF");
-                self.mode = SessionMode::Active;
-                Ok(true)
-            }
-            Ok(None) => Ok(false),
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(false),
-            Err(e) => Err(e),
-            Ok(Some(other)) => {
-                warn!(?other, "unexpected during handshake");
-                Err(io::Error::new(io::ErrorKind::InvalidData, "expected CONF"))
-            }
-        }
-    }
-
-    /// P-08/P-08b: send a frame. SHM path carries the pixel fd (plane 0);
-    /// no fence is ever attached (blit removed).
-    #[allow(clippy::too_many_arguments)] // mirrors the wire fields 1:1
+    /// Send the CURRENT frame (width/height + pixel fd). The App replies
+    /// with a RELEASE once it has consumed the fd.
     pub fn send_frame(
-        &mut self, frame_serial: u64, buffer_id: u32, _screen_w: u32, _screen_h: u32,
-        buf_w: u32, buf_h: u32, pixel_fd: Option<std::os::fd::OwnedFd>,
-        _fence_fd: Option<std::os::fd::OwnedFd>,
+        &mut self,
+        buf_w: u32,
+        buf_h: u32,
+        pixel_fd: std::os::fd::OwnedFd,
     ) -> io::Result<()> {
-        let mut fm = proto::FrameMessage {
-            magic: proto::MAGIC_LAND,
-            num_planes: 1,
-            serial: frame_serial,
-            modifier: 0,
-            width: buf_w,
-            height: buf_h,
-            drm_format: proto::DRM_FORMAT_ABGR8888,
-            flags: 0,
-            buffer_id,
-            _reserved: 0,
-            planes: [
-                proto::PlaneDesc { offset: 0, stride: buf_w * 4 },
-                proto::PlaneDesc { offset: 0, stride: 0 },
-                proto::PlaneDesc { offset: 0, stride: 0 },
-                proto::PlaneDesc { offset: 0, stride: 0 },
-            ],
-        };
-        let mut fds: Vec<std::os::fd::OwnedFd> = pixel_fd.into_iter().collect();
-        fm.set_carries_fds(!fds.is_empty());
-        if let Some(fence) = _fence_fd {
-            fm.set_carries_fence(true);
-            fds.push(fence);
-        }
-        self.transport.send(&Message::Frame(fm, fds))
-    }
-
-    #[allow(dead_code)]
-    pub fn try_recv_ack(&mut self) -> io::Result<Option<u64>> {
-        match self.transport.recv() {
-            Ok(Some(Message::Ack(ack))) => Ok(Some(ack.serial)),
-            Ok(None) => Ok(None), // EAGAIN
-            Ok(Some(Message::Config(_))) => Ok(None),
-            Ok(Some(Message::Touch(_))) => Ok(None), // handled by caller, not an ack
-            Ok(Some(other)) => {
-                warn!(?other, "unexpected message");
-                Ok(None)
-            }
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(None),
-            Err(e) => Err(e),
-        }
+        let fm = proto::FrameMessage::new(buf_w, buf_h);
+        self.transport.send(&Message::Frame(fm, vec![pixel_fd]))
     }
 
     /// Server → App display-geometry/DPI/refresh update. Sent when the server
@@ -144,8 +62,8 @@ impl AppSession {
     }
 
     /// Receive any message from the App (non-blocking). Pure passthrough of
-    /// the transport decode — the blit/TBUF/slot path was removed, so the
-    /// only messages expected here are Ack/Touch/Key/Config.
+    /// the transport decode — the stateless protocol only carries
+    /// Config/Touch/Key/Release.
     pub fn recv_message(&mut self) -> io::Result<Option<Message>> {
         self.transport.recv()
     }
@@ -158,6 +76,7 @@ mod tests {
     use super::*;
     use std::os::fd::{AsRawFd, OwnedFd};
     use std::os::unix::net::UnixStream;
+    use wl_android_common::proto::PROTOCOL_VERSION;
 
     // X-04: fd leak guard (process-global, serialized across tests).
     static FD_GUARD_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
@@ -193,82 +112,9 @@ mod tests {
     }
 
     #[test]
-    fn handshake_completes_with_valid_conf() {
+    fn send_frame_carries_pixel_fd_and_dimensions() {
         let _lock = fd_guard_lock().lock().unwrap();
-        let _guard = FdCountGuard::new("handshake_completes_with_valid_conf");
-        let (client, server) = socketpair();
-        let mut session = AppSession::new(Transport::new(server).unwrap());
-
-        std::thread::spawn(move || {
-            let mut client = Transport::new(client).unwrap();
-            // wait for HELO (0 fds — raw bytes suffice)
-            for _ in 0..100 {
-                if client.recv().unwrap().is_some() {
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-            let conf = proto::ConfigMessage::new(800, 600, 60000, 96, 0, 0);
-            client.send(&Message::Config(conf)).unwrap();
-        });
-
-        // do_handshake: first call sends HELO (returns Ok(false) waiting CONF),
-        // subsequent calls read CONF.
-        let _ = session.do_handshake(); // sends HELO
-        let mut done = false;
-        for _ in 0..50 {
-            if session.do_handshake().unwrap_or(false) {
-                done = true;
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        assert!(done, "handshake did not complete");
-        assert_eq!(session.mode(), SessionMode::Active);
-        assert!(session.server_caps & proto::SERVER_CAP_SHM != 0);
-    }
-
-    #[test]
-    fn frame_ack_roundtrip() {
-        let _lock = fd_guard_lock().lock().unwrap();
-        let _guard = FdCountGuard::new("frame_ack_roundtrip");
-        let (client, server) = socketpair();
-        let mut session = AppSession::new(Transport::new(server).unwrap());
-
-        let client_thread = std::thread::spawn(move || {
-            let mut client = Transport::new(client).unwrap();
-            // wait for the frame message, then ack it
-            loop {
-                match client.recv().unwrap() {
-                    Some(Message::Frame(..)) => break,
-                    Some(_) => panic!("expected Frame"),
-                    None => std::thread::sleep(std::time::Duration::from_millis(10)),
-                }
-            }
-            client.send(&Message::Ack(proto::FrameAck::new(42))).unwrap();
-        });
-
-        // send a frame
-        let fd = fake_pixel_fd();
-        session.send_frame(42, 1, 800, 600, 800, 600, Some(fd), None).unwrap();
-
-        // server reads the ack
-        let mut got = None;
-        for _ in 0..50 {
-            if let Ok(Some(serial)) = session.try_recv_ack() {
-                got = Some(serial);
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        client_thread.join().unwrap();
-        assert_eq!(got, Some(42));
-    }
-
-    #[test]
-    fn send_frame_shm_carries_pixel_fd_no_fence() {
-        let _lock = fd_guard_lock().lock().unwrap();
-        let _guard = FdCountGuard::new("send_frame_shm_carries_pixel_fd_no_fence");
+        let _guard = FdCountGuard::new("send_frame_carries_pixel_fd_and_dimensions");
         let (client, server) = socketpair();
         let mut session = AppSession::new(Transport::new(server).unwrap());
 
@@ -284,16 +130,77 @@ mod tests {
 
         let fd = fake_pixel_fd();
         let raw = fd.as_raw_fd();
-        session.send_frame(7, 2, 800, 600, 800, 600, Some(fd), None).unwrap();
+        session.send_frame(800, 600, fd).unwrap();
         let msg = client_thread.join().unwrap();
         match msg {
             Message::Frame(fm, fds) => {
-                assert!(fm.carries_fds(), "SHM frame must carry the pixel fd");
-                assert!(!fm.carries_fence(), "SHM frame must NOT carry a fence");
+                assert!(fm.carries_fds(), "frame must carry the pixel fd");
+                assert_eq!((fm.width, fm.height), (800, 600));
                 assert_eq!(fds.len(), 1);
                 assert_eq!(fds[0].as_raw_fd(), raw);
             }
             _ => panic!("expected Frame"),
         }
+    }
+
+    #[test]
+    fn release_roundtrip() {
+        let _lock = fd_guard_lock().lock().unwrap();
+        let _guard = FdCountGuard::new("release_roundtrip");
+        let (client, server) = socketpair();
+        let mut session = AppSession::new(Transport::new(server).unwrap());
+
+        let client_thread = std::thread::spawn(move || {
+            let mut client = Transport::new(client).unwrap();
+            client.send(&Message::Release(proto::ReleaseMessage::new())).unwrap();
+        });
+
+        let mut got = None;
+        for _ in 0..50 {
+            if let Ok(Some(msg)) = session.recv_message() {
+                got = Some(msg);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        client_thread.join().unwrap();
+        assert!(matches!(got, Some(Message::Release(_))), "server must receive the Release");
+    }
+
+    #[test]
+    fn config_update_roundtrip() {
+        let _lock = fd_guard_lock().lock().unwrap();
+        let _guard = FdCountGuard::new("config_update_roundtrip");
+        let (client, server) = socketpair();
+        let mut session = AppSession::new(Transport::new(server).unwrap());
+
+        let client_thread = std::thread::spawn(move || {
+            let mut client = Transport::new(client).unwrap();
+            loop {
+                match client.recv().unwrap() {
+                    Some(msg) => return msg,
+                    None => std::thread::sleep(std::time::Duration::from_millis(10)),
+                }
+            }
+        });
+
+        session.send_config_update(800, 600, 60000, 96, 0).unwrap();
+        let msg = client_thread.join().unwrap();
+        match msg {
+            Message::ConfigUpdate(c) => {
+                assert!(c.is_config_update());
+                assert_eq!((c.width, c.height), (800, 600));
+                assert_eq!(c.protocol_version, PROTOCOL_VERSION);
+            }
+            _ => panic!("expected ConfigUpdate"),
+        }
+    }
+
+    #[test]
+    fn config_version_check_uses_protocol_version() {
+        // The stateless protocol drops the handshake; CONF events still
+        // carry the version so a mismatched App is detectable.
+        let conf = proto::ConfigMessage::new(800, 600, 60000, 96, 0, 0);
+        assert_eq!(conf.protocol_version, PROTOCOL_VERSION);
     }
 }

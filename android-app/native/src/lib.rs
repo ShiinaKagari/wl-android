@@ -27,14 +27,12 @@ pub enum AppState {
 
 #[derive(Debug)]
 pub struct FrameData {
-    pub serial: u64,
-    pub buffer_id: u32,
     pub width: u32,
     pub height: u32,
-    /// RENDER-DECOUPLE: dup'd pixel fd for the SHM path. The recv thread
-    /// enqueues the fd (ownership transfer) instead of rendering inline;
-    /// the dedicated render thread mmaps it, copies into the window and
-    /// drops it. None for fence frames (pixels already in the slot).
+    /// RENDER-DECOUPLE: pixel fd for the SHM path. The recv thread enqueues
+    /// the fd (ownership transfer) instead of rendering inline; the dedicated
+    /// render thread mmaps it, copies into the window, drops it, and replies
+    /// with a RELEASE so the server can reuse the memfd.
     pub pixel_fd: Option<OwnedFd>,
 }
 
@@ -49,19 +47,14 @@ struct Inner {
     /// Wakeup goes through the process-global FRAME_CV (not a field, so the
     /// render thread's wait never borrows through the mutex it parks on).
     frame_queue: VecDeque<FrameData>,
-    /// Server capabilities from the handshake HELO (SERVER_CAP_*). The
-    /// recv thread writes it on HELO; nativeSetSurface reads it to decide
-    /// whether to init the Vulkan swapchain (SERVER_CAP_SHM ⇒ pure CPU path).
-    server_caps: Arc<std::sync::atomic::AtomicU32>,
     /// PERF-13: dedicated write path for input (Touch/Key) — a clone of the
     /// session's write stream, guarded by its own mutex so UI-thread input
     /// never contends with the recv thread's Inner lock (frame bookkeeping).
     input_write: Mutex<Option<Arc<UnixStream>>>,
-    /// CONFIG RACE: nativeOnConfig may fire before the handshake CONF is done
-    /// (onResume → collector.start() races the connection). Sending a second
-    /// CONF over the same socket mid-handshake desyncs the length-prefix
-    /// stream (the server reads 0x18 as a magic). Cache the latest config
-    /// here; flush it once the session reaches Active (handshake complete).
+    /// Stateless protocol: CONF is a plain event, so no config caching is
+    /// needed for a handshake — but nativeOnConfig can still fire before the
+    /// session exists (connection retrying), so keep the latest to send on
+    /// connect.
     pending_config: Option<(u32, u32, u32, u32, u32)>,
     /// CONN-LOOP: set by nativeDestroy to stop the reconnect thread (it owns
     /// an Arc of Inner and would otherwise retry forever).
@@ -159,7 +152,6 @@ extern "system" fn Java_com_wl_android_NativeBridge_nativeInit(
         session: None,
         state: AppState::Init,
         frame_queue: VecDeque::new(),
-        server_caps: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         input_write: Mutex::new(None),
         pending_config: None,
         stopped: std::sync::atomic::AtomicBool::new(false),
@@ -197,10 +189,6 @@ extern "system" fn Java_com_wl_android_NativeBridge_nativeInit(
                         inner.state = AppState::Handshake;
                         notify_status(AppState::Handshake);
                     }
-                    let caps = {
-                        let inner = state_clone.lock().unwrap();
-                        inner.server_caps.clone()
-                    };
                     let on_frame_state = state_clone.clone();
                     let on_connected_state = state_clone.clone();
                     let result = AppSession::run_loop(
@@ -210,14 +198,13 @@ extern "system" fn Java_com_wl_android_NativeBridge_nativeInit(
                             inner.session.as_ref().unwrap().write_stream.as_ref().try_clone()
                                 .expect("clone write stream")
                         },
-                        caps,
                         move || {
-                            // CONN-STATE: handshake complete — the session is
-                            // live even without frames (KWin may be idle).
+                            // Stateless protocol: the session is live the
+                            // moment it connects (no handshake to wait for).
                             if let Ok(mut inner) = on_connected_state.lock() {
                                 inner.state = AppState::Active;
-                                // CONFIG RACE: flush the config the UI thread
-                                // cached while the handshake was in progress.
+                                // Flush any config the UI thread cached while
+                                // the connection was retrying.
                                 if let Some((w, h, r, d, m)) = inner.pending_config.take()
                                     && let Some(ref mut session) = inner.session
                                 {
@@ -226,14 +213,14 @@ extern "system" fn Java_com_wl_android_NativeBridge_nativeInit(
                                 notify_status(AppState::Active);
                             }
                         },
-                        move |serial, buffer_id, width, height, _fence_fd: Option<OwnedFd>, pixel_fd: Option<OwnedFd>| {
-                            log::debug!("FRAME: serial={serial} {width}x{height} buf={buffer_id} pixels={}", pixel_fd.is_some());
+                        move |width, height, pixel_fd: Option<OwnedFd>| {
+                            log::debug!("FRAME: {width}x{height} pixels={}", pixel_fd.is_some());
                             // RENDER-DECOUPLE: the pixel fd is enqueued
                             // (latest-wins in the render thread); the recv
                             // thread never touches ANativeWindow.
                             if let Ok(mut inner) = on_frame_state.lock() {
                                 inner.state = AppState::Active;
-                                inner.frame_queue.push_back(FrameData { serial, buffer_id, width, height, pixel_fd });
+                                inner.frame_queue.push_back(FrameData { width, height, pixel_fd });
                                 crate::FRAME_CV.notify_one();
                             }
                         },
@@ -334,8 +321,17 @@ extern "system" fn Java_com_wl_android_NativeBridge_nativeInit(
                 };
                 if let Some(fd) = frame.pixel_fd {
                     let _ = crate::jni_bridge::render_frame_fd(
-                        frame.serial, frame.width, frame.height, &fd,
+                        frame.width, frame.height, &fd,
                     );
+                    // Stateless: the frame's pixel fd has been consumed —
+                    // release the memfd so the server can reuse it. Drop the
+                    // fd first (ownership transfer is complete).
+                    drop(fd);
+                    if let Ok(inner) = render_state.lock() {
+                        if let Some(ref session) = inner.session {
+                            let _ = session.send_release();
+                        }
+                    }
                 }
             }
         });
@@ -360,15 +356,10 @@ extern "system" fn Java_com_wl_android_NativeBridge_nativeSetSurface(
         log::error!("nativeSetSurface: unknown handle {handle}");
         return;
     };
-    let inner = state.lock().unwrap();
-    // SHM-only protocol: frames are pixel fds, rendered via ANativeWindow_lock
-    // in the render thread. There is no Vulkan swapchain to arm.
-    let caps = inner.server_caps.load(std::sync::atomic::Ordering::Relaxed);
-    if caps & wl_android_common::proto::SERVER_CAP_SHM != 0 {
-        log::info!("nativeSetSurface: SERVER_CAP_SHM — CPU presentation path");
-    } else {
-        log::warn!("nativeSetSurface: server advertises no SERVER_CAP_SHM (caps={caps:#x})");
-    }
+    let _inner = state.lock().unwrap();
+    // SHM-only stateless protocol: frames are pixel fds, rendered via
+    // ANativeWindow_lock in the render thread. No Vulkan swapchain, no caps.
+    log::info!("nativeSetSurface: surface set — CPU presentation path");
 }
 
 #[unsafe(no_mangle)]
