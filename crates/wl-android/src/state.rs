@@ -41,6 +41,7 @@ use crate::frame_cache::FrameCache;
 use crate::touch::TouchInjector;
 use wl_android_common::proto::{TouchMessage, TOUCH_PHASE_DOWN, TOUCH_PHASE_MOVE, TOUCH_PHASE_UP};
 
+#[derive(Debug)]
 enum ExtractedFrame {
     /// SHM frame extracted directly into the FrameCache memfd. The fd is
     /// None when the frame was DROPPED (target buffer still in the App's
@@ -202,10 +203,14 @@ fn extract_from_dmabuf(
             return None;
         }
     };
-    // dmabuf_sync: ensure the GPU finished writing before we read (KWin
-    // renders on the GPU; without this the copy may see a torn frame).
-    let _ = dmabuf.sync_plane(0, DmabufSyncFlags::READ | DmabufSyncFlags::START);
-    let _ = dmabuf.sync_plane(0, DmabufSyncFlags::READ | DmabufSyncFlags::END);
+    // dmabuf_sync (DMA_BUF_IOCTL_SYNC): START before the copy waits for the
+    // GPU to finish writing (implicit fence); END after the copy tells the
+    // kernel the CPU is done reading so the next GPU write is not blocked.
+    // Both are required — skipping END would leave the read fence held.
+    let sync_start = dmabuf.sync_plane(0, DmabufSyncFlags::READ | DmabufSyncFlags::START);
+    if let Err(e) = &sync_start {
+        tracing::warn!(err = ?e, "dmabuf sync START failed — reading may race the GPU");
+    }
 
     let src_ptr = mapping.ptr() as *const u8;
     let cache = if frame_cache.is_none() {
@@ -225,6 +230,10 @@ fn extract_from_dmabuf(
     cache.set_dimensions(w, h);
     let rects = damage_to_rects(damage, buffer_scale, w, h);
     let result = cache.push_damaged(w, h, &rects, |dst, effective| {
+        // Bounds use the rectangle width for the copy but the FULL row width
+        // for the stride-check — the source row may have padding after the
+        // last pixel column, so requiring the whole row in-bounds is
+        // conservative and safe.
         let row_bytes = w as usize * 4;
         for r in effective {
             for y in r.y..r.y + r.h {
@@ -245,6 +254,12 @@ fn extract_from_dmabuf(
             }
         }
     });
+
+    // END after the copy (even on copy failure — the mapping is still valid).
+    if let Err(e) = dmabuf.sync_plane(0, DmabufSyncFlags::READ | DmabufSyncFlags::END) {
+        tracing::warn!(err = ?e, "dmabuf sync END failed");
+    }
+
     result.map(|fd| ExtractedFrame::Shm(w, h, Some(fd)))
 }
 
@@ -825,7 +840,7 @@ delegate_presentation!(WlState);
 
 #[cfg(test)]
 mod tests {
-    use super::WlState;
+    use super::{ExtractedFrame, FrameCache, extract_from_dmabuf, WlState};
     use smithay::backend::input::KeyState;
 
     #[test]
@@ -862,5 +877,90 @@ mod tests {
         assert_eq!(WlState::bucket_dpi(110), 120, "midway rounds to the larger bucket");
         assert_eq!(WlState::bucket_dpi(0), 96, "degenerate input clamps to the smallest");
         assert_eq!(WlState::bucket_dpi(1000), 384, "above the largest bucket saturates");
+    }
+
+    /// Build a LINEAR dmabuf backed by a memfd with a recognizable pattern,
+    /// then run extract_from_dmabuf and verify the FrameCache holds the
+    /// pattern (damage rect copied, untouched region preserved).
+    #[test]
+    fn extract_from_linear_dmabuf_reads_pixels() {
+        use smithay::backend::allocator::dmabuf::{Dmabuf, DmabufFlags};
+        use smithay::utils::Size;
+        use std::os::fd::{AsRawFd, FromRawFd};
+
+        const W: u32 = 4;
+        const H: u32 = 4;
+
+        // memfd with pattern: each row = row index byte.
+        let size = (W * H * 4) as usize;
+        let name = std::ffi::CString::new("test-dmabuf").unwrap();
+        let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
+        assert!(fd >= 0);
+        let owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
+        assert_eq!(unsafe { libc::ftruncate(fd, size as libc::off_t) }, 0);
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                fd,
+                0,
+            )
+        };
+        assert_ne!(ptr, libc::MAP_FAILED);
+        for y in 0..H {
+            for x in 0..W * 4 {
+                unsafe { *(ptr as *mut u8).add((y * W * 4 + x) as usize) = y as u8 };
+            }
+        }
+        unsafe { libc::munmap(ptr, size) };
+
+        let mut builder = Dmabuf::builder(
+            Size::from((W as i32, H as i32)),
+            drm_fourcc::DrmFourcc::Abgr8888,
+            drm_fourcc::DrmModifier::Linear,
+            DmabufFlags::empty(),
+        );
+        assert!(builder.add_plane(owned, 0, 0, W * 4));
+        let dmabuf: Dmabuf = builder.build().expect("dmabuf");
+
+        let mut cache: Option<FrameCache> = None;
+        let frame = extract_from_dmabuf(&dmabuf, &mut cache, &[], 1);
+        let (fw, fh, fd_opt) = match frame {
+            Some(ExtractedFrame::Shm(w, h, fd)) => (w, h, fd),
+            other => panic!("expected Shm frame, got {other:?}"),
+        };
+        assert_eq!((fw, fh), (W, H));
+        let fd = fd_opt.expect("dmabuf frame must carry a pixel fd");
+
+        // Read back the FrameCache memfd and verify rows.
+        let st = unsafe {
+            let mut st: libc::stat = std::mem::zeroed();
+            assert_eq!(libc::fstat(fd.as_raw_fd(), &mut st), 0);
+            st
+        };
+        let rp = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                st.st_size as usize,
+                libc::PROT_READ,
+                libc::MAP_SHARED,
+                fd.as_raw_fd(),
+                0,
+            )
+        };
+        assert_ne!(rp, libc::MAP_FAILED);
+        let bytes = unsafe { std::slice::from_raw_parts(rp as *const u8, st.st_size as usize) };
+        for y in 0..H {
+            for x in 0..W * 4 {
+                assert_eq!(
+                    bytes[(y * W * 4 + x) as usize],
+                    y as u8,
+                    "row {y} col {x}"
+                );
+            }
+        }
+        unsafe { libc::munmap(rp, st.st_size as usize) };
     }
 }
