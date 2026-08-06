@@ -412,13 +412,11 @@ extern "system" fn Java_com_wl_android_NativeBridge_nativeOnConfig(
     if let Some(state) = find(handle) {
         let mut inner = state.lock().unwrap();
         let cfg = (w as u32, h as u32, refresh_millihz as u32, dpi as u32, frame_mode as u32);
-        // CONFIG RACE: only send once the handshake CONF is done (Active). A
-        // mid-handshake second CONF over the same socket desyncs the
-        // length-prefix stream on the server (bad magic). Cache otherwise.
-        if inner.state == AppState::Active {
-            if let Some(ref mut session) = inner.session {
-                let _ = session.send_config(cfg.0, cfg.1, cfg.2, cfg.3, cfg.4);
-            }
+        // Stateless protocol: CONF is a plain event. Send it when a session
+        // exists; otherwise cache it and flush on the next connect (the
+        // connection may still be retrying).
+        if let Some(ref mut session) = inner.session {
+            let _ = session.send_config(cfg.0, cfg.1, cfg.2, cfg.3, cfg.4);
         } else {
             inner.pending_config = Some(cfg);
         }
