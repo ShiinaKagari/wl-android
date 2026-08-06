@@ -144,112 +144,43 @@ fn run_server() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("listening on wayland socket {wayland_display}");
 
+    let event_handle = event_loop.handle();
+
     // Ensure non-root clients (kagari) can connect
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&wayland_socket_path, std::fs::Permissions::from_mode(0o666)).ok();
 
-    // Land socket — store listener in state for idle polling
+    // Land socket — store listener in state; its fd is registered as an
+    // event-driven source below so new App connections are accepted
+    // WITHOUT a poll tick (the accept loop lives in that source's callback).
+    use std::os::fd::AsRawFd;
     match app_link::create_listener(&land_socket_path) {
         Ok(listener) => {
+            let fd = listener.as_raw_fd();
             state.land_listener = Some(listener);
             info!("land socket at {land_socket_path}");
+            let accept_source: calloop::generic::Generic<std::os::fd::OwnedFd> = Generic::new(
+                unsafe { std::os::fd::FromRawFd::from_raw_fd(fd) },
+                Interest::READ,
+                Mode::Level,
+            );
+            let eh = event_handle.clone();
+            let cb = move |_readiness, _fd: &mut _, state: &mut WlState| -> std::io::Result<calloop::PostAction> {
+                accept_land_connections(state, &eh);
+                Ok(calloop::PostAction::Continue)
+            };
+            if let Err(e) = event_handle.insert_source(accept_source, cb) {
+                error!(err = %e, "failed to register land accept source");
+            }
         }
         Err(e) => {
             warn!("land socket not available: {e}");
         }
     }
 
-    let event_handle = event_loop.handle();
-
     event_loop.run(None, &mut state, |state| {
         // Dispatch pending Wayland client messages
         state.dispatch_wayland();
-
-        // ── Accept new App connections ──
-        let mut connect_actions = Vec::new();
-        let mut listener_opt = state.land_listener.take();
-        if let Some(ref mut listener) = listener_opt {
-            loop {
-                match listener.accept() {
-                    Ok((stream, _)) => {
-                        info!("App connected");
-                        if let Ok(transport) = Transport::new(stream.try_clone().expect("clone land stream")) {
-                            if state.app_session.is_some() {
-                                // C-01: replacing the old session — release its slots.
-                                state.clear_blit_pipeline_state();
-                                state.blit_engine.clear_slots();
-                                connect_actions = state.frame_router.handle(
-                                    crate::frame_router::RouterEvent::AppLost,
-                                );
-                                dispatch_router_actions(state, &connect_actions);
-                                // The old session's land source is removed by
-                                // dropping the source handle below (replace).
-                                if let Some(old_token) = state.land_source.take() {
-                                    event_handle.remove(old_token);
-                                }
-                            }
-                            state.app_session = Some(AppSession::new(transport));
-                            connect_actions = state.frame_router.handle(
-                                crate::frame_router::RouterEvent::AppConnected,
-                            );
-
-                            // PERF-13: register the land socket fd as an
-                            // event-driven source — App input (Touch/Key/Config/
-                            // Ack/Ready) wakes the loop immediately, independent
-                            // of the 16ms tick and of KWin frame processing.
-                            // The callback owns the session drain: it runs
-                            // handle_land_input once per readable fd state, and
-                            // returns Remove on session teardown so calloop
-                            // unregisters the source (the token is dropped too).
-                            let fd_clone = stream.try_clone().expect("clone land fd for source");
-                            let source = Generic::new(
-                                fd_clone,
-                                Interest::READ,
-                                Mode::Level,
-                            );
-                            let cb = |_readiness, _fd: &mut _, state: &mut WlState| -> std::io::Result<calloop::PostAction> {
-                                let lost = handle_land_input(state);
-                                if lost {
-                                    // C-02: blit mode — close all slot fds and
-                                    // destroy the VkImages.
-                                    state.clear_blit_pipeline_state();
-                                    state.blit_engine.clear_slots();
-                                    let actions = state.frame_router.handle(
-                                        crate::frame_router::RouterEvent::AppLost,
-                                    );
-                                    dispatch_router_actions(state, &actions);
-                                    state.app_session = None;
-                                    Ok(calloop::PostAction::Remove)
-                                } else {
-                                    Ok(calloop::PostAction::Continue)
-                                }
-                            };
-                            match event_handle.insert_source(source, cb) {
-                                Ok(token) => {
-                                    state.land_source = Some(token);
-                                    // Handshake is driven by the source's
-                                    // readiness (the App's HELO arrives right
-                                    // after connect); kick it here too so the
-                                    // first message is consumed even if the
-                                    // fd event raced ahead of insert_source.
-                                    let _ = handle_land_input(state);
-                                }
-                                Err(e) => {
-                                    error!(err = %e, "failed to register land source");
-                                }
-                            }
-                        }
-                    }
-                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                    Err(e) => {
-                        error!(err = %e, "accept error");
-                        break;
-                    }
-                }
-            }
-        }
-        state.land_listener = listener_opt;
-        dispatch_router_actions(state, &connect_actions);
     })?;
 
     // Cleanup on exit
@@ -260,6 +191,97 @@ fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+
+/// Accept any pending App connections on the land listener. Event-driven
+/// (called from the land accept source) — a connection wakes the loop and
+/// is accepted immediately, with no poll tick required.
+fn accept_land_connections(state: &mut WlState, event_handle: &calloop::LoopHandle<WlState>) {
+    // ── Accept new App connections ──
+    let mut connect_actions = Vec::new();
+    let mut listener_opt = state.land_listener.take();
+    if let Some(ref mut listener) = listener_opt {
+        loop {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    info!("App connected");
+                    if let Ok(transport) = Transport::new(stream.try_clone().expect("clone land stream")) {
+                        if state.app_session.is_some() {
+                            // C-01: replacing the old session — release its slots.
+                            state.clear_blit_pipeline_state();
+                            state.blit_engine.clear_slots();
+                            connect_actions = state.frame_router.handle(
+                                crate::frame_router::RouterEvent::AppLost,
+                            );
+                            dispatch_router_actions(state, &connect_actions);
+                            // The old session's land source is removed by
+                            // dropping the source handle below (replace).
+                            if let Some(old_token) = state.land_source.take() {
+                                event_handle.remove(old_token);
+                            }
+                        }
+                        state.app_session = Some(AppSession::new(transport));
+                        connect_actions = state.frame_router.handle(
+                            crate::frame_router::RouterEvent::AppConnected,
+                        );
+
+                        // PERF-13: register the land socket fd as an
+                        // event-driven source — App input (Touch/Key/Config/
+                        // Ack/Ready) wakes the loop immediately, independent
+                        // of the 16ms tick and of KWin frame processing.
+                        // The callback owns the session drain: it runs
+                        // handle_land_input once per readable fd state, and
+                        // returns Remove on session teardown so calloop
+                        // unregisters the source (the token is dropped too).
+                        let fd_clone = stream.try_clone().expect("clone land fd for source");
+                        let source = Generic::new(
+                            fd_clone,
+                            Interest::READ,
+                            Mode::Level,
+                        );
+                        let cb = |_readiness, _fd: &mut _, state: &mut WlState| -> std::io::Result<calloop::PostAction> {
+                            let lost = handle_land_input(state);
+                            if lost {
+                                // C-02: blit mode — close all slot fds and
+                                // destroy the VkImages.
+                                state.clear_blit_pipeline_state();
+                                state.blit_engine.clear_slots();
+                                let actions = state.frame_router.handle(
+                                    crate::frame_router::RouterEvent::AppLost,
+                                );
+                                dispatch_router_actions(state, &actions);
+                                state.app_session = None;
+                                Ok(calloop::PostAction::Remove)
+                            } else {
+                                Ok(calloop::PostAction::Continue)
+                            }
+                        };
+                        match event_handle.insert_source(source, cb) {
+                            Ok(token) => {
+                                state.land_source = Some(token);
+                                // Handshake is driven by the source's
+                                // readiness (the App's HELO arrives right
+                                // after connect); kick it here too so the
+                                // first message is consumed even if the
+                                // fd event raced ahead of insert_source.
+                                let _ = handle_land_input(state);
+                            }
+                            Err(e) => {
+                                error!(err = %e, "failed to register land source");
+                            }
+                        }
+                    }
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) => {
+                    error!(err = %e, "accept error");
+                    break;
+                }
+            }
+        }
+    }
+    state.land_listener = listener_opt;
+
+}
 /// Drain one App land-socket message (handshake / slot registration / active
 /// input) and apply it to the compositor state. Returns true when the session
 /// must be torn down (protocol error or disconnect).
