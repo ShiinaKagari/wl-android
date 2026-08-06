@@ -203,10 +203,14 @@ impl AppSession {
 
         // 1. Send CONF (a plain event, not a handshake) — the server applies
         // it and mirrors the effective geometry back via ConfigUpdate.
+        // NOTE: the length prefix is a u32 LE (4 bytes) — writing
+        // `usize.to_le_bytes()` (8 bytes) leaks 4 zero bytes into the
+        // stream that the server reads as a message (bad magic) and tears
+        // the session down.
         let conf_data = proto::encode(&Message::Config(proto::ConfigMessage::new(3392, 2400, 144000, 289, 0, 0)));
         {
             let mut s = wr.lock().unwrap();
-            s.write_all(&conf_data.len().to_le_bytes())?;
+            s.write_all(&(conf_data.len() as u32).to_le_bytes())?;
             s.write_all(&conf_data)?;
             s.flush()?;
         }
