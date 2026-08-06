@@ -52,7 +52,7 @@ start_server() {
     sleep 2
     run "XDG_RUNTIME_DIR=/tmp/wl-runtime WAYLAND_DISPLAY=land-0 VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/freedreno_icd.aarch64.json MESA_LOADER_DRIVER_OVERRIDE=kgsl vblank_mode=3 MESA_VK_WSI_PRESENT_MODE=mailbox LAND_SOCKET=/run/wl-android/land.sock $REPO/target/release/wl-android run &" &
     sleep 4
-    run "XDG_RUNTIME_DIR=/tmp/wl-runtime WAYLAND_DISPLAY=land-0 VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/freedreno_icd.aarch64.json MESA_LOADER_DRIVER_OVERRIDE=kgsl vblank_mode=3 MESA_VK_WSI_PRESENT_MODE=mailbox HOME=/home/kagari kwin_wayland --no-lockscreen --socket wayland-0 &" &
+    run "XDG_RUNTIME_DIR=/tmp/wl-runtime WAYLAND_DISPLAY=land-0 VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/freedreno_icd.aarch64.json MESA_LOADER_DRIVER_OVERRIDE=kgsl vblank_mode=3 MESA_VK_WSI_PRESENT_MODE=mailbox EGL_PLATFORM=wayland QT_QPA_PLATFORM=wayland KWIN_COMPOSE=O2 HOME=/home/kagari kwin_wayland --no-lockscreen --socket wayland-0 &" &
     sleep 10
     run "XDG_RUNTIME_DIR=/tmp/wl-runtime WAYLAND_DISPLAY=wayland-0 HOME=/home/kagari KDE_FULL_SESSION=true plasmashell &" &
     sleep 10
