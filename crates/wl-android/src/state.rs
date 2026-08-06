@@ -37,239 +37,101 @@ use tracing::info;
 use wayland_protocols::xdg::shell::server::xdg_toplevel;
 
 use crate::app_link::AppSession;
-use crate::frame_cache::FrameCache;
+use crate::frame_mem::FrameMem;
 use crate::touch::TouchInjector;
 use wl_android_common::proto::{TouchMessage, TOUCH_PHASE_DOWN, TOUCH_PHASE_MOVE, TOUCH_PHASE_UP};
 
 #[derive(Debug)]
 enum ExtractedFrame {
-    /// SHM frame extracted directly into the FrameCache memfd. The fd is
-    /// None when the frame was DROPPED (target buffer still in the App's
-    /// hands — latest-wins, no fd to send).
-    Shm(u32, u32, Option<OwnedFd>),
+    /// dmabuf fd forwarded directly (zero copy, KWin GPU rendering). The
+    /// App consumes it and replies with RELEASE before KWin may reuse it.
+    Dmabuf(u32, u32, OwnedFd),
+    /// SHM pixels copied into the single FrameMem buffer (smithay does not
+    /// expose the client pool fd, so SHM cannot be forwarded directly).
+    Shm(u32, u32, OwnedFd),
 }
 
-
-
-
-/// Convert smithay's per-commit surface damage into pixel rects (clamped to
-/// the frame), so the FrameCache can copy only the changed regions
-/// (PERF-DAMAGE). `Buffer` damage is already in pixels; `Surface` damage is
-/// logical and must be scaled by the surface's buffer_scale. Rectangles are
-/// clamped into [0, w] × [0, h]; anything fully outside is dropped.
-fn damage_to_rects(damage: &[compositor::Damage], scale: i32, w: u32, h: u32) -> Vec<crate::frame_cache::Rect> {
-    let mut out = Vec::new();
-    for d in damage {
-        let (x, y, rw, rh): (i32, i32, i32, i32) = match d {
-            compositor::Damage::Buffer(r) => (r.loc.x, r.loc.y, r.size.w, r.size.h),
-            compositor::Damage::Surface(r) => (
-                r.loc.x * scale,
-                r.loc.y * scale,
-                r.size.w * scale,
-                r.size.h * scale,
-            ),
-        };
-        let x = x.max(0);
-        let y = y.max(0);
-        let rw = rw.max(0);
-        let rh = rh.max(0);
-        if x >= w as i32 || y >= h as i32 || rw == 0 || rh == 0 {
-            continue;
-        }
-        let rw = rw.min(w as i32 - x);
-        let rh = rh.min(h as i32 - y);
-        out.push(crate::frame_cache::Rect { x: x as u32, y: y as u32, w: rw as u32, h: rh as u32 });
-    }
-    out
-}
-
-/// Extract a committed buffer's pixels into the FrameCache memfd, returning
-/// the pixel fd for the App. Two sources:
+/// Extract a committed buffer's pixels for the App. Two sources:
 ///
-/// * SHM: copy straight out of the pool (PERF-12, damage-optimized).
-/// * dmabuf (KWin GPU rendering): map plane 0 and copy — only LINEAR
-///   buffers are CPU-readable; QCOM_COMPRESSED buffers are dropped (the App
-///   is a CPU consumer and cannot import them).
-fn extract_from_buffer(
+/// * dmabuf (KWin GPU rendering): forward the plane-0 fd directly — zero
+///   copy. Only LINEAR buffers are CPU-readable by the App; compressed
+///   (UBWC) buffers are dropped (the App cannot import them).
+/// * SHM (KWin software rendering): smithay does not expose the client pool
+///   fd, so the pixels are copied into the single FrameMem buffer. KWin
+///   repaints the whole buffer per frame, so no damage tracking is needed.
+fn extract_frame(
     wl_buffer: &smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer,
-    frame_cache: &mut Option<FrameCache>,
-    damage: &[compositor::Damage],
-    buffer_scale: i32,
+    frame_mem: &mut Option<FrameMem>,
 ) -> Option<ExtractedFrame> {
-    // dmabuf path (KWin EGL): linear → mmap + copy.
+    use smithay::backend::allocator::Buffer;
+    use std::os::fd::{AsRawFd, FromRawFd};
+
+    // dmabuf path: forward the fd directly (zero copy).
     if let Ok(dmabuf) = smithay::wayland::dmabuf::get_dmabuf(wl_buffer) {
-        return extract_from_dmabuf(dmabuf, frame_cache, damage, buffer_scale);
+        if dmabuf.has_modifier() {
+            tracing::warn!(
+                modifier = ?dmabuf.format().modifier,
+                "dmabuf with non-linear modifier — App cannot read it, dropping frame"
+            );
+            return None;
+        }
+        let w = dmabuf.width();
+        let h = dmabuf.height();
+        let fd = match dmabuf.handles().next() {
+            Some(handle) => {
+                // dup so the App's fd is independent of the KWin buffer's
+                // lifetime (the wl_buffer may be released once RELEASE
+                // arrives, but the App still needs the fd valid).
+                let raw = unsafe { libc::dup(handle.as_raw_fd()) };
+                if raw >= 0 {
+                    Some(unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) })
+                } else {
+                    None
+                }
+            }
+            None => None,
+        };
+        return fd.map(|fd| ExtractedFrame::Dmabuf(w, h, fd));
     }
 
-    // SHM path (KWin software rendering).
+    // SHM path: copy into the single frame buffer.
     let shm_result = shm::with_buffer_contents(wl_buffer, |ptr, _pool_len, data| {
         let stride = data.stride as usize;
         let height = data.height as usize;
-        if height == 0 || stride == 0 { return None; }
-        if stride % 4 != 0 {
-            tracing::warn!(stride, "non-multiple-of-4 SHM stride — dropping frame");
+        if height == 0 || stride == 0 {
             return None;
         }
         let offset = data.offset as usize;
         let w = (stride as u32) / 4;
-        if frame_cache.is_none() {
-            match FrameCache::new(w, height as u32) {
-                Ok(c) => *frame_cache = Some(c),
+        if frame_mem.is_none() {
+            match FrameMem::new(w, height as u32) {
+                Ok(f) => *frame_mem = Some(f),
                 Err(e) => {
-                    tracing::error!(err = %e, "FrameCache::new failed");
+                    tracing::error!(err = %e, "FrameMem::new failed");
                     return None;
                 }
             }
         }
-        let cache = frame_cache.as_mut().unwrap();
-        cache.set_dimensions(w, height as u32);
-        let rects = damage_to_rects(damage, buffer_scale, w, height as u32);
-        // PERF-12 + PERF-DAMAGE: copy the damaged rects straight out of the
-        // pool into the resident memfd mapping — no intermediate Vec
-        // allocation + memcpy, and untouched regions are preserved from the
-        // previous frame (the FrameCache accumulates damage per buffer).
-        cache.push_damaged(w, height as u32, &rects, |dst, effective| {
-            for r in effective {
-                let row_bytes = r.w as usize * 4;
-                for y in r.y..r.y + r.h {
-                    let src = unsafe { ptr.add(offset + y as usize * stride + r.x as usize * 4) };
-                    let dst_row = y as usize * stride;
-                    // dst stride == src stride == w*4 (FrameCache built at
-                    // w = stride/4), so the same row math applies.
-                    if dst_row + row_bytes <= dst.len() && r.x as usize * 4 + row_bytes <= stride {
-                        unsafe {
-                            std::ptr::copy_nonoverlapping(
-                                src,
-                                dst.as_mut_ptr().add(dst_row + r.x as usize * 4),
-                                row_bytes,
-                            );
-                        }
-                    }
-                }
-            }
-        })
-    }).unwrap_or(None);
-    let (sw, sh) = shm::with_buffer_contents(&wl_buffer, |_ptr, _len, data| {
+        let mem = frame_mem.as_mut().unwrap();
+        if mem.set_dimensions(w, height as u32).is_err() {
+            return None;
+        }
+        // Copy the full frame: KWin repaints the whole buffer per commit,
+        // so per-frame contents are complete (no damage tracking needed).
+        let needed = w as usize * height * 4;
+        let buf = unsafe { std::slice::from_raw_parts(ptr.add(offset), needed) };
+        mem.push(buf, w, height as u32)
+    })
+    .unwrap_or(None);
+    let (sw, sh) = shm::with_buffer_contents(wl_buffer, |_ptr, _len, data| {
         (data.stride as u32 / 4, data.height as u32)
-    }).unwrap_or((0, 0));
-    if shm_result.is_some() {
-            return Some(ExtractedFrame::Shm(sw, sh, shm_result));
-        }
-
-
-
-    None
+    })
+    .unwrap_or((0, 0));
+    shm_result.map(|fd| ExtractedFrame::Shm(sw, sh, fd))
 }
 
-/// dmabuf source: map plane 0 (LINEAR only) and copy into the FrameCache.
-/// Returns None when the buffer is compressed (not CPU-readable) or the map
-/// fails — the frame is dropped, the next linear frame proceeds normally.
-fn extract_from_dmabuf(
-    dmabuf: &smithay::backend::allocator::dmabuf::Dmabuf,
-    frame_cache: &mut Option<FrameCache>,
-    damage: &[compositor::Damage],
-    buffer_scale: i32,
-) -> Option<ExtractedFrame> {
-    use smithay::backend::allocator::Buffer;
-    use smithay::backend::allocator::dmabuf::{DmabufMappingMode, DmabufSyncFlags};
 
-    // Only LINEAR dmabufs are CPU-readable. Compressed (UBWC) buffers would
-    // need GPU import — the App is a CPU consumer, so drop them.
-    if dmabuf.has_modifier() {
-        tracing::warn!(
-            modifier = ?dmabuf.format().modifier,
-            "dmabuf with non-linear modifier — CPU read-back unsupported, dropping frame"
-        );
-        return None;
-    }
 
-    let w = dmabuf.width();
-    let h = dmabuf.height();
-    if w == 0 || h == 0 {
-        return None;
-    }
-
-    let mapping = match dmabuf.map_plane(0, DmabufMappingMode::READ) {
-        Ok(m) => m,
-        Err(e) => {
-            tracing::warn!(err = ?e, "dmabuf map_plane failed — dropping frame");
-            return None;
-        }
-    };
-    let stride = match dmabuf.strides().next() {
-        Some(s) => s as usize,
-        None => {
-            tracing::warn!("dmabuf without plane 0 stride — dropping frame");
-            return None;
-        }
-    };
-    // dmabuf_sync (DMA_BUF_IOCTL_SYNC): START before the copy waits for the
-    // GPU to finish writing (implicit fence); END after the copy tells the
-    // kernel the CPU is done reading so the next GPU write is not blocked.
-    // Both are required — skipping END would leave the read fence held.
-    let sync_start = dmabuf.sync_plane(0, DmabufSyncFlags::READ | DmabufSyncFlags::START);
-    if let Err(e) = &sync_start {
-        tracing::warn!(err = ?e, "dmabuf sync START failed — reading may race the GPU");
-    }
-
-    let src_ptr = mapping.ptr() as *const u8;
-    let cache = if frame_cache.is_none() {
-        match FrameCache::new(w, h) {
-            Ok(c) => {
-                *frame_cache = Some(c);
-                frame_cache.as_mut().unwrap()
-            }
-            Err(e) => {
-                tracing::error!(err = %e, "FrameCache::new failed");
-                return None;
-            }
-        }
-    } else {
-        frame_cache.as_mut().unwrap()
-    };
-    cache.set_dimensions(w, h);
-    let rects = damage_to_rects(damage, buffer_scale, w, h);
-    // EGL renders with GL origin at the bottom-left; the dmabuf is flagged
-    // Y_INVERT so the compositor flips rows. Without the flip the picture
-    // would be upside down. Damage rects use Wayland (top-left) coordinates
-    // — the flip applies to the SOURCE row only.
-    let y_inverted = dmabuf.y_inverted();
-    let src_h = h as usize;
-    let result = cache.push_damaged(w, h, &rects, |dst, effective| {
-        // Bounds use the rectangle width for the copy but the FULL row width
-        // for the stride-check — the source row may have padding after the
-        // last pixel column, so requiring the whole row in-bounds is
-        // conservative and safe.
-        let row_bytes = w as usize * 4;
-        for r in effective {
-            for y in r.y..r.y + r.h {
-                // Source row: flipped when the dmabuf is Y_INVERT.
-                let src_y = if y_inverted { src_h - 1 - y as usize } else { y as usize };
-                let src_row = src_y * stride;
-                let dst_row = y as usize * row_bytes;
-                if src_row + row_bytes <= mapping.length()
-                    && dst_row + row_bytes <= dst.len()
-                    && r.x as usize * 4 + r.w as usize * 4 <= stride
-                {
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(
-                            src_ptr.add(src_row + r.x as usize * 4),
-                            dst.as_mut_ptr().add(dst_row + r.x as usize * 4),
-                            r.w as usize * 4,
-                        );
-                    }
-                }
-            }
-        }
-    });
-
-    // END after the copy (even on copy failure — the mapping is still valid).
-    if let Err(e) = dmabuf.sync_plane(0, DmabufSyncFlags::READ | DmabufSyncFlags::END) {
-        tracing::warn!(err = ?e, "dmabuf sync END failed");
-    }
-
-    result.map(|fd| ExtractedFrame::Shm(w, h, Some(fd)))
-}
 
 pub struct WlState {
     pub display: Display<Self>,
@@ -277,7 +139,14 @@ pub struct WlState {
     pub shm_state: ShmState,
     pub xdg_shell_state: XdgShellState,
     pub dmabuf_state: smithay::wayland::dmabuf::DmabufState,
-    pub frame_cache: Option<FrameCache>,
+    /// Single SHM frame buffer (fallback path; dmabuf frames bypass this).
+    pub frame_mem: Option<FrameMem>,
+    /// FIFO of KWin wl_buffers handed to the App, awaiting RELEASE. Each
+    /// RELEASE pops the oldest and releases it back to KWin (back-pressure:
+    /// KWin's buffer pool is the frame-rate limiter).
+    pub pending_release: std::collections::VecDeque<
+        smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer,
+    >,
     pub app_session: Option<AppSession>,
     pub land_listener: Option<UnixListener>,
     /// calloop source for the App session's land socket fd (event-driven
@@ -291,8 +160,6 @@ pub struct WlState {
     /// Frame pacing mode from the App's ConfigMessage: 0 free, 1 vsync-align,
     /// 2 performance, 3 power-save. Drives commit-time throttling (last_send).
     pub frame_mode: u32,
-    /// Last Instant a frame was actually sent to the App — pacing anchor.
-    pub last_send: std::time::Instant,
     pub output: Output,
     pub toplevel: Option<ToplevelSurface>,
     pub seat_state: SeatState<Self>,
@@ -376,11 +243,12 @@ impl WlState {
 
         let state = Self {
             display, compositor_state, shm_state, xdg_shell_state, dmabuf_state,
-            frame_cache: None,
+            frame_mem: None,
+            pending_release: std::collections::VecDeque::new(),
             app_session: None, land_listener: None, land_source: None,
             clock_epoch: std::time::Instant::now(),
             screen_width: w, screen_height: h, refresh_millihz: refresh, dpi,
-            frame_mode: 0, last_send: std::time::Instant::now(),
+            frame_mode: 0,
             output, toplevel: None, seat_state, seat, touch_injector,
             next_serial: 1,
         };
@@ -572,37 +440,6 @@ impl WlState {
         best
     }
 
-    /// PACING: decide whether a freshly-committed frame may be sent to the App
-    /// now, and (if sent) update the pacing anchor. Modes (ConfigMessage):
-    /// 0 free — always send.
-    /// 1 vsync-align — send at most one frame per refresh period; a commit
-    ///   inside the same period is merged into the next tick (latest-wins).
-    /// 2 performance — always send, minimum buffering (no pacing gate).
-    /// 3 power-save — cap at half the refresh rate (fewer presents, less
-    ///   GPU + copy work in the App; still smooth for static content).
-    /// Returns true when the frame should be delivered.
-    pub fn pacing_gate(&mut self) -> bool {
-        let period = match self.frame_mode {
-            0 | 2 => return true,
-            1 => {
-                let p = 1_000_000_000_000u64 / self.refresh_millihz.max(1) as u64;
-                p.min(1_000_000_000) // cap at 1s: a 0/absent refresh never stalls
-            }
-            3 => {
-                let p = 2_000_000_000_000u64 / self.refresh_millihz.max(1) as u64;
-                p.min(2_000_000_000)
-            }
-            _ => return true,
-        };
-        let elapsed = self.last_send.elapsed().as_nanos() as u64;
-        if elapsed >= period {
-            self.last_send = std::time::Instant::now();
-            true
-        } else {
-            false
-        }
-    }
-
 }
 
 // ── Compositor ──
@@ -632,42 +469,26 @@ impl CompositorHandler for WlState {
 
     fn commit(&mut self, surface: &WlSurface) {
         tracing::info!("surface commit");
-        // PACING: when the gate says "don't send this frame", skip the whole
-        // extract — writing the FrameCache would mark the buffer in flight
-        // without ever sending its fd, wedging it forever (the App never
-        // learns about a frame it never received). Skipped frames keep the
-        // KWin buffer released (ASYNC-RELEASE below) and the next commit
-        // proceeds normally.
-        if !self.pacing_gate() {
-            tracing::debug!("frame gated by pacing — skipped");
-            return;
-        }
+        // Back-pressure via KWin's buffer pool: a committed buffer is NOT
+        // released immediately — it stays in `pending_release` until the App
+        // replies with RELEASE (having consumed the frame). KWin's pool
+        // (typically 2-3 buffers) is therefore the frame-rate limiter,
+        // replacing the old pacing gate.
         {
             let extracted: Option<ExtractedFrame> = 'extract: {
                 let parent_data = compositor::with_states(surface, |states| {
                     let mut guard = states.cached_state.get::<SurfaceAttributes>();
-                    // ASYNC-RELEASE: take the buffer out and clear the field —
-                    // smithay's docs allow this ("free to set this field to
-                    // None to avoid processing it several times"). The buffer
-                    // is released once we're done with it, so KWin never
-                    // blocks waiting for its buffer pool. If the buffer is a
-                    // fresh one we haven't copied yet, extract it here.
+                    // Take the buffer out and clear the field — smithay's
+                    // docs allow this ("free to set this field to None to
+                    // avoid processing it several times").
                     let buffer = guard.current().buffer.take();
-                    // PERF-DAMAGE: this commit's damage rects (smithay moves
-                    // them into `current` on commit) drive the partial copy.
-                    // `Damage` is not Clone; take() empties the vec, which is
-                    // fine — commit handling already consumed it.
-                    let damage = std::mem::take(&mut guard.current().damage);
-                    let scale = guard.current().buffer_scale;
                     match buffer {
                         Some(BufferAssignment::NewBuffer(wl_buffer)) => {
-                            let r = extract_from_buffer(&wl_buffer, &mut self.frame_cache, &damage, scale);
-                            // ASYNC-RELEASE: the frame is now copied into the
-                            // resident FrameCache (our shared memory), so KWin's
-                            // buffer is free — release it immediately. Dropping
-                            // WlBuffer alone does NOT send wl_buffer.release;
-                            // smithay's own code always calls it explicitly.
-                            wl_buffer.release();
+                            let r = extract_frame(&wl_buffer, &mut self.frame_mem);
+                            // The buffer is handed to the App (its pixels are
+                            // being consumed remotely); it is released when
+                            // the App's RELEASE arrives (FIFO).
+                            self.pending_release.push_back(wl_buffer);
                             r
                         }
                         _ => None,
@@ -679,12 +500,10 @@ impl CompositorHandler for WlState {
                     let child_data = compositor::with_states(child, |states| {
                         let mut guard = states.cached_state.get::<SurfaceAttributes>();
                         let buffer = guard.current().buffer.take();
-                        let damage = std::mem::take(&mut guard.current().damage);
-                        let scale = guard.current().buffer_scale;
                         match buffer {
                             Some(BufferAssignment::NewBuffer(wl_buffer)) => {
-                                let r = extract_from_buffer(&wl_buffer, &mut self.frame_cache, &damage, scale);
-                                wl_buffer.release();
+                                let r = extract_frame(&wl_buffer, &mut self.frame_mem);
+                                self.pending_release.push_back(wl_buffer);
                                 r
                             }
                             _ => None,
@@ -696,29 +515,20 @@ impl CompositorHandler for WlState {
             };
 
             match extracted {
+                Some(ExtractedFrame::Dmabuf(bw, bh, fd)) => {
+                    tracing::info!(bw, bh, "dmabuf frame — fd forwarded directly (zero copy)");
+                    if let Some(session) = &mut self.app_session {
+                        let _ = session.send_frame(bw, bh, fd);
+                    }
+                }
                 Some(ExtractedFrame::Shm(bw, bh, fd)) => {
-                    tracing::info!(bw, bh, "frame extracted from SHM");
-                    // push_damaged returned None when the target buffer was
-                    // still in the App's hands (frame dropped, latest-wins).
-                    if let Some(fd) = fd {
-                        if let Some(session) = &mut self.app_session {
-                            tracing::info!(bw, bh, "sending frame to App");
-                            let _ = session.send_frame(bw, bh, fd);
-                        }
+                    tracing::info!(bw, bh, "SHM frame — copied into frame buffer");
+                    if let Some(session) = &mut self.app_session {
+                        let _ = session.send_frame(bw, bh, fd);
                     }
                 }
                 None => {
-                    // No new buffer on this commit (KWin reused one or the
-                    // commit carried no buffer): nothing to send — the App
-                    // already holds the current frame. Just make sure the
-                    // FrameCache exists for the next real frame.
                     tracing::debug!("commit without a new buffer — nothing to send");
-                    if self.frame_cache.is_none() {
-                        match FrameCache::new(self.screen_width, self.screen_height) {
-                            Ok(c) => self.frame_cache = Some(c),
-                            Err(e) => tracing::error!(err = %e, "FrameCache::new failed"),
-                        }
-                    }
                 }
             }
         }
@@ -730,7 +540,7 @@ impl CompositorHandler for WlState {
             .as_millis() as u32;
         let period_ns = 1_000_000_000_000u64 / self.refresh_millihz as u64;
         let refresh = Refresh::Fixed(std::time::Duration::from_nanos(period_ns));
-        let seq = self.frame_cache.as_ref().map(|c| c.seq()).unwrap_or(0);
+        let seq = self.next_serial as u64;
         compositor::with_states(surface, |states| {
             let mut guard = states.cached_state.get::<SurfaceAttributes>();
             let count = guard.current().frame_callbacks.len();
@@ -848,7 +658,7 @@ delegate_presentation!(WlState);
 
 #[cfg(test)]
 mod tests {
-    use super::{ExtractedFrame, FrameCache, extract_from_dmabuf, WlState};
+    use super::WlState;
     use smithay::backend::input::KeyState;
 
     #[test]
@@ -885,125 +695,5 @@ mod tests {
         assert_eq!(WlState::bucket_dpi(110), 120, "midway rounds to the larger bucket");
         assert_eq!(WlState::bucket_dpi(0), 96, "degenerate input clamps to the smallest");
         assert_eq!(WlState::bucket_dpi(1000), 384, "above the largest bucket saturates");
-    }
-
-    /// Build a LINEAR dmabuf backed by a memfd with a recognizable pattern:
-    /// each row contains the row index byte. `flags` controls Y_INVERT so
-    /// both orientations can be tested.
-    fn build_pattern_dmabuf(flags: smithay::backend::allocator::dmabuf::DmabufFlags) -> smithay::backend::allocator::dmabuf::Dmabuf {
-        use std::os::fd::FromRawFd;
-
-        const W: u32 = 4;
-        const H: u32 = 4;
-        let size = (W * H * 4) as usize;
-        let name = std::ffi::CString::new("test-dmabuf").unwrap();
-        let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
-        assert!(fd >= 0);
-        let owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
-        assert_eq!(unsafe { libc::ftruncate(fd, size as libc::off_t) }, 0);
-        let ptr = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                size,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED,
-                fd,
-                0,
-            )
-        };
-        assert_ne!(ptr, libc::MAP_FAILED);
-        for y in 0..H {
-            for x in 0..W * 4 {
-                unsafe { *(ptr as *mut u8).add((y * W * 4 + x) as usize) = y as u8 };
-            }
-        }
-        unsafe { libc::munmap(ptr, size) };
-
-        let mut builder = smithay::backend::allocator::dmabuf::Dmabuf::builder(
-            smithay::utils::Size::from((W as i32, H as i32)),
-            drm_fourcc::DrmFourcc::Abgr8888,
-            drm_fourcc::DrmModifier::Linear,
-            flags,
-        );
-        assert!(builder.add_plane(owned, 0, 0, W * 4));
-        builder.build().expect("dmabuf")
-    }
-
-    /// Read the FrameCache memfd produced for a dmabuf and return it as
-    /// rows of bytes (row index, 4-byte pixels).
-    fn extract_and_read_rows(
-        dmabuf: &smithay::backend::allocator::dmabuf::Dmabuf,
-        cache: &mut Option<FrameCache>,
-    ) -> (u32, u32, Vec<Vec<u8>>) {
-        use std::os::fd::AsRawFd;
-
-        let frame = extract_from_dmabuf(dmabuf, cache, &[], 1);
-        let (fw, fh, fd_opt) = match frame {
-            Some(ExtractedFrame::Shm(w, h, fd)) => (w, h, fd),
-            other => panic!("expected Shm frame, got {other:?}"),
-        };
-        let fd = fd_opt.expect("dmabuf frame must carry a pixel fd");
-        let st = unsafe {
-            let mut st: libc::stat = std::mem::zeroed();
-            assert_eq!(libc::fstat(fd.as_raw_fd(), &mut st), 0);
-            st
-        };
-        let rp = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                st.st_size as usize,
-                libc::PROT_READ,
-                libc::MAP_SHARED,
-                fd.as_raw_fd(),
-                0,
-            )
-        };
-        assert_ne!(rp, libc::MAP_FAILED);
-        let bytes = unsafe { std::slice::from_raw_parts(rp as *const u8, st.st_size as usize) };
-        let mut rows = Vec::new();
-        for y in 0..fh {
-            let start = (y * fw * 4) as usize;
-            rows.push(bytes[start..start + (fw * 4) as usize].to_vec());
-        }
-        unsafe { libc::munmap(rp, st.st_size as usize) };
-        (fw, fh, rows)
-    }
-
-    /// A LINEAR dmabuf WITHOUT Y_INVERT copies rows straight through.
-    #[test]
-    fn extract_from_linear_dmabuf_reads_pixels() {
-        use smithay::backend::allocator::dmabuf::DmabufFlags;
-
-        let dmabuf = build_pattern_dmabuf(DmabufFlags::empty());
-        let mut cache: Option<FrameCache> = None;
-        let (w, h, rows) = extract_and_read_rows(&dmabuf, &mut cache);
-        assert_eq!((w, h), (4, 4));
-        for y in 0..4u32 {
-            assert_eq!(rows[y as usize][0], y as u8, "row {y} copied straight through");
-            assert!(rows[y as usize].iter().all(|&b| b == y as u8), "row {y} all same byte");
-        }
-    }
-
-    /// A LINEAR dmabuf WITH Y_INVERT (EGL default) must flip rows: source
-    /// row 0 lands in target row 3, etc. Damage rects keep Wayland
-    /// (top-left) coordinates — only the source row index flips.
-    #[test]
-    fn extract_from_yinverted_dmabuf_flips_rows() {
-        use smithay::backend::allocator::dmabuf::DmabufFlags;
-
-        let dmabuf = build_pattern_dmabuf(DmabufFlags::Y_INVERT);
-        let mut cache: Option<FrameCache> = None;
-        let (w, h, rows) = extract_and_read_rows(&dmabuf, &mut cache);
-        assert_eq!((w, h), (4, 4));
-        for y in 0..4u32 {
-            // Source row (3 - y) contains byte (3 - y); after flip target row
-            // y must contain byte (3 - y).
-            assert_eq!(
-                rows[y as usize][0],
-                (3 - y) as u8,
-                "row {y} must hold flipped source row {}",
-                3 - y
-            );
-        }
     }
 }

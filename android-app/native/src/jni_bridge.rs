@@ -230,45 +230,75 @@ pub fn render_frame(width: u32, height: u32, pixel_data: &[u8]) -> Result<(), St
     Ok(())
 }
 
-/// RENDER-DECOUPLE: render a frame from its pixel fd (the recv thread enqueued
-/// the fd; this runs on the dedicated render thread). fstat-guarded mmap of
-/// the fd, then the same BGRX→BGRA row copy as `render_frame`, then munmap.
-pub fn render_frame_fd(
+/// RENDER-DECOUPLE: per-fd mmap cache. KWin's buffer pool is small (2-3
+/// fds) and rotates, so caching the mapping per fd avoids mmap+munmap of
+/// the whole frame (32MB page-table churn ≈ 20ms) on every frame. Owned by
+/// the render thread only — no locking needed. The mappings live for the
+/// process lifetime (fds are dup'd per frame; entries are reused or grow
+/// the cache by at most the pool size).
+pub struct FdMmapCache {
+    maps: std::collections::HashMap<i32, (usize, *mut u8)>,
+}
+
+// SAFETY: only used from the render thread; pointers are into private
+// mmaps that stay valid for the cache's lifetime.
+unsafe impl Send for FdMmapCache {}
+
+impl FdMmapCache {
+    pub fn new() -> Self {
+        Self { maps: std::collections::HashMap::new() }
+    }
+
+    /// Map `fd` if not cached; returns (ptr, len) of the readable mapping.
+    fn map(&mut self, fd: i32, len: usize) -> Option<(*const u8, usize)> {
+        if let Some(&(cached_len, ptr)) = self.maps.get(&fd) {
+            return Some((ptr as *const u8, cached_len));
+        }
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ,
+                libc::MAP_SHARED,
+                fd,
+                0,
+            )
+        };
+        if ptr == libc::MAP_FAILED {
+            log::error!("FdMmapCache: mmap failed for fd {fd}");
+            return None;
+        }
+        self.maps.insert(fd, (len, ptr as *mut u8));
+        Some((ptr as *const u8, len))
+    }
+}
+
+/// RENDER-DECOUPLE: render a frame from its pixel fd with per-fd mapping
+/// cache (the recv thread enqueued the fd; this runs on the render thread).
+/// fstat-guarded, then the same BGRX→BGRA row copy as `render_frame`.
+pub fn render_frame_fd_cached(
     width: u32,
     height: u32,
     pixel_fd: &std::os::fd::OwnedFd,
+    cache: &mut FdMmapCache,
 ) -> Result<(), String> {
     use std::os::fd::AsRawFd;
     let size = width as usize * height as usize * 4;
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
     if unsafe { libc::fstat(pixel_fd.as_raw_fd(), &mut st) } != 0 {
-        log::error!("render_frame_fd: fstat failed; dropping frame");
+        log::error!("render_frame_fd_cached: fstat failed; dropping frame");
         return Err("fstat failed".into());
     }
     let map_len = (st.st_size as usize).min(size);
     if map_len == 0 {
-        log::warn!("render_frame_fd: empty fd; dropping frame");
+        log::warn!("render_frame_fd_cached: empty fd; dropping frame");
         return Err("empty fd".into());
     }
-    let ptr = unsafe {
-        libc::mmap(
-            std::ptr::null_mut(),
-            map_len,
-            libc::PROT_READ,
-            libc::MAP_SHARED,
-            pixel_fd.as_raw_fd(),
-            0,
-        )
-    };
-    if ptr == libc::MAP_FAILED {
-        log::error!("render_frame_fd: mmap failed; dropping frame");
-        return Err("mmap failed".into());
-    }
-    // SAFETY: ptr is a live readable mapping of map_len bytes (fstat-guarded).
-    let slice = unsafe { std::slice::from_raw_parts(ptr as *const u8, map_len) };
-    let result = render_frame(width, height, slice);
-    unsafe { libc::munmap(ptr, map_len); }
-    result
+    let (ptr, _) = cache.map(pixel_fd.as_raw_fd(), map_len).ok_or_else(|| "mmap failed".to_string())?;
+    // SAFETY: ptr is a live readable mapping of map_len bytes (fstat-guarded,
+    // cached by fd).
+    let slice = unsafe { std::slice::from_raw_parts(ptr, map_len) };
+    render_frame(width, height, slice)
 }
 
 /// CONN-STATE: blank the ANativeWindow to pure black. Called by the render

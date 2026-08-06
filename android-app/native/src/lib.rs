@@ -280,6 +280,9 @@ extern "system" fn Java_com_wl_android_NativeBridge_nativeInit(
             // CONN-STATE: cleared on Disconnected so the screen is blanked
             // once, not repeatedly while parked on the condvar.
             let mut blanked_while_disconnected = false;
+            // Per-fd mmap cache: KWin's buffer pool rotates through a few
+            // fds; mapping each once avoids 32MB mmap+munmap per frame.
+            let mut mmap_cache = crate::jni_bridge::FdMmapCache::new();
             loop {
                 let frame = loop {
                     let mut guard = render_state.lock().unwrap();
@@ -347,8 +350,8 @@ extern "system" fn Java_com_wl_android_NativeBridge_nativeInit(
                     }
                 };
                 if let Some(fd) = frame.pixel_fd {
-                    let _ = crate::jni_bridge::render_frame_fd(
-                        frame.width, frame.height, &fd,
+                    let _ = crate::jni_bridge::render_frame_fd_cached(
+                        frame.width, frame.height, &fd, &mut mmap_cache,
                     );
                     // Stateless: the frame's pixel fd has been consumed —
                     // release the memfd so the server can reuse it (one

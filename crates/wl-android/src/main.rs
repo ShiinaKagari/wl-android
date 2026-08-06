@@ -12,7 +12,7 @@ use crate::transport::Transport;
 mod app_link;
 mod comp;
 mod doctor;
-mod frame_cache;
+mod frame_mem;
 mod state;
 mod touch;
 mod transport;
@@ -206,11 +206,10 @@ fn accept_land_connections(state: &mut WlState, event_handle: &calloop::LoopHand
                             if let Some(old_token) = state.land_source.take() {
                                 event_handle.remove(old_token);
                             }
-                            // The old App's outstanding fd ownership is void —
-                            // its in-flight marks must not leak into the new
-                            // session's FIFO accounting.
-                            if let Some(cache) = &mut state.frame_cache {
-                                cache.reset_in_flight();
+                            // The old App's outstanding frames are void —
+                            // release every pending KWin buffer back to it.
+                            while let Some(buffer) = state.pending_release.pop_front() {
+                                buffer.release();
                             }
                         }
                         state.app_session = Some(AppSession::new(transport));
@@ -244,21 +243,14 @@ fn accept_land_connections(state: &mut WlState, event_handle: &calloop::LoopHand
                                 // Stateless protocol: the App is ready the
                                 // moment it connects. Push the current
                                 // geometry (bucketed DPI) immediately so the
-                                // App's render window matches, and replay the
-                                // cached frame (if any) to avoid a black
-                                // screen until the next KWin commit.
+                                // App's render window matches; the first
+                                // frame arrives with the next KWin commit.
                                 if let Some(session) = &mut state.app_session {
                                     let _ = session.send_config_update(
                                         state.screen_width, state.screen_height,
                                         state.refresh_millihz, WlState::bucket_dpi(state.dpi),
                                         state.frame_mode,
                                     );
-                                    if let Some(cache) = &mut state.frame_cache
-                                        && let Some((fd, _seq, cw, ch)) = cache.current_frame()
-                                    {
-                                        cache.mark_current_in_flight();
-                                        let _ = session.send_frame(cw, ch, fd);
-                                    }
                                 }
                                 let _ = handle_land_input(state);
                             }
@@ -295,8 +287,10 @@ fn handle_land_input(state: &mut WlState) -> bool {
             // Buffer-ownership signal: the App consumed the oldest in-flight
             // frame's pixel fd — the FrameCache frees that memfd (FIFO).
             wl_android_common::proto::Message::Release(_) => {
-                if let Some(cache) = &mut state.frame_cache {
-                    cache.on_release();
+                // The App consumed the oldest outstanding frame — release
+                // that KWin buffer back to it (FIFO back-pressure).
+                if let Some(buffer) = state.pending_release.pop_front() {
+                    buffer.release();
                 }
                 false
             }
