@@ -28,16 +28,6 @@ fn ack_size_is_16() {
 }
 
 #[test]
-fn slot_size_is_64() {
-    assert_eq!(size_of::<SlotBuffer>(), 64);
-}
-
-#[test]
-fn gone_size_is_16() {
-    assert_eq!(size_of::<BufferGone>(), 16);
-}
-
-#[test]
 fn touch_size_is_24() {
     assert_eq!(size_of::<TouchMessage>(), 24);
 }
@@ -51,12 +41,6 @@ fn plane_desc_size_is_8() {
 fn key_size_is_16() {
     // P-03: KeyMessage (v2, §4.8) is exactly 16 B
     assert_eq!(size_of::<KeyMessage>(), 16);
-}
-
-#[test]
-fn ready_size_is_16() {
-    // P-03: BufferReady (v2, §4.9) is exactly 16 B
-    assert_eq!(size_of::<BufferReady>(), 16);
 }
 
 // =============================================================================
@@ -84,16 +68,6 @@ fn magic_fack_is_ascii_fack() {
 }
 
 #[test]
-fn magic_tbuf_is_ascii_tbuf() {
-    assert_eq!(MAGIC_TBUF, u32::from_le_bytes(*b"TBUF"));
-}
-
-#[test]
-fn magic_bgon_is_ascii_bgon() {
-    assert_eq!(MAGIC_BGON, u32::from_le_bytes(*b"BGON"));
-}
-
-#[test]
 fn magic_touc_is_ascii_touc() {
     assert_eq!(MAGIC_TOUC, u32::from_le_bytes(*b"TOUC"));
 }
@@ -101,11 +75,6 @@ fn magic_touc_is_ascii_touc() {
 #[test]
 fn magic_keym_is_ascii_keym() {
     assert_eq!(MAGIC_KEYM, u32::from_le_bytes(*b"KEYM"));
-}
-
-#[test]
-fn magic_brdy_is_ascii_brdy() {
-    assert_eq!(MAGIC_BRDY, u32::from_le_bytes(*b"BRDY"));
 }
 
 // =============================================================================
@@ -120,14 +89,14 @@ fn golden_hello() {
     assert_eq!(bytes.len(), 16);
     assert_eq!(bytes[0..4], *b"HELO");
     assert_eq!(u32::from_le_bytes(bytes[4..8].try_into().unwrap()), PROTOCOL_VERSION);
-    assert_eq!(u32::from_le_bytes(bytes[8..12].try_into().unwrap()), SERVER_CAP_BLIT);
+    assert_eq!(u32::from_le_bytes(bytes[8..12].try_into().unwrap()), SERVER_CAP_SHM);
     assert_eq!(u32::from_le_bytes(bytes[12..16].try_into().unwrap()), 0);
     insta::assert_debug_snapshot!(&bytes);
 }
 
 #[test]
 fn golden_config() {
-    let msg = ConfigMessage::new(3392, 2400, 144000, 289, APP_CAP_DIRECT_IMPORT, 0);
+    let msg = ConfigMessage::new(3392, 2400, 144000, 289, 0, 0);
     let bytes = encode(&Message::Config(msg));
     assert_eq!(bytes.len(), 32);
     assert_eq!(bytes[0..4], *b"CONF");
@@ -177,24 +146,6 @@ fn golden_ack() {
 }
 
 #[test]
-fn golden_slot() {
-    let msg = SlotBuffer::new(0, 3392, 2400, DRM_FORMAT_ABGR8888, 3392 * 4);
-    let bytes = encode(&Message::Slot(msg));
-    assert_eq!(bytes.len(), 64);
-    assert_eq!(bytes[0..4], *b"TBUF");
-    insta::assert_debug_snapshot!(&bytes);
-}
-
-#[test]
-fn golden_gone() {
-    let msg = BufferGone::new(1);
-    let bytes = encode(&Message::Gone(msg));
-    assert_eq!(bytes.len(), 16);
-    assert_eq!(bytes[0..4], *b"BGON");
-    insta::assert_debug_snapshot!(&bytes);
-}
-
-#[test]
 fn golden_touch() {
     let msg = TouchMessage::new(0, 0.5, 0.75, TOUCH_PHASE_DOWN, 1000);
     let bytes = encode(&Message::Touch(msg));
@@ -211,15 +162,6 @@ fn keym_message_golden() {
     let bytes = encode(&Message::Key(msg));
     assert_eq!(bytes.len(), 16);
     assert_eq!(bytes[0..4], *b"KEYM");
-    insta::assert_debug_snapshot!(&bytes);
-}
-
-#[test]
-fn brdy_message_golden() {
-    let msg = BufferReady::new(2);
-    let bytes = encode(&Message::Ready(msg));
-    assert_eq!(bytes.len(), 16);
-    assert_eq!(bytes[0..4], *b"BRDY");
     insta::assert_debug_snapshot!(&bytes);
 }
 
@@ -277,13 +219,6 @@ proptest! {
     #[test]
     fn rt_ack(serial in 0u64..) {
         let msg = Message::Ack(FrameAck::new(serial));
-        let got = decode_roundtrip(&msg)?;
-        assert_eq!(got, msg);
-    }
-
-    #[test]
-    fn rt_gone(buffer_id in 0u32..1024) {
-        let msg = Message::Gone(BufferGone::new(buffer_id));
         let got = decode_roundtrip(&msg)?;
         assert_eq!(got, msg);
     }
@@ -363,28 +298,8 @@ proptest! {
     }
 
     #[test]
-    fn rt_slot(
-        slot in 0u32..3,
-        width in 100u32..8000,
-        height in 100u32..8000,
-        format in 0u32..,
-        stride in 256u32..65535,
-    ) {
-        let msg = Message::Slot(SlotBuffer::new(slot, width, height, format, stride));
-        let got = decode_roundtrip(&msg)?;
-        assert_eq!(got, msg);
-    }
-
-    #[test]
     fn rt_key(keycode in 0u32..256, state in 0u32..2, time_ms in 0u32..) {
         let msg = Message::Key(KeyMessage::new(keycode, state, time_ms));
-        let got = decode_roundtrip(&msg)?;
-        assert_eq!(got, msg);
-    }
-
-    #[test]
-    fn rt_ready(slot in 0u32..3) {
-        let msg = Message::Ready(BufferReady::new(slot));
         let got = decode_roundtrip(&msg)?;
         assert_eq!(got, msg);
     }
@@ -477,14 +392,6 @@ fn decode_truncated_frame() {
 fn decode_truncated_keym() {
     let mut buf = [0u8; 8]; // KEYM needs 16 bytes
     buf[0..4].copy_from_slice(b"KEYM");
-    let err = decode(&buf, vec![]).unwrap_err();
-    assert_eq!(err, ProtoError::BadLength { expected: 16, got: 8 });
-}
-
-#[test]
-fn decode_truncated_brdy() {
-    let mut buf = [0u8; 8]; // BRDY needs 16 bytes
-    buf[0..4].copy_from_slice(b"BRDY");
     let err = decode(&buf, vec![]).unwrap_err();
     assert_eq!(err, ProtoError::BadLength { expected: 16, got: 8 });
 }

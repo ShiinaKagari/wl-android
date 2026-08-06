@@ -8,16 +8,10 @@ use tracing::{error, info, warn};
 use crate::app_link::{AppSession, SessionMode};
 use crate::state::WlState;
 use crate::transport::Transport;
-use wl_android_common::proto;
-use wl_android_common::proto::Message;
 
-mod ahb_handle;
 mod app_link;
-mod blit;
-mod comp;
 mod doctor;
 mod frame_cache;
-mod frame_router;
 mod state;
 mod touch;
 mod transport;
@@ -197,7 +191,6 @@ fn run_server() -> Result<(), Box<dyn std::error::Error>> {
 /// is accepted immediately, with no poll tick required.
 fn accept_land_connections(state: &mut WlState, event_handle: &calloop::LoopHandle<WlState>) {
     // ── Accept new App connections ──
-    let mut connect_actions = Vec::new();
     let mut listener_opt = state.land_listener.take();
     if let Some(ref mut listener) = listener_opt {
         loop {
@@ -206,29 +199,20 @@ fn accept_land_connections(state: &mut WlState, event_handle: &calloop::LoopHand
                     info!("App connected");
                     if let Ok(transport) = Transport::new(stream.try_clone().expect("clone land stream")) {
                         if state.app_session.is_some() {
-                            // C-01: replacing the old session — release its slots.
-                            state.clear_blit_pipeline_state();
-                            state.blit_engine.clear_slots();
-                            connect_actions = state.frame_router.handle(
-                                crate::frame_router::RouterEvent::AppLost,
-                            );
-                            dispatch_router_actions(state, &connect_actions);
-                            // The old session's land source is removed by
-                            // dropping the source handle below (replace).
+                            // C-01: replacing the old session. The old
+                            // session's land source is removed by dropping the
+                            // source handle below (replace).
                             if let Some(old_token) = state.land_source.take() {
                                 event_handle.remove(old_token);
                             }
                         }
                         state.app_session = Some(AppSession::new(transport));
-                        connect_actions = state.frame_router.handle(
-                            crate::frame_router::RouterEvent::AppConnected,
-                        );
 
                         // PERF-13: register the land socket fd as an
                         // event-driven source — App input (Touch/Key/Config/
-                        // Ack/Ready) wakes the loop immediately, independent
-                        // of the 16ms tick and of KWin frame processing.
-                        // The callback owns the session drain: it runs
+                        // Ack) wakes the loop immediately, independent of the
+                        // poll cadence and of KWin frame processing. The
+                        // callback owns the session drain: it runs
                         // handle_land_input once per readable fd state, and
                         // returns Remove on session teardown so calloop
                         // unregisters the source (the token is dropped too).
@@ -241,14 +225,6 @@ fn accept_land_connections(state: &mut WlState, event_handle: &calloop::LoopHand
                         let cb = |_readiness, _fd: &mut _, state: &mut WlState| -> std::io::Result<calloop::PostAction> {
                             let lost = handle_land_input(state);
                             if lost {
-                                // C-02: blit mode — close all slot fds and
-                                // destroy the VkImages.
-                                state.clear_blit_pipeline_state();
-                                state.blit_engine.clear_slots();
-                                let actions = state.frame_router.handle(
-                                    crate::frame_router::RouterEvent::AppLost,
-                                );
-                                dispatch_router_actions(state, &actions);
                                 state.app_session = None;
                                 Ok(calloop::PostAction::Remove)
                             } else {
@@ -280,7 +256,6 @@ fn accept_land_connections(state: &mut WlState, event_handle: &calloop::LoopHand
         }
     }
     state.land_listener = listener_opt;
-    dispatch_router_actions(state, &connect_actions);
 }
 /// Drain one App land-socket message (handshake / slot registration / active
 /// input) and apply it to the compositor state. Returns true when the session
@@ -317,68 +292,12 @@ fn handle_land_input(state: &mut WlState) -> bool {
                 true
             }
         },
-        SessionMode::SlotRegistration => {
-            // Wait for TBUF slot messages (H-04: SLOT_COUNT before frames)
-            match session.recv_message(&mut state.blit_engine) {
-                Ok(Some(Message::Slot(slot))) => {
-                    // Already counted in recv_message. F-14: registration
-                    // itself marks the slot ready for the FIRST blit — the
-                    // App cannot BRDY a slot it has not yet presented a
-                    // frame from, so without this implicit grant the first
-                    // frame would deadlock (server waits for BRDY, App
-                    // waits for a frame to present before BRDYing).
-                    // (Direct field borrow, not handle_brdy: `session` is
-                    // still live here, so a &mut self call cannot borrow.)
-                    state.brdy_ready.mark_ready(slot.slot);
-                    info!(count = session.slot_count(), "slot registered");
-                    // Check if all slots are registered
-                    if session.slot_count() >= proto::SLOT_COUNT as u32 {
-                        info!("all slots registered, activating");
-                        session.activate();
-                        // H-04: blit is now Active — replay the latest cached
-                        // frame so the App is not black until the next commit.
-                        if let Some(cache) = &state.frame_cache
-                            && let Some((fd, seq, cw, ch)) = cache.current_frame()
-                        {
-                            let _ = session.send_frame(
-                                seq, 0, state.screen_width, state.screen_height,
-                                cw, ch, Some(fd), None,
-                            );
-                        }
-                    }
-                    false
-                }
-                Ok(None) => false,
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => false,
-                Err(e) => {
-                    warn!(err = %e, "slot registration read error");
-                    true
-                }
-                _ => false,
-            }
-        }
         SessionMode::Active => {
-            match session.recv_message(&mut state.blit_engine) {
+            match session.recv_message() {
                 Ok(Some(msg)) => match msg {
-                    wl_android_common::proto::Message::Ack(ack) => {
-                        // F-11: freed slots (fences destroyed) before
-                        // dispatch — an unblocked frame may immediately
-                        // reuse a slot this ack just released.
-                        let freed = crate::state::free_slots_on_ack(
-                            &mut state.slots_in_use, ack.serial,
-                        );
-                        for (slot, fence) in freed {
-                            state.blit_engine.destroy_fence_handle(fence);
-                            tracing::info!(slot, ack = ack.serial, "slot freed by cum-ack");
-                        }
-                        let actions = state.frame_router.handle(
-                            crate::frame_router::RouterEvent::AppAck {
-                                serial: ack.serial,
-                            },
-                        );
-                        dispatch_router_actions(state, &actions);
-                        false
-                    }
+                    // SHM path: the App cum-acks every frame serial; with no
+                    // blit slot pool there is nothing to free, just accept it.
+                    wl_android_common::proto::Message::Ack(_) => false,
                     wl_android_common::proto::Message::Touch(tm) => {
                         state.handle_touch(&tm);
                         false
@@ -395,52 +314,12 @@ fn handle_land_input(state: &mut WlState) -> bool {
                         );
                         false
                     }
-                    wl_android_common::proto::Message::Ready(rdy) => {
-                        // F-14: App presented the slot's previous fence
-                        // frame and releases it for reuse — the slot
-                        // becomes eligible for the next blit.
-                        state.handle_brdy(rdy.slot);
-                        false
-                    }
                     _ => false,
                 },
                 Ok(None) => false,
                 Err(e) => {
                     warn!(err = %e, "session read error");
                     true
-                }
-            }
-        }
-    }
-}
-
-fn dispatch_router_actions(
-    state: &mut WlState,
-    actions: &[crate::frame_router::RouterAction],
-) {
-    use crate::frame_router::RouterAction;
-    for action in actions {
-        match action {
-            RouterAction::EnqueueFrame { buffer_id: bid, serial, .. } => {
-                state.blit_and_send_frame(*bid, *serial);
-            }
-            RouterAction::ReleaseBuffer { .. } => {
-                // F-10 noop by design: smithay's compositor emits wl_buffer.release
-                // itself when a buffer is replaced (merge_into) or removed (tree.rs).
-                tracing::trace!("release buffer");
-            }
-            RouterAction::FireCallback => {
-                if let Some(ref tl) = state.toplevel {
-                    let surface = tl.wl_surface();
-                    let now_ms = std::time::Instant::now()
-                        .duration_since(state.clock_epoch)
-                        .as_millis() as u32;
-                    smithay::wayland::compositor::with_states(surface, |states| {
-                        let mut guard = states.cached_state.get::<smithay::wayland::compositor::SurfaceAttributes>();
-                        for cb in guard.current().frame_callbacks.drain(..) {
-                            cb.done(now_ms);
-                        }
-                    });
                 }
             }
         }

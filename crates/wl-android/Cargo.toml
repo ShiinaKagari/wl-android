@@ -6,7 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-ash = "0.38.0"
 calloop = "0.14.4"
 calloop-wayland-source = "0.4.1"
 drm-fourcc = "2.2.0"

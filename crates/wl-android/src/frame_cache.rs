@@ -1,14 +1,13 @@
 use std::num::NonZeroUsize;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
-// ── TODO 31: DEBUG-ONLY (SHM/CPU fallback) ──
+// ── SHM frame cache (the only frame path) ──
 //
-// This module is the retired SHM/CPU frame path. It is kept ONLY as the
-// LAND_MODE=shm debug fallback (state.rs `shm_path_enabled`): with that env
-// set, commit pushes pixel frames here and sends memfd-backed pixel-fd frames
-// to the App. In the default (blit) mode the SHM branch is gated off and this
-// cache stays None — KWin must produce dmabufs (the doctor/deploy scripts set
-// the env). Do not extend; the production path is blit.rs.
+// This module is the SHM frame path. KWin (nested compositor) commits SHM
+// buffers; state.rs extracts each frame into a resident memfd pool here and
+// ships memfd-backed pixel-fd frames to the App, which presents via
+// ANativeWindow_lock. There is no dmabuf/blit path (turnip import of App AHB
+// SIGSEGVs on this device — device-verified).
 //
 // PERF: the three memfds are mapped ONCE at pool build time and kept mapped
 // for the pool's lifetime (PERF-12). The previous implementation mmap'd +

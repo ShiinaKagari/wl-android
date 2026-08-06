@@ -10,11 +10,8 @@ pub const MAGIC_HELO: u32 = u32::from_le_bytes(*b"HELO");
 pub const MAGIC_CONF: u32 = u32::from_le_bytes(*b"CONF");
 pub const MAGIC_LAND: u32 = u32::from_le_bytes(*b"LAND");
 pub const MAGIC_FACK: u32 = u32::from_le_bytes(*b"FACK");
-pub const MAGIC_TBUF: u32 = u32::from_le_bytes(*b"TBUF");
-pub const MAGIC_BGON: u32 = u32::from_le_bytes(*b"BGON");
 pub const MAGIC_TOUC: u32 = u32::from_le_bytes(*b"TOUC");
 pub const MAGIC_KEYM: u32 = u32::from_le_bytes(*b"KEYM");
-pub const MAGIC_BRDY: u32 = u32::from_le_bytes(*b"BRDY");
 
 // =============================================================================
 // Version
@@ -26,16 +23,7 @@ pub const PROTOCOL_VERSION: u32 = 2;
 // Caps bits
 // =============================================================================
 
-pub const SERVER_CAP_BLIT: u32 = 1 << 0;
-/// Server is in SHM/CPU fallback mode (LAND_MODE=shm): frames carry pixel
-/// fds (no fence), the App presents via the CPU path and must NOT init the
-/// Vulkan swapchain (CPU lock + Vulkan swapchain on one ANativeWindow
-/// conflict — ANativeWindow_lock returns -22).
-pub const SERVER_CAP_SHM: u32 = 1 << 1;
-pub const SERVER_CAP_FENCE: u32 = 1 << 1;
-
-pub const APP_CAP_DIRECT_IMPORT: u32 = 1 << 0;
-pub const APP_CAP_SWAPCHAIN: u32 = 1 << 1;
+pub const SERVER_CAP_SHM: u32 = 1 << 0;
 
 // =============================================================================
 // Frame flags
@@ -58,8 +46,6 @@ pub const TOUCH_PHASE_FRAME: u32 = 4;
 // Limits
 // =============================================================================
 
-pub const MAX_IN_FLIGHT: usize = 2;
-pub const SLOT_COUNT: usize = 3;
 pub const MAX_PLANES: usize = 4;
 
 // =============================================================================
@@ -67,7 +53,6 @@ pub const MAX_PLANES: usize = 4;
 // =============================================================================
 
 pub const DRM_FORMAT_MOD_LINEAR: u64 = 0;
-pub const DRM_FORMAT_MOD_QCOM_COMPRESSED: u64 = 0x0800_0000_0000_0005;
 pub const DRM_FORMAT_XRGB8888: u32 = fourcc(b"XR24");
 pub const DRM_FORMAT_ARGB8888: u32 = fourcc(b"AR24");
 pub const DRM_FORMAT_XBGR8888: u32 = fourcc(b"XB24");
@@ -78,7 +63,7 @@ const fn fourcc(s: &[u8; 4]) -> u32 {
 }
 
 // =============================================================================
-// Plane descriptor (sub-struct reused in Frame and TBUF) — P-03
+// Plane descriptor (sub-struct reused in Frame) — P-03
 // =============================================================================
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout)]
@@ -106,7 +91,7 @@ impl Default for HelloMessage {
         Self {
             magic: MAGIC_HELO,
             protocol_version: PROTOCOL_VERSION,
-            server_caps: SERVER_CAP_BLIT,
+            server_caps: SERVER_CAP_SHM,
             _reserved: 0,
         }
     }
@@ -216,64 +201,7 @@ impl FrameAck {
 }
 
 // =============================================================================
-// 4.5 SlotBuffer (App → server, 64 B) — P-12/P-13
-// =============================================================================
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout)]
-#[repr(C)]
-pub struct SlotBuffer {
-    pub magic: u32,
-    pub slot: u32,
-    pub modifier: u64,
-    pub width: u32,
-    pub height: u32,
-    pub drm_format: u32,
-    pub num_planes: u32,
-    pub planes: [PlaneDesc; 4],
-}
-
-impl SlotBuffer {
-    pub fn new(slot: u32, width: u32, height: u32, drm_format: u32, stride_bytes: u32) -> Self {
-        Self {
-            magic: MAGIC_TBUF,
-            slot,
-            modifier: DRM_FORMAT_MOD_LINEAR,
-            width,
-            height,
-            drm_format,
-            num_planes: 1,
-            planes: [
-                PlaneDesc { offset: 0, stride: stride_bytes },
-                PlaneDesc { offset: 0, stride: 0 },
-                PlaneDesc { offset: 0, stride: 0 },
-                PlaneDesc { offset: 0, stride: 0 },
-            ],
-        }
-    }
-}
-
-// =============================================================================
-// 4.6 BufferGone (server → App, 16 B) — P-15
-// =============================================================================
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout)]
-#[repr(C)]
-pub struct BufferGone {
-    pub magic: u32,
-    pub buffer_id: u32,
-    pub _reserved: u64,
-}
-
-impl BufferGone {
-    pub fn new(buffer_id: u32) -> Self {
-        Self {
-            magic: MAGIC_BGON,
-            buffer_id,
-            _reserved: 0,
-        }
-    }
-}
-
+// 4.5 TouchMessage (App → server, 24 B) — T-01..T-03
 // =============================================================================
 // 4.7 TouchMessage (App → server, 24 B) — T-01..T-03
 // =============================================================================
@@ -326,27 +254,6 @@ impl KeyMessage {
     }
 }
 
-// =============================================================================
-// 4.9 BufferReady (App → server, 16 B) — F-14
-// =============================================================================
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout)]
-#[repr(C)]
-pub struct BufferReady {
-    pub magic: u32,
-    pub slot: u32,
-    pub _reserved: u64,
-}
-
-impl BufferReady {
-    pub fn new(slot: u32) -> Self {
-        Self {
-            magic: MAGIC_BRDY,
-            slot,
-            _reserved: 0,
-        }
-    }
-}
 
 // =============================================================================
 // Message enum (decode output)
@@ -358,11 +265,8 @@ pub enum Message {
     Config(ConfigMessage),
     Frame(FrameMessage, Vec<OwnedFd>),
     Ack(FrameAck),
-    Slot(SlotBuffer),
-    Gone(BufferGone),
     Touch(TouchMessage),
     Key(KeyMessage),
-    Ready(BufferReady),
 }
 
 impl PartialEq for Message {
@@ -372,11 +276,8 @@ impl PartialEq for Message {
             (Self::Config(a), Self::Config(b)) => a == b,
             (Self::Frame(a, fa), Self::Frame(b, fb)) => a == b && fa.len() == fb.len(),
             (Self::Ack(a), Self::Ack(b)) => a == b,
-            (Self::Slot(a), Self::Slot(b)) => a == b,
-            (Self::Gone(a), Self::Gone(b)) => a == b,
             (Self::Touch(a), Self::Touch(b)) => a == b,
             (Self::Key(a), Self::Key(b)) => a == b,
-            (Self::Ready(a), Self::Ready(b)) => a == b,
             _ => false,
         }
     }
@@ -418,11 +319,8 @@ const _: () = {
     assert!(size_of::<ConfigMessage>() == 32);
     assert!(size_of::<FrameMessage>() == 80);
     assert!(size_of::<FrameAck>() == 16);
-    assert!(size_of::<SlotBuffer>() == 64);
-    assert!(size_of::<BufferGone>() == 16);
     assert!(size_of::<TouchMessage>() == 24);
     assert!(size_of::<KeyMessage>() == 16);
-    assert!(size_of::<BufferReady>() == 16);
     assert!(size_of::<PlaneDesc>() == 8);
 };
 
@@ -438,11 +336,8 @@ pub fn encode(msg: &Message) -> Vec<u8> {
         Message::Config(m) => m.as_bytes().to_vec(),
         Message::Frame(m, _) => m.as_bytes().to_vec(),
         Message::Ack(m) => m.as_bytes().to_vec(),
-        Message::Slot(m) => m.as_bytes().to_vec(),
-        Message::Gone(m) => m.as_bytes().to_vec(),
         Message::Touch(m) => m.as_bytes().to_vec(),
         Message::Key(m) => m.as_bytes().to_vec(),
-        Message::Ready(m) => m.as_bytes().to_vec(),
     }
 }
 
@@ -492,16 +387,6 @@ pub fn decode(buf: &[u8], fds: Vec<OwnedFd>) -> Result<Message, ProtoError> {
             let (m, _) = FrameAck::read_from_prefix(buf).unwrap();
             Ok(Message::Ack(m))
         }
-        MAGIC_TBUF => {
-            check_len::<SlotBuffer>(buf)?;
-            let (m, _) = SlotBuffer::read_from_prefix(buf).unwrap();
-            Ok(Message::Slot(m))
-        }
-        MAGIC_BGON => {
-            check_len::<BufferGone>(buf)?;
-            let (m, _) = BufferGone::read_from_prefix(buf).unwrap();
-            Ok(Message::Gone(m))
-        }
         MAGIC_TOUC => {
             check_len::<TouchMessage>(buf)?;
             let (m, _) = TouchMessage::read_from_prefix(buf).unwrap();
@@ -511,11 +396,6 @@ pub fn decode(buf: &[u8], fds: Vec<OwnedFd>) -> Result<Message, ProtoError> {
             check_len::<KeyMessage>(buf)?;
             let (m, _) = KeyMessage::read_from_prefix(buf).unwrap();
             Ok(Message::Key(m))
-        }
-        MAGIC_BRDY => {
-            check_len::<BufferReady>(buf)?;
-            let (m, _) = BufferReady::read_from_prefix(buf).unwrap();
-            Ok(Message::Ready(m))
         }
         _ => Err(ProtoError::BadMagic { got: magic }),
     }

@@ -14,15 +14,6 @@ unsafe extern "C" {
 
 static WINDOW: Mutex<Option<usize>> = Mutex::new(None);
 
-/// Borrow the current ANativeWindow (as `*mut c_void`) for renderer init
-/// (TODO 26). Returns None when no surface is set. Ownership stays here —
-/// the caller must not release it; the window may be replaced by a later
-/// `set_surface`, so use it immediately (e.g. vkCreateAndroidSurfaceKHR) and
-/// don't cache it.
-pub fn window_ptr() -> Option<*mut std::ffi::c_void> {
-    WINDOW.lock().unwrap().filter(|w| *w != 0).map(|w| w as *mut std::ffi::c_void)
-}
-
 pub fn set_surface(env: *mut std::ffi::c_void, surface: jni::sys::jobject) {
     let mut w = WINDOW.lock().unwrap();
     if surface.is_null() {
@@ -139,14 +130,9 @@ fn copy_row_bgra(
     truncated
 }
 
-/// CPU fallback render path (legacy SHM frames / swapchain-unavailable
-/// devices): BGRX→BGRA row copy into the ANativeWindow via
-/// `ANativeWindow_lock`. Deprecated in favor of the Vulkan swapchain present
-/// path (P3, TODO 30): when the swapchain is up, fence frames bypass this
-/// entirely, and this function only serves pre-blit SHM servers or a
-/// failed/absent swapchain init. Kept working — it is the non-swapchain
-/// fallback.
-#[deprecated(note = "CPU fallback path — swapchain present is primary (P3)")]
+/// SHM/CPU render path: BGRX→BGRA row copy into the ANativeWindow via
+/// `ANativeWindow_lock`. This is the only presentation path (SHM-only
+/// protocol — frames are pixel fds).
 pub fn render_frame(serial: u64, width: u32, height: u32, pixel_data: &[u8]) -> Result<(), String> {
     let guard = WINDOW.lock().unwrap();
     let window = match *guard {
@@ -281,7 +267,6 @@ pub fn render_frame_fd(
     }
     // SAFETY: ptr is a live readable mapping of map_len bytes (fstat-guarded).
     let slice = unsafe { std::slice::from_raw_parts(ptr as *const u8, map_len) };
-    #[allow(deprecated)]
     let result = render_frame(serial, width, height, slice);
     unsafe { libc::munmap(ptr, map_len); }
     result
