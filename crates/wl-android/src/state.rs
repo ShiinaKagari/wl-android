@@ -500,6 +500,16 @@ impl CompositorHandler for WlState {
 
     fn commit(&mut self, surface: &WlSurface) {
         tracing::info!("surface commit");
+        // PACING: when the gate says "don't send this frame", skip the whole
+        // extract — writing the FrameCache would mark the buffer in flight
+        // without ever sending its fd, wedging it forever (the App never
+        // learns about a frame it never received). Skipped frames keep the
+        // KWin buffer released (ASYNC-RELEASE below) and the next commit
+        // proceeds normally.
+        if !self.pacing_gate() {
+            tracing::debug!("frame gated by pacing — skipped");
+            return;
+        }
         {
             let extracted: Option<ExtractedFrame> = 'extract: {
                 let parent_data = compositor::with_states(surface, |states| {
@@ -558,35 +568,23 @@ impl CompositorHandler for WlState {
                     tracing::info!(bw, bh, "frame extracted from SHM");
                     // push_damaged returned None when the target buffer was
                     // still in the App's hands (frame dropped, latest-wins).
-                    if fd.is_some() {
-                        let paced = self.pacing_gate();
-                        if let Some(session) = &mut self.app_session
-                            && paced
-                        {
+                    if let Some(fd) = fd {
+                        if let Some(session) = &mut self.app_session {
                             tracing::info!(bw, bh, "sending frame to App");
-                            let _ = session.send_frame(bw, bh, fd.expect("fd checked above"));
+                            let _ = session.send_frame(bw, bh, fd);
                         }
                     }
                 }
                 None => {
-                    tracing::warn!("no SHM buffer extracted on commit");
-                    // 仍发一个空帧（带 fd），保持 SCM_RIGHTS 消息边界对齐
+                    // No new buffer on this commit (KWin reused one or the
+                    // commit carried no buffer): nothing to send — the App
+                    // already holds the current frame. Just make sure the
+                    // FrameCache exists for the next real frame.
+                    tracing::debug!("commit without a new buffer — nothing to send");
                     if self.frame_cache.is_none() {
                         match FrameCache::new(self.screen_width, self.screen_height) {
                             Ok(c) => self.frame_cache = Some(c),
                             Err(e) => tracing::error!(err = %e, "FrameCache::new failed"),
-                        }
-                    }
-                    let paced = self.pacing_gate();
-                    if let Some(cache) = &mut self.frame_cache {
-                        if let Some(fd) = cache.current_frame() {
-                            if let Some(session) = &mut self.app_session
-                                && paced
-                            {
-                                let (fd, _seq, cw, ch) = fd;
-                                cache.mark_current_in_flight();
-                                let _ = session.send_frame(cw, ch, fd);
-                            }
                         }
                     }
                 }

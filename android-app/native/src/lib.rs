@@ -50,7 +50,7 @@ struct Inner {
     /// PERF-13: dedicated write path for input (Touch/Key) — a clone of the
     /// session's write stream, guarded by its own mutex so UI-thread input
     /// never contends with the recv thread's Inner lock (frame bookkeeping).
-    input_write: Mutex<Option<Arc<UnixStream>>>,
+    input_write: Mutex<Option<Arc<std::sync::Mutex<UnixStream>>>>,
     /// Stateless protocol: CONF is a plain event, so no config caching is
     /// needed for a handshake — but nativeOnConfig can still fire before the
     /// session exists (connection retrying), so keep the latest to send on
@@ -195,8 +195,7 @@ extern "system" fn Java_com_wl_android_NativeBridge_nativeInit(
                         read_stream,
                         {
                             let inner = state_clone.lock().unwrap();
-                            inner.session.as_ref().unwrap().write_stream.as_ref().try_clone()
-                                .expect("clone write stream")
+                            inner.session.as_ref().unwrap().write_stream.clone()
                         },
                         move || {
                             // Stateless protocol: the session is live the
@@ -290,10 +289,38 @@ extern "system" fn Java_com_wl_android_NativeBridge_nativeInit(
                     }
                     match guard.frame_queue.pop_back() {
                         Some(f) => {
-                            // latest-wins: drop every older queued frame now —
-                            // their pixel fds would otherwise leak and the
-                            // server's 3-buffer rotation would be overrun.
-                            guard.frame_queue.clear();
+                            // latest-wins: every older queued frame is
+                            // dropped NOW — each one still owes the server a
+                            // RELEASE (its memfd is in flight until the App
+                            // says it is done with it). One RELEASE per
+                            // dropped/consumed fd keeps the server's FIFO
+                            // ownership count exact; leaking them would
+                            // wedge one buffer in flight forever.
+                            let mut dropped = 0usize;
+                            while let Some(old) = guard.frame_queue.pop_front() {
+                                if old.pixel_fd.is_some() {
+                                    dropped += 1;
+                                }
+                            }
+                            // Send the releases OUTSIDE the Inner lock: clone
+                            // the shared write stream, then write.
+                            let ws = guard.input_write.lock().unwrap().clone();
+                            if dropped > 0 {
+                                if let Some(ref ws) = ws {
+                                    let data = wl_android_common::proto::encode(
+                                        &wl_android_common::proto::Message::Release(
+                                            wl_android_common::proto::ReleaseMessage::new(),
+                                        ),
+                                    );
+                                    let mut buf = Vec::with_capacity(4 + data.len());
+                                    buf.extend_from_slice(&(data.len() as u32).to_le_bytes());
+                                    buf.extend_from_slice(&data);
+                                    let mut s = ws.lock().unwrap();
+                                    for _ in 0..dropped {
+                                        let _ = s.write(&buf);
+                                    }
+                                }
+                            }
                             blanked_while_disconnected = false;
                             break f;
                         }
@@ -324,13 +351,28 @@ extern "system" fn Java_com_wl_android_NativeBridge_nativeInit(
                         frame.width, frame.height, &fd,
                     );
                     // Stateless: the frame's pixel fd has been consumed —
-                    // release the memfd so the server can reuse it. Drop the
-                    // fd first (ownership transfer is complete).
+                    // release the memfd so the server can reuse it (one
+                    // RELEASE per consumed/dropped fd keeps the server's
+                    // FIFO ownership count exact).
                     drop(fd);
-                    if let Ok(inner) = render_state.lock() {
-                        if let Some(ref session) = inner.session {
-                            let _ = session.send_release();
-                        }
+                    // Send via the shared input_write stream — no Inner lock
+                    // needed (it is an independent Arc<Mutex<UnixStream>>),
+                    // so this never contends with the recv thread's frame
+                    // bookkeeping.
+                    let ws = {
+                        let inner = render_state.lock().unwrap();
+                        inner.input_write.lock().unwrap().clone()
+                    };
+                    if let Some(ws) = ws {
+                        let data = wl_android_common::proto::encode(
+                            &wl_android_common::proto::Message::Release(
+                                wl_android_common::proto::ReleaseMessage::new(),
+                            ),
+                        );
+                        let mut buf = Vec::with_capacity(4 + data.len());
+                        buf.extend_from_slice(&(data.len() as u32).to_le_bytes());
+                        buf.extend_from_slice(&data);
+                        let _ = ws.lock().unwrap().write(&buf);
                     }
                 }
             }
@@ -419,14 +461,13 @@ extern "system" fn Java_com_wl_android_NativeBridge_nativeOnKey(
 }
 
 /// PERF-13: send an input message over the dedicated input write stream —
-/// only the tiny `input_write` mutex is taken (a clone of the session's write
-/// end), never the Inner lock that the recv thread holds for frame handling.
-/// Drops the message when no session is connected (session: None or stream
-/// absent) — same observable behavior as the previous Inner-locked path.
+/// only the tiny `input_write` mutex is taken (a clone of the session's
+/// write end), never the Inner lock that the recv thread holds for frame
+/// handling. Drops the message when no session is connected.
 ///
-/// The whole message (length prefix + payload) is written in ONE write()
-/// syscall: on SOCK_STREAM a single write is atomic, so this never interleaves
-/// with the recv thread's FACK writes on its own stream clone.
+/// The underlying UnixStream is the SAME mutex-guarded write end as
+/// send_release/send_config — all App→server sends serialize through it, so
+/// message bytes can never interleave on the SOCK_STREAM.
 fn send_input_message(state: &StateRef, msg: &wl_android_common::proto::Message) {
     let Ok(inner) = state.lock() else {
         log::warn!("send_input_message: state lock failed");
@@ -440,11 +481,7 @@ fn send_input_message(state: &StateRef, msg: &wl_android_common::proto::Message)
     let mut buf = Vec::with_capacity(4 + data.len());
     buf.extend_from_slice(&(data.len() as u32).to_le_bytes());
     buf.extend_from_slice(&data);
-    // Single write() call: on SOCK_STREAM the kernel treats one write as an
-    // atomic unit, so the message can never interleave with the recv thread's
-    // FACK writes on its own stream clone. The message is ~40B and the socket
-    // buffer is ≥64KiB, so the write completes in one call in practice.
-    match ws.as_ref().write(&buf) {
+    match ws.lock().unwrap().write(&buf) {
         Ok(n) => log::debug!("send_input_message: wrote {n} bytes"),
         Err(e) => log::warn!("send_input_message: write failed: {e}"),
     }

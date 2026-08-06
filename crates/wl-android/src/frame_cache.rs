@@ -257,20 +257,21 @@ impl FrameCache {
             return None;
         }
 
-        // The App still holds the target buffer's fd — writing now would
-        // race its read. Drop the frame (latest-wins); the pending list
-        // below still records the damage for the next writable turn.
-        if self.in_flight.contains(&self.next) {
-            return None;
-        }
-
-        // Union the new damage into EVERY buffer's pending list: the buffer
-        // we are about to write consumes its own list now; the other buffer
-        // must still learn about this frame's changes for its next turn.
+        // Union the new damage into EVERY buffer's pending list FIRST — this
+        // must happen even when the frame is dropped below, so the next
+        // writable buffer repaints this frame's changes too (latest-wins
+        // must not lose pixels, only frame pacing).
         for pending in &mut self.pending {
             for r in rects {
                 Self::union_rect(pending, *r);
             }
+        }
+
+        // The App still holds the target buffer's fd — writing now would
+        // race its read. Drop the frame (latest-wins); the damage above is
+        // already recorded for the next writable turn.
+        if self.in_flight.contains(&self.next) {
+            return None;
         }
 
         // First write after build/resize: the memfd content is garbage, so
@@ -298,6 +299,13 @@ impl FrameCache {
     /// Extra releases (when no buffer is in flight) are ignored.
     pub fn on_release(&mut self) {
         self.in_flight.pop_front();
+    }
+
+    /// Forget every in-flight buffer (session teardown / App reconnect): the
+    /// old App's outstanding fds are gone, so their ownership marks must not
+    /// survive into the new session's FIFO accounting.
+    pub fn reset_in_flight(&mut self) {
+        self.in_flight.clear();
     }
 
     /// Insert `r` into `list`, merging with any overlapping/adjacent rect so
@@ -926,5 +934,68 @@ mod tests {
         write_rect(&mut expected_a, &Rect { x: 1, y: 1, w: 1, h: 1 }, 4, &frame3);
         write_rect(&mut expected_a, &Rect { x: 2, y: 2, w: 1, h: 1 }, 4, &frame3);
         assert_eq!(read_fd(&fd), expected_a, "A = frame 1 + both missed rects (full convergence)");
+    }
+
+    // PERF-DAMAGE regression (self-audit): a DROPPED frame (target buffer
+    // still in flight) must still accumulate its damage — otherwise the next
+    // writable buffer never repaints that region and pixels are lost.
+    #[test]
+    fn dropped_frame_damage_is_accumulated() {
+        let _serial = fd_guard_lock().lock().unwrap();
+        let _guard = FdCountGuard::new("dropped_frame_damage_is_accumulated");
+        let mut cache = FrameCache::new(4, 4).unwrap();
+        let full = fill_pattern(4, 4, 1);
+
+        // Frame N → buffer A (full), App holds it (in flight).
+        cache
+            .push_damaged(4, 4, &[Rect { x: 0, y: 0, w: 4, h: 4 }], |dst, effective| {
+                for r in effective {
+                    write_rect(dst, r, 4, &full);
+                }
+            })
+            .expect("frame N");
+
+        // Frame N+1 → buffer B (full first write). Both A and B now in
+        // flight: the App has not released either.
+        let f2 = fill_pattern(4, 4, 2);
+        cache
+            .push_damaged(4, 4, &[Rect { x: 0, y: 0, w: 1, h: 1 }], |dst, effective| {
+                assert_eq!(effective, &[Rect { x: 0, y: 0, w: 4, h: 4 }], "B's first write must be full-frame");
+                for r in effective {
+                    write_rect(dst, r, 4, &f2);
+                }
+            })
+            .expect("frame N+1");
+
+        // Frame N+2 → both buffers in flight → DROPPED. Its damage rect
+        // (3,3,1,1) must still reach the next writable buffer's pending list.
+        let f3 = fill_pattern(4, 4, 3);
+        let dropped = cache.push_damaged(4, 4, &[Rect { x: 3, y: 3, w: 1, h: 1 }], |_, _| {
+            panic!("dropped frame must not write");
+        });
+        assert!(dropped.is_none(), "both buffers in flight → frame dropped");
+
+        // App releases A (frame N's buffer). Frame N+3 writes A again; its
+        // effective rects must include the DROPPED frame's rect (3,3) — the
+        // buggy order returned None before accumulating, losing the pixel.
+        cache.on_release();
+        let fd = cache
+            .push_damaged(4, 4, &[Rect { x: 0, y: 0, w: 1, h: 1 }], |dst, effective| {
+                let expected = vec![Rect { x: 0, y: 0, w: 1, h: 1 }, Rect { x: 3, y: 3, w: 1, h: 1 }];
+                let mut eff = effective.to_vec();
+                eff.sort_by_key(|r| (r.x, r.y));
+                let mut exp = expected.clone();
+                exp.sort_by_key(|r| (r.x, r.y));
+                assert_eq!(eff, exp, "dropped frame's damage must be repainted");
+                for r in effective {
+                    write_rect(dst, r, 4, &f3);
+                }
+            })
+            .expect("frame N+3");
+        let a = read_fd(&fd);
+        let mut expected_a = full.clone();
+        write_rect(&mut expected_a, &Rect { x: 0, y: 0, w: 1, h: 1 }, 4, &f3);
+        write_rect(&mut expected_a, &Rect { x: 3, y: 3, w: 1, h: 1 }, 4, &f3);
+        assert_eq!(a, expected_a, "dropped frame's rect applied on the next writable turn");
     }
 }

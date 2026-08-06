@@ -138,25 +138,29 @@ fn dispatch_frame(
 }
 
 pub struct AppSession {
-    pub write_stream: Arc<UnixStream>,
+    /// Write end of the land socket, mutex-guarded: the UI thread sends
+    /// Touch/Key, the render thread sends RELEASE, and (briefly) the recv
+    /// thread sends CONF — concurrent writes on a SOCK_STREAM would
+    /// interleave message bytes. All sends serialize through this lock.
+    pub write_stream: Arc<std::sync::Mutex<UnixStream>>,
 }
 
 impl AppSession {
     /// Connect and return session. The read end is returned separately for
-    /// the dedicated recv thread; the write end is shared for JNI calls.
+    /// the dedicated recv thread; the write end is shared for all sends.
     pub fn connect(path: &str) -> io::Result<(Self, UnixStream)> {
         let stream = UnixStream::connect(path)?;
         stream.set_nonblocking(false)?;
-        let write_stream = Arc::new(stream.try_clone()?);
+        let write_stream = Arc::new(std::sync::Mutex::new(stream.try_clone()?));
         let read_stream = stream;
         Ok((Self { write_stream }, read_stream))
     }
 
-    // ── Send (JNI-facing, shared via Arc) ──
+    // ── Send (shared via Arc, serialized by the write mutex) ──
 
     fn write_msg(&self, data: &[u8]) -> io::Result<()> {
         let len = (data.len() as u32).to_le_bytes();
-        let mut s = self.write_stream.as_ref();
+        let mut s = self.write_stream.lock().unwrap();
         s.write_all(&len)?;
         s.write_all(data)?;
         s.flush()
@@ -174,6 +178,9 @@ impl AppSession {
     /// Buffer-ownership signal: the App finished consuming a frame's pixel
     /// fd and the server may reuse that memfd. Order-only (FIFO on the
     /// server side) — one release per consumed frame.
+    /// Production sends RELEASE directly via the shared input_write stream
+    /// (render thread, no Inner lock); kept for the wire-level tests.
+    #[allow(dead_code)]
     pub fn send_release(&self) -> io::Result<()> {
         self.send_message(&Message::Release(proto::ReleaseMessage::new()))
     }
@@ -185,22 +192,24 @@ impl AppSession {
     /// an independent event.
     pub fn run_loop(
         read_stream: UnixStream,
-        write_stream: UnixStream,
+        write_stream: Arc<std::sync::Mutex<UnixStream>>,
         on_connected: impl FnOnce(),
         on_frame: impl Fn(u32, u32, Option<OwnedFd>),
         on_config_update: impl Fn(u32, u32, u32, u32, u32),
     ) -> io::Result<()> {
         log::debug!("run_loop: entered");
         let mut reader = PendingReader::new(read_stream);
-        let mut wr = write_stream;
+        let wr = write_stream;
 
         // 1. Send CONF (a plain event, not a handshake) — the server applies
         // it and mirrors the effective geometry back via ConfigUpdate.
         let conf_data = proto::encode(&Message::Config(proto::ConfigMessage::new(3392, 2400, 144000, 289, 0, 0)));
-        let len = (conf_data.len() as u32).to_le_bytes();
-        wr.write_all(&len)?;
-        wr.write_all(&conf_data)?;
-        wr.flush()?;
+        {
+            let mut s = wr.lock().unwrap();
+            s.write_all(&conf_data.len().to_le_bytes())?;
+            s.write_all(&conf_data)?;
+            s.flush()?;
+        }
         log::info!("CONF sent, entering event loop");
         on_connected();
 
@@ -247,16 +256,6 @@ impl AppSession {
                 }
             }
         }
-    }
-
-    /// P-05 framing onto an arbitrary write end (run_loop owns its stream
-    /// rather than a session instance): u32 LE length, then the payload.
-    #[allow(dead_code)]
-    fn write_msg_on(wr: &mut UnixStream, data: &[u8]) -> io::Result<()> {
-        let len = (data.len() as u32).to_le_bytes();
-        wr.write_all(&len)?;
-        wr.write_all(data)?;
-        wr.flush()
     }
 
 }

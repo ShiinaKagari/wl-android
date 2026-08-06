@@ -205,6 +205,12 @@ fn accept_land_connections(state: &mut WlState, event_handle: &calloop::LoopHand
                             if let Some(old_token) = state.land_source.take() {
                                 event_handle.remove(old_token);
                             }
+                            // The old App's outstanding fd ownership is void —
+                            // its in-flight marks must not leak into the new
+                            // session's FIFO accounting.
+                            if let Some(cache) = &mut state.frame_cache {
+                                cache.reset_in_flight();
+                            }
                         }
                         state.app_session = Some(AppSession::new(transport));
 
