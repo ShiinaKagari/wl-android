@@ -19,6 +19,7 @@ use smithay::input::{Seat, SeatHandler, SeatState};
 use smithay::utils::{Logical, Point, Serial};
 use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
+use smithay::reexports::wayland_server::Resource as WlResource;
 use smithay::reexports::wayland_server::Display;
 use smithay::wayland::compositor::{self, BufferAssignment, CompositorClientState, CompositorHandler, CompositorState, SurfaceAttributes};
 use smithay::wayland::output::OutputManagerState;
@@ -511,7 +512,15 @@ impl CompositorHandler for WlState {
     }
 
     fn commit(&mut self, surface: &WlSurface) {
-        tracing::info!("surface commit");
+        let is_output_tree = self
+            .toplevel
+            .as_ref()
+            .is_some_and(|t| surface_tree_contains(t.wl_surface(), surface));
+        let top_id = self.toplevel.as_ref().map(|t| t.wl_surface().id());
+        // DIAG: surface identity + tree match, so a single run shows whether
+        // the committed surface is the toplevel, a tree child, or the
+        // independent cursor sprite.
+        tracing::info!(surface_id = ?surface.id(), is_output_tree, ?top_id, "surface commit");
         // SURFACE-FILTER: only the toplevel OUTPUT surface's frames go to
         // the App. KWin also commits auxiliary surfaces — most notably its
         // 32x32 cursor sprite surface (wl_pointer.set_cursor), which animates
