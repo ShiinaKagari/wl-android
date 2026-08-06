@@ -45,8 +45,8 @@ show_status() {
 start_server() {
     echo "--- rebuild server in container ---"
     run "cd $REPO && cargo build --release -p wl-android > /tmp/b.log 2>&1; tail -2 /tmp/b.log"
-    echo "--- deploy ---"
-    run "cp $REPO/target/release/wl-android /data/local/tmp/wl-android/wl-android"
+    echo "--- deploy (container /run/wl-android = host /data/local/tmp/wl-android) ---"
+    run "cp $REPO/target/release/wl-android /run/wl-android/wl-android"
     echo "--- restart session ---"
     run "pkill plasmashell; pkill kwin_wayland; pkill wl-android; sleep 1" || true
     sleep 2

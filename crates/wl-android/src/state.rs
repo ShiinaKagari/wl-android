@@ -141,12 +141,6 @@ pub struct WlState {
     pub dmabuf_state: smithay::wayland::dmabuf::DmabufState,
     /// Single SHM frame buffer (fallback path; dmabuf frames bypass this).
     pub frame_mem: Option<FrameMem>,
-    /// FIFO of KWin wl_buffers handed to the App, awaiting RELEASE. Each
-    /// RELEASE pops the oldest and releases it back to KWin (back-pressure:
-    /// KWin's buffer pool is the frame-rate limiter).
-    pub pending_release: std::collections::VecDeque<
-        smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer,
-    >,
     pub app_session: Option<AppSession>,
     pub land_listener: Option<UnixListener>,
     /// calloop source for the App session's land socket fd (event-driven
@@ -244,7 +238,6 @@ impl WlState {
         let state = Self {
             display, compositor_state, shm_state, xdg_shell_state, dmabuf_state,
             frame_mem: None,
-            pending_release: std::collections::VecDeque::new(),
             app_session: None, land_listener: None, land_source: None,
             clock_epoch: std::time::Instant::now(),
             screen_width: w, screen_height: h, refresh_millihz: refresh, dpi,
@@ -469,11 +462,14 @@ impl CompositorHandler for WlState {
 
     fn commit(&mut self, surface: &WlSurface) {
         tracing::info!("surface commit");
-        // Back-pressure via KWin's buffer pool: a committed buffer is NOT
-        // released immediately — it stays in `pending_release` until the App
-        // replies with RELEASE (having consumed the frame). KWin's pool
-        // (typically 2-3 buffers) is therefore the frame-rate limiter,
-        // replacing the old pacing gate.
+        // ASYNC-RELEASE: KWin's buffer is released IMMEDIATELY after
+        // extraction. dmabuf frames are forwarded as a dup'd fd (the App's
+        // fd is an independent reference — KWin reusing the buffer is safe);
+        // SHM frames are copied into our own FrameMem. Holding KWin's buffer
+        // until the App's RELEASE would exhaust KWin's EGL buffer pool and
+        // crash it (eglSwapBuffers fails with EGL_BAD_SURFACE when no buffer
+        // is available). The App's RELEASE is now purely a consumption
+        // signal, not a KWin lifecycle gate.
         {
             let extracted: Option<ExtractedFrame> = 'extract: {
                 let parent_data = compositor::with_states(surface, |states| {
@@ -485,10 +481,11 @@ impl CompositorHandler for WlState {
                     match buffer {
                         Some(BufferAssignment::NewBuffer(wl_buffer)) => {
                             let r = extract_frame(&wl_buffer, &mut self.frame_mem);
-                            // The buffer is handed to the App (its pixels are
-                            // being consumed remotely); it is released when
-                            // the App's RELEASE arrives (FIFO).
-                            self.pending_release.push_back(wl_buffer);
+                            // ASYNC-RELEASE: KWin's buffer is free now — the
+                            // pixels were dup'd/copied above. Dropping
+                            // WlBuffer alone does NOT send wl_buffer.release;
+                            // smithay's own code always calls it explicitly.
+                            wl_buffer.release();
                             r
                         }
                         _ => None,
@@ -503,7 +500,7 @@ impl CompositorHandler for WlState {
                         match buffer {
                             Some(BufferAssignment::NewBuffer(wl_buffer)) => {
                                 let r = extract_frame(&wl_buffer, &mut self.frame_mem);
-                                self.pending_release.push_back(wl_buffer);
+                                wl_buffer.release();
                                 r
                             }
                             _ => None,

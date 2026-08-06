@@ -206,11 +206,6 @@ fn accept_land_connections(state: &mut WlState, event_handle: &calloop::LoopHand
                             if let Some(old_token) = state.land_source.take() {
                                 event_handle.remove(old_token);
                             }
-                            // The old App's outstanding frames are void —
-                            // release every pending KWin buffer back to it.
-                            while let Some(buffer) = state.pending_release.pop_front() {
-                                buffer.release();
-                            }
                         }
                         state.app_session = Some(AppSession::new(transport));
 
@@ -284,14 +279,12 @@ fn handle_land_input(state: &mut WlState) -> bool {
     };
     match session.recv_message() {
         Ok(Some(msg)) => match msg {
-            // Buffer-ownership signal: the App consumed the oldest in-flight
-            // frame's pixel fd — the FrameCache frees that memfd (FIFO).
+            // Consumption signal: the App finished reading a frame's fd. KWin
+            // buffers are released immediately at commit (ASYNC-RELEASE), so
+            // there is nothing to return here — this is purely an ack for
+            // logging/accounting.
             wl_android_common::proto::Message::Release(_) => {
-                // The App consumed the oldest outstanding frame — release
-                // that KWin buffer back to it (FIFO back-pressure).
-                if let Some(buffer) = state.pending_release.pop_front() {
-                    buffer.release();
-                }
+                tracing::debug!("App released a frame");
                 false
             }
             wl_android_common::proto::Message::Touch(tm) => {
