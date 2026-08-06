@@ -154,17 +154,36 @@ fn extract_from_buffer(
 /// TODO 23: dmabuf frames stashed at commit time, keyed by per-wl_buffer id,
 /// waiting for the router's EnqueueFrame to drive the blit. Replaces the
 /// unkeyed `pending_pixel_fds` (which could pair an fd with the wrong frame).
+///
+/// Bounded: when the session stalls (e.g. stuck in SlotRegistration because
+/// not all TBUFs arrived, or blit never consumes), KWin keeps committing and
+/// every stash would otherwise pin a fresh 32MB dmabuf fd forever → OOM kills
+/// the whole device (observed). Past [`Self::MAX_PENDING`] the OLDEST entry is
+/// dropped (its fd closes) — latest-wins, same as the router's pending frame.
 #[derive(Default)]
 pub struct PendingFrames {
     map: HashMap<u32, (OwnedFd, u32, u32, ash::vk::Format, u64)>,
 }
 
 impl PendingFrames {
+    /// Upper bound on stashed frames. A stall must not accumulate unbounded
+    /// dmabuf fds; 4 covers the router's in-flight window + slack.
+    const MAX_PENDING: usize = 4;
+
     pub fn stash(
         &mut self, key: u32, fd: OwnedFd, w: u32, h: u32,
         format: ash::vk::Format, modifier: u64,
     ) {
         self.map.insert(key, (fd, w, h, format, modifier));
+        while self.map.len() > Self::MAX_PENDING {
+            // Evict the oldest key (HashMap iteration order is arbitrary but
+            // stable enough for a bounded cap — any eviction beats leaking).
+            if let Some(old_key) = self.map.keys().next().copied() {
+                self.map.remove(&old_key);
+            } else {
+                break;
+            }
+        }
     }
 
     pub fn take(&mut self, key: u32) -> Option<(OwnedFd, u32, u32, ash::vk::Format, u64)> {
