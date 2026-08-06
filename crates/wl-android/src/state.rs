@@ -462,6 +462,16 @@ impl CompositorHandler for WlState {
 
     fn commit(&mut self, surface: &WlSurface) {
         tracing::info!("surface commit");
+        // SURFACE-FILTER: only the toplevel OUTPUT surface's frames go to
+        // the App. KWin also commits auxiliary surfaces — most notably its
+        // 32x32 cursor sprite surface (wl_pointer.set_cursor), which animates
+        // at frame rate while the desktop is static. Forwarding those tiny
+        // frames would let the App's latest-wins renderer overwrite the real
+        // picture with a 32x32 cursor frame (black screen + dead panel).
+        // Frame callbacks and presentation feedback still go out for every
+        // surface, so KWin's per-surface render loops stay alive.
+        let is_output_surface =
+            self.toplevel.as_ref().is_some_and(|t| t.wl_surface() == surface);
         // ASYNC-RELEASE: KWin's buffer is released IMMEDIATELY after
         // extraction. dmabuf frames are forwarded as a dup'd fd (the App's
         // fd is an independent reference — KWin reusing the buffer is safe);
@@ -470,7 +480,7 @@ impl CompositorHandler for WlState {
         // crash it (eglSwapBuffers fails with EGL_BAD_SURFACE when no buffer
         // is available). The App's RELEASE is now purely a consumption
         // signal, not a KWin lifecycle gate.
-        {
+        if is_output_surface {
             let extracted: Option<ExtractedFrame> = 'extract: {
                 let parent_data = compositor::with_states(surface, |states| {
                     let mut guard = states.cached_state.get::<SurfaceAttributes>();
@@ -528,6 +538,15 @@ impl CompositorHandler for WlState {
                     tracing::debug!("commit without a new buffer — nothing to send");
                 }
             }
+        } else {
+            // SURFACE-FILTER: auxiliary surface (e.g. KWin's cursor sprite)
+            // committed a frame — release its buffer and forward nothing.
+            compositor::with_states(surface, |states| {
+                let mut guard = states.cached_state.get::<SurfaceAttributes>();
+                if let Some(BufferAssignment::NewBuffer(wl_buffer)) = guard.current().buffer.take() {
+                    wl_buffer.release();
+                }
+            });
         }
 
 
