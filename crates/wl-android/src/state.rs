@@ -437,6 +437,56 @@ impl WlState {
 
 // ── Compositor ──
 
+/// SURFACE-FILTER: is `target` inside the surface tree rooted at `root`
+/// (root itself, its subsurfaces, and recursively their children)? KWin
+/// renders its wayland output through a subsurface CHILD of the xdg_toplevel,
+/// not the toplevel surface itself — a plain `toplevel.wl_surface() == s`
+/// check would filter out every real frame and starve KWin (it then fails
+/// EGL init and reconnects in a loop). The cursor sprite is NOT in this
+/// tree, so its frames stay filtered out.
+fn surface_tree_contains(root: &WlSurface, target: &WlSurface) -> bool {
+    if root == target {
+        return true;
+    }
+    compositor::get_children(root)
+        .iter()
+        .any(|c| surface_tree_contains(c, target))
+}
+
+/// Extract the first new buffer from `surface`'s tree (own surface first,
+/// then subsurfaces depth-first), releasing each consumed wl_buffer
+/// immediately (ASYNC-RELEASE). Returns the extracted frame, if any.
+fn extract_tree(surface: &WlSurface, frame_mem: &mut Option<FrameMem>) -> Option<ExtractedFrame> {
+    let own = compositor::with_states(surface, |states| {
+        let mut guard = states.cached_state.get::<SurfaceAttributes>();
+        // Take the buffer out and clear the field — smithay's docs allow
+        // this ("free to set this field to None to avoid processing it
+        // several times").
+        let buffer = guard.current().buffer.take();
+        match buffer {
+            Some(BufferAssignment::NewBuffer(wl_buffer)) => {
+                let r = extract_frame(&wl_buffer, frame_mem);
+                // ASYNC-RELEASE: the buffer is free now — the pixels were
+                // dup'd/copied above. Dropping WlBuffer alone does NOT send
+                // wl_buffer.release; smithay's own code always calls it
+                // explicitly.
+                wl_buffer.release();
+                r
+            }
+            _ => None,
+        }
+    });
+    if own.is_some() {
+        return own;
+    }
+    for child in compositor::get_children(surface) {
+        if let Some(f) = extract_tree(&child, frame_mem) {
+            return Some(f);
+        }
+    }
+    None
+}
+
 impl CompositorHandler for WlState {
     fn compositor_state(&mut self) -> &mut CompositorState {
         &mut self.compositor_state
@@ -470,8 +520,19 @@ impl CompositorHandler for WlState {
         // picture with a 32x32 cursor frame (black screen + dead panel).
         // Frame callbacks and presentation feedback still go out for every
         // surface, so KWin's per-surface render loops stay alive.
-        let is_output_surface =
-            self.toplevel.as_ref().is_some_and(|t| t.wl_surface() == surface);
+        // SURFACE-FILTER: only frames from the toplevel output surface TREE
+        // go to the App. KWin renders its output through a subsurface child
+        // of the xdg_toplevel (its own tree), and also owns an independent
+        // 32x32 cursor sprite surface that animates at frame rate while the
+        // desktop is static. Forwarding the cursor's tiny frames would let
+        // the App's latest-wins renderer overwrite the real picture with a
+        // 32x32 cursor frame (black screen + dead panel). Frame callbacks
+        // and presentation feedback still go out for every surface, so
+        // KWin's per-surface render loops stay alive.
+        let is_output_tree = self
+            .toplevel
+            .as_ref()
+            .is_some_and(|t| surface_tree_contains(t.wl_surface(), surface));
         // ASYNC-RELEASE: KWin's buffer is released IMMEDIATELY after
         // extraction. dmabuf frames are forwarded as a dup'd fd (the App's
         // fd is an independent reference — KWin reusing the buffer is safe);
@@ -480,46 +541,8 @@ impl CompositorHandler for WlState {
         // crash it (eglSwapBuffers fails with EGL_BAD_SURFACE when no buffer
         // is available). The App's RELEASE is now purely a consumption
         // signal, not a KWin lifecycle gate.
-        if is_output_surface {
-            let extracted: Option<ExtractedFrame> = 'extract: {
-                let parent_data = compositor::with_states(surface, |states| {
-                    let mut guard = states.cached_state.get::<SurfaceAttributes>();
-                    // Take the buffer out and clear the field — smithay's
-                    // docs allow this ("free to set this field to None to
-                    // avoid processing it several times").
-                    let buffer = guard.current().buffer.take();
-                    match buffer {
-                        Some(BufferAssignment::NewBuffer(wl_buffer)) => {
-                            let r = extract_frame(&wl_buffer, &mut self.frame_mem);
-                            // ASYNC-RELEASE: KWin's buffer is free now — the
-                            // pixels were dup'd/copied above. Dropping
-                            // WlBuffer alone does NOT send wl_buffer.release;
-                            // smithay's own code always calls it explicitly.
-                            wl_buffer.release();
-                            r
-                        }
-                        _ => None,
-                    }
-                });
-                if parent_data.is_some() { break 'extract parent_data; }
-                let children = compositor::get_children(surface);
-                for child in &children {
-                    let child_data = compositor::with_states(child, |states| {
-                        let mut guard = states.cached_state.get::<SurfaceAttributes>();
-                        let buffer = guard.current().buffer.take();
-                        match buffer {
-                            Some(BufferAssignment::NewBuffer(wl_buffer)) => {
-                                let r = extract_frame(&wl_buffer, &mut self.frame_mem);
-                                wl_buffer.release();
-                                r
-                            }
-                            _ => None,
-                        }
-                    });
-                    if child_data.is_some() { break 'extract child_data; }
-                }
-                None
-            };
+        if is_output_tree {
+            let extracted = extract_tree(surface, &mut self.frame_mem);
 
             match extracted {
                 Some(ExtractedFrame::Dmabuf(bw, bh, fd)) => {
