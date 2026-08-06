@@ -75,11 +75,11 @@ pub fn run() {
     // time is stamped on the server, present-complete on the App. doctor is
     // server-side only and cannot measure both ends alone.
     println!("PERF-02/03 (end-to-end latency p95 @60/144Hz): measured at the App —");
-    println!("  serial-timestamp diff of commit(server) ↔ present(App); App doctor");
+    println!("  commit(server) ↔ present(App) timestamp diff; App doctor");
     println!("  page aggregates p95. doctor (server-side) cannot measure");
     println!("  cross-process latency alone; frame flow is spot-checked by");
     println!("  scripts/deploy-test.sh verify (logcat 'Frame received|render:'");
-    println!("  counts at T0 vs T3 — serials advance ⇒ frames are flowing).");
+    println!("  counts at T0 vs T3 — frame count advances ⇒ frames flow).");
     println!();
     println!("doctor check complete.");
 }
