@@ -4,11 +4,14 @@ use std::os::unix::net::UnixListener;
 /// DELAYED-RELEASE: each output wl_buffer is held for this many commits
 /// after extraction, then returned to KWin. The App's MAP_SHARED read of
 /// the forwarded dmabuf fd happens only during its memcpy (lock waits do
-/// not read), ~3-6ms — two frames at 144Hz (~14ms) covers it with margin,
-/// so KWin's rewrite can never race the App's read (no tearing), while
-/// KWin's frame rate stays its own capability (NOT gated by App
-/// consumption). Must stay < KWin's pool size (typically 2-3).
-const DELAYED_RELEASE_FRAMES: usize = 2;
+/// not read), ~3-6ms — one frame at 144Hz (~7ms) is the safe window.
+///
+/// MUST be 1: with KWin's pool at 2 (its minimum), holding 2 buffers
+/// deadlocks — KWin submits its 2 buffers, then waits for a release that
+/// only arrives on the NEXT commit (which never comes). Holding 1 keeps
+/// one buffer always available while still giving the App's read a
+/// one-frame window against KWin's rewrite.
+const DELAYED_RELEASE_FRAMES: usize = 1;
 
 use smithay::delegate_compositor;
 use smithay::delegate_content_type;
