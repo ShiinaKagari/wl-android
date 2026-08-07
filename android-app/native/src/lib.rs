@@ -280,6 +280,8 @@ extern "system" fn Java_com_wl_android_NativeBridge_nativeInit(
             // CONN-STATE: cleared on Disconnected so the screen is blanked
             // once, not repeatedly while parked on the condvar.
             let mut blanked_while_disconnected = false;
+            // DIAG-BLACKSCREEN: rendered-frame counter for the heartbeat log.
+            let mut rendered_frames: u64 = 0;
             // Per-fd mmap cache: KWin's buffer pool rotates through a few
             // fds; mapping each once avoids 32MB mmap+munmap per frame.
             let mut mmap_cache = crate::jni_bridge::FdMmapCache::new();
@@ -353,6 +355,18 @@ extern "system" fn Java_com_wl_android_NativeBridge_nativeInit(
                     let _ = crate::jni_bridge::render_frame_fd_cached(
                         frame.width, frame.height, &fd, &mut mmap_cache,
                     );
+                    // DIAG-BLACKSCREEN: heartbeat — every 120 rendered
+                    // frames log a line so logcat shows whether frames are
+                    // arriving and being rendered (vs. stuck on blank).
+                    rendered_frames += 1;
+                    if rendered_frames % 120 == 0 {
+                        log::info!(
+                            "render heartbeat: {rendered_frames} frames rendered ({}x{}), queue_depth={}",
+                            frame.width,
+                            frame.height,
+                            render_state.lock().unwrap().frame_queue.len(),
+                        );
+                    }
                     // Stateless: the frame's pixel fd has been consumed —
                     // release the memfd so the server can reuse it (one
                     // RELEASE per consumed/dropped fd keeps the server's

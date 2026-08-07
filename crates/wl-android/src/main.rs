@@ -143,6 +143,20 @@ fn run_server() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("listening on wayland socket {wayland_display}");
 
+    // VSYNC-PACING: a steady timer at the output refresh rate (144Hz) that
+    // flushes queued frame callbacks / presentation feedbacks — KWin's
+    // render loop is driven by this beat. Registered BEFORE the land socket
+    // source so vsync ticks are never starved by App traffic.
+    let vsync_period = state.vsync_period();
+    let vsync_timer = calloop::timer::Timer::from_duration(vsync_period);
+    event_loop
+        .handle()
+        .insert_source(vsync_timer, move |_, _meta, state| {
+            state.vsync_tick();
+            calloop::timer::TimeoutAction::ToDuration(vsync_period)
+        })?;
+    info!(?vsync_period, "vsync timer started");
+
     let event_handle = event_loop.handle();
 
     // Ensure non-root clients (kagari) can connect

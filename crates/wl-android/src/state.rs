@@ -19,6 +19,7 @@ use smithay::input::{Seat, SeatHandler, SeatState};
 use smithay::utils::{Logical, Point, Serial};
 use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
 use smithay::reexports::wayland_server::backend::ClientData;
+use smithay::reexports::wayland_server::protocol::wl_callback::WlCallback;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::Resource as WlResource;
 use smithay::reexports::wayland_server::Display;
@@ -33,7 +34,7 @@ use smithay::wayland::alpha_modifier::AlphaModifierState;
 use smithay::wayland::pointer_constraints::{PointerConstraintsHandler, PointerConstraintsState};
 use smithay::wayland::fractional_scale::FractionalScaleManagerState;
 use smithay::wayland::fractional_scale::FractionalScaleHandler;
-use smithay::wayland::presentation::{PresentationState, PresentationFeedbackCachedState};
+use smithay::wayland::presentation::{PresentationFeedbackCallback, PresentationState, PresentationFeedbackCachedState};
 use smithay::wayland::presentation::Refresh;
 use tracing::info;
 use wayland_protocols::xdg::shell::server::xdg_toplevel;
@@ -162,6 +163,17 @@ pub struct WlState {
     pub seat: Seat<Self>,
     pub touch_injector: TouchInjector,
     pub next_serial: u32,
+    /// VSYNC-PACING: frame callbacks & presentation feedbacks queued by
+    /// commits are NOT dispatched immediately — they are flushed by the
+    /// vsync timer at the output's refresh rate (144Hz). KWin's render loop
+    /// is driven by these signals; an irregular, event-driven dispatch (one
+    /// per commit, whenever that happens to arrive) leaves KWin's vsync
+    /// monitor without a trustworthy beat, so it falls back to input-driven
+    /// rendering — "plasma needs a tap to continue". A stable beat keeps
+    /// KWin rendering at min(144Hz, its own capability).
+    pub pending_callbacks: Vec<WlCallback>,
+    pub pending_feedbacks: Vec<PresentationFeedbackCallback>,
+    pub vsync_seq: u64,
 }
 
 /// PERF-11 import-cache bound: a destroyed wl_buffer's entry lingers (the
@@ -246,6 +258,9 @@ impl WlState {
             frame_mode: 0,
             output, toplevel: None, seat_state, seat, touch_injector,
             next_serial: 1,
+            pending_callbacks: Vec::new(),
+            pending_feedbacks: Vec::new(),
+            vsync_seq: 1,
         };
 
 
@@ -608,38 +623,73 @@ impl CompositorHandler for WlState {
 
 
 
-        let now_ms = std::time::Instant::now()
-            .duration_since(self.clock_epoch)
-            .as_millis() as u32;
-        let period_ns = 1_000_000_000_000u64 / self.refresh_millihz as u64;
-        let refresh = Refresh::Fixed(std::time::Duration::from_nanos(period_ns));
-        let seq = self.next_serial as u64;
+        // VSYNC-PACING: collect this commit's frame callbacks and
+        // presentation feedbacks into the pending queues — the vsync timer
+        // (output refresh rate) flushes them at a steady beat. Dispatching
+        // here, immediately, gives KWin an irregular event-driven signal
+        // instead of a vsync.
         compositor::with_states(surface, |states| {
             let mut guard = states.cached_state.get::<SurfaceAttributes>();
-            let count = guard.current().frame_callbacks.len();
-            for cb in guard.current().frame_callbacks.drain(..) {
-                cb.done(now_ms);
-            }
-            if count > 0 {
-                tracing::info!(count, "dispatched frame callbacks");
+            let cbs: Vec<_> = guard.current().frame_callbacks.drain(..).collect();
+            if !cbs.is_empty() {
+                tracing::info!(count = cbs.len(), "vsync: queued frame callbacks");
+                self.pending_callbacks.extend(cbs);
             }
         });
         compositor::with_states(surface, |states| {
             let mut guard = states.cached_state.get::<PresentationFeedbackCachedState>();
-            let count = guard.current().callbacks.len();
-            for fb in guard.current().callbacks.drain(..) {
-                fb.presented(
-                    &self.output,
-                    std::time::Instant::now().duration_since(self.clock_epoch),
-                    refresh,
-                    seq,
-                    wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::Kind::Vsync,
-                );
-            }
-            if count > 0 {
-                tracing::info!(count, "dispatched presentation feedbacks");
+            let fbs: Vec<_> = guard.current().callbacks.drain(..).collect();
+            if !fbs.is_empty() {
+                self.pending_feedbacks.extend(fbs);
             }
         });
+    }
+}
+
+impl WlState {
+    /// VSYNC-PACING: called by the vsync timer at the output refresh rate
+    /// (144Hz). Flushes all queued frame callbacks and presentation
+    /// feedbacks with a single monotonic beat, giving KWin a stable vsync
+    /// signal to drive its render loop (no more input-driven "tap to
+    /// continue" fallback). No-op when nothing is queued.
+    pub fn vsync_tick(&mut self) {
+        if self.pending_callbacks.is_empty() && self.pending_feedbacks.is_empty() {
+            return;
+        }
+        let elapsed = std::time::Instant::now().duration_since(self.clock_epoch);
+        let now_ms = elapsed.as_millis() as u32;
+        let period_ns = 1_000_000_000_000u64 / self.refresh_millihz.max(1) as u64;
+        let refresh = Refresh::Fixed(std::time::Duration::from_nanos(period_ns));
+        let seq = self.vsync_seq;
+        self.vsync_seq += 1;
+
+        let callbacks = std::mem::take(&mut self.pending_callbacks);
+        let count = callbacks.len();
+        for cb in callbacks {
+            // Guard: the client may have disconnected while the callback was
+            // queued — done() on a destroyed resource would misbehave.
+            if cb.is_alive() {
+                cb.done(now_ms);
+            }
+        }
+        if count > 0 {
+            tracing::info!(count, "vsync: dispatched frame callbacks");
+        }
+        for fb in self.pending_feedbacks.drain(..) {
+            fb.presented(
+                &self.output,
+                elapsed,
+                refresh,
+                seq,
+                wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::Kind::Vsync,
+            );
+        }
+    }
+
+    /// VSYNC-PACING: the refresh period for the vsync timer, derived from
+    /// the App-reported refresh rate (CONF).
+    pub fn vsync_period(&self) -> std::time::Duration {
+        std::time::Duration::from_nanos(1_000_000_000_000u64 / self.refresh_millihz.max(1) as u64)
     }
 }
 
