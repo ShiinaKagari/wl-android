@@ -16,12 +16,44 @@ class TouchForwarder(
         const val TOUCH_FRAME = 4
     }
 
-    // MOVE-THROTTLE: last forwarded event time per pointer id. Sliding
-    // produces 120Hz+ MOVE streams; forwarding every one floods the server's
-    // touch injection and KWin's input handling (fast swipes crashed KWin).
-    // A per-pointer 8ms window coalesces the stream while keeping full
-    // trajectory fidelity (the last position in each window is sent).
-    private val lastMoveTime = HashMap<Int, Int>()
+    // FRAME-COALESCE: per-pointer MOVE cache flushed at the display frame
+    // boundary (Choreographer vsync). A sliding finger produces 120Hz+ MOVE
+    // streams; forwarding every one floods the server's touch injection and
+    // KWin's input handling (fast swipes crashed KWin). Within one frame
+    // time only the LAST MOVE per pointer is kept and committed when the
+    // frame ticks — one MOVE per display frame, aligned to the render
+    // rhythm, with full trajectory fidelity (final position per frame).
+    //
+    // DOWN/UP/CANCEL are NOT coalesced: they are state transitions and must
+    // arrive immediately (a tap's DOWN-UP gap can be shorter than one frame;
+    // caching would drop the DOWN and desync the touch state machine).
+    private data class PendingMove(val x: Float, val y: Float, val timeMs: Int)
+    private val pendingMoves = HashMap<Int, PendingMove>()
+    private var framePosted = false
+    private val choreographer by lazy { android.view.Choreographer.getInstance() }
+    private val frameCallback = object : android.view.Choreographer.FrameCallback {
+        override fun doFrame(frameTimeNanos: Long) {
+            framePosted = false
+            if (pendingMoves.isEmpty()) {
+                return
+            }
+            var latest = 0
+            for ((id, mv) in pendingMoves) {
+                onTouch(id, mv.x, mv.y, TOUCH_MOVE, mv.timeMs)
+                if (mv.timeMs > latest) latest = mv.timeMs
+            }
+            pendingMoves.clear()
+            // T-02: frame sentinel after the coalesced MOVE batch.
+            onTouch(0, 0f, 0f, TOUCH_FRAME, latest)
+        }
+    }
+
+    private fun postFrame() {
+        if (!framePosted) {
+            framePosted = true
+            choreographer.postFrameCallback(frameCallback)
+        }
+    }
 
     fun handle(event: MotionEvent) {
         val actionMasked = event.actionMasked
@@ -45,21 +77,17 @@ class TouchForwarder(
                 else -> TOUCH_MOVE
             }
             if (phase == TOUCH_MOVE) {
-                // MOVE-THROTTLE: coalesce moves within an 8ms window.
-                val now = event.eventTime.toInt()
-                val last = lastMoveTime[id]
-                if (last != null && now - last < 8) {
-                    // Keep the latest position for the next window — skip.
-                    continue
-                }
-                lastMoveTime[id] = now
+                // FRAME-COALESCE: keep the latest position; commit at the
+                // display frame boundary.
+                pendingMoves[id] = PendingMove(nx, ny, event.eventTime.toInt())
+                postFrame()
             } else {
-                // DOWN/UP/CANCEL reset the throttle window for this pointer.
-                lastMoveTime.remove(id)
+                // State transition: deliver immediately, drop any cached
+                // MOVE for this pointer (the state has changed).
+                pendingMoves.remove(id)
+                onTouch(id, nx, ny, phase, event.eventTime.toInt())
+                onTouch(0, 0f, 0f, TOUCH_FRAME, event.eventTime.toInt())
             }
-            onTouch(id, nx, ny, phase, event.eventTime.toInt())
         }
-        // T-02: frame sentinel after all pointers
-        onTouch(0, 0f, 0f, TOUCH_FRAME, event.eventTime.toInt())
     }
 }
