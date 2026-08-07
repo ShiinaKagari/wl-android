@@ -16,6 +16,13 @@ class TouchForwarder(
         const val TOUCH_FRAME = 4
     }
 
+    // MOVE-THROTTLE: last forwarded event time per pointer id. Sliding
+    // produces 120Hz+ MOVE streams; forwarding every one floods the server's
+    // touch injection and KWin's input handling (fast swipes crashed KWin).
+    // A per-pointer 8ms window coalesces the stream while keeping full
+    // trajectory fidelity (the last position in each window is sent).
+    private val lastMoveTime = HashMap<Int, Int>()
+
     fun handle(event: MotionEvent) {
         val actionMasked = event.actionMasked
         val actionIndex = event.actionIndex
@@ -36,6 +43,19 @@ class TouchForwarder(
                     && actionIndex == i -> TOUCH_UP
                 actionMasked == MotionEvent.ACTION_CANCEL -> TOUCH_CANCEL
                 else -> TOUCH_MOVE
+            }
+            if (phase == TOUCH_MOVE) {
+                // MOVE-THROTTLE: coalesce moves within an 8ms window.
+                val now = event.eventTime.toInt()
+                val last = lastMoveTime[id]
+                if (last != null && now - last < 8) {
+                    // Keep the latest position for the next window — skip.
+                    continue
+                }
+                lastMoveTime[id] = now
+            } else {
+                // DOWN/UP/CANCEL reset the throttle window for this pointer.
+                lastMoveTime.remove(id)
             }
             onTouch(id, nx, ny, phase, event.eventTime.toInt())
         }

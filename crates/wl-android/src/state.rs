@@ -1,6 +1,12 @@
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixListener;
 
+/// RELEASE-BACKPRESSURE fuse: if the App stops consuming (stall, dropped
+/// session), force-release the oldest pending buffers past this many so
+/// KWin's EGL pool can never deadlock. KWin typically uses 2-3 buffers; 4
+/// gives the App generous latency while keeping the pool alive.
+const MAX_PENDING_BUFFERS: usize = 4;
+
 use smithay::delegate_compositor;
 use smithay::delegate_content_type;
 use smithay::delegate_fractional_scale;
@@ -19,6 +25,7 @@ use smithay::input::{Seat, SeatHandler, SeatState};
 use smithay::utils::{Logical, Point, Serial};
 use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
 use smithay::reexports::wayland_server::backend::ClientData;
+use smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer;
 use smithay::reexports::wayland_server::protocol::wl_callback::WlCallback;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::Resource as WlResource;
@@ -173,6 +180,10 @@ pub struct WlState {
     /// KWin rendering at min(144Hz, its own capability).
     pub pending_callbacks: Vec<WlCallback>,
     pub pending_feedbacks: Vec<PresentationFeedbackCallback>,
+    /// RELEASE-BACKPRESSURE: FIFO of output-surface wl_buffers awaiting the
+    /// App's consumption signal. Pop front + release on each RELEASE
+    /// message; force-released oldest-first past MAX_PENDING_BUFFERS.
+    pub pending_buffers: std::collections::VecDeque<WlBuffer>,
     pub vsync_seq: u64,
 }
 
@@ -260,6 +271,7 @@ impl WlState {
             next_serial: 1,
             pending_callbacks: Vec::new(),
             pending_feedbacks: Vec::new(),
+            pending_buffers: std::collections::VecDeque::new(),
             vsync_seq: 1,
         };
 
@@ -496,9 +508,17 @@ fn surface_tree_contains(root: &WlSurface, target: &WlSurface) -> bool {
 }
 
 /// Extract the first new buffer from `surface`'s tree (own surface first,
-/// then subsurfaces depth-first), releasing each consumed wl_buffer
-/// immediately (ASYNC-RELEASE). Returns the extracted frame, if any.
-fn extract_tree(surface: &WlSurface, frame_mem: &mut Option<FrameMem>) -> Option<ExtractedFrame> {
+/// then subsurfaces depth-first). The consumed wl_buffer is NOT released
+/// here — RELEASE-BACKPRESSURE: the server keeps it until the App reports
+/// consumption (RELEASE message), so the App's MAP_SHARED read can never
+/// race KWin's rewrite of the same dmabuf (tearing). KWin's frame rate is
+/// naturally capped at the App's consumption rate (no EGL pool exhaustion —
+/// the FIFO always releases as the App consumes). Returns the extracted
+/// frame plus the owning wl_buffer (caller enqueues it for backpressure).
+fn extract_tree(
+    surface: &WlSurface,
+    frame_mem: &mut Option<FrameMem>,
+) -> (Option<ExtractedFrame>, Option<WlBuffer>) {
     let own = compositor::with_states(surface, |states| {
         let mut guard = states.cached_state.get::<SurfaceAttributes>();
         // Take the buffer out and clear the field — smithay's docs allow
@@ -507,26 +527,26 @@ fn extract_tree(surface: &WlSurface, frame_mem: &mut Option<FrameMem>) -> Option
         let buffer = guard.current().buffer.take();
         match buffer {
             Some(BufferAssignment::NewBuffer(wl_buffer)) => {
+                // RELEASE-BACKPRESSURE: NOT released here — the caller
+                // queues it and releases on the App's RELEASE. Dropping
+                // WlBuffer alone does NOT send wl_buffer.release; smithay's
+                // own code always calls it explicitly.
                 let r = extract_frame(&wl_buffer, frame_mem);
-                // ASYNC-RELEASE: the buffer is free now — the pixels were
-                // dup'd/copied above. Dropping WlBuffer alone does NOT send
-                // wl_buffer.release; smithay's own code always calls it
-                // explicitly.
-                wl_buffer.release();
-                r
+                (r, Some(wl_buffer))
             }
-            _ => None,
+            _ => (None, None),
         }
     });
-    if own.is_some() {
+    if own.0.is_some() {
         return own;
     }
     for child in compositor::get_children(surface) {
-        if let Some(f) = extract_tree(&child, frame_mem) {
-            return Some(f);
+        let r = extract_tree(&child, frame_mem);
+        if r.0.is_some() {
+            return r;
         }
     }
-    None
+    (None, None)
 }
 
 impl CompositorHandler for WlState {
@@ -578,16 +598,29 @@ impl CompositorHandler for WlState {
             .toplevel
             .as_ref()
             .is_some_and(|t| surface_tree_contains(t.wl_surface(), surface));
-        // ASYNC-RELEASE: KWin's buffer is released IMMEDIATELY after
-        // extraction. dmabuf frames are forwarded as a dup'd fd (the App's
-        // fd is an independent reference — KWin reusing the buffer is safe);
-        // SHM frames are copied into our own FrameMem. Holding KWin's buffer
-        // until the App's RELEASE would exhaust KWin's EGL buffer pool and
-        // crash it (eglSwapBuffers fails with EGL_BAD_SURFACE when no buffer
-        // is available). The App's RELEASE is now purely a consumption
-        // signal, not a KWin lifecycle gate.
+        // RELEASE-BACKPRESSURE: KWin's buffer is NOT released immediately —
+        // it is queued and released when the App reports consumption
+        // (RELEASE message). The App's MAP_SHARED read of the forwarded
+        // dmabuf fd can then never race KWin's rewrite of the same buffer
+        // (which froze the picture with tearing during animations and
+        // stressed KWin's EGL pipeline into crashing under 144Hz). KWin's
+        // frame rate is naturally capped at the App's consumption rate, so
+        // the EGL pool can never exhaust (the old 0x3001 crash required
+        // holding buffers with NO releases coming back; here every frame
+        // yields exactly one RELEASE).
         if is_output_tree {
-            let extracted = extract_tree(surface, &mut self.frame_mem);
+            let (extracted, buffer) = extract_tree(surface, &mut self.frame_mem);
+            if let Some(buf) = buffer {
+                self.pending_buffers.push_back(buf);
+                // BACKPRESSURE-FUSE: if the App ever stops consuming
+                // (dropped session, stall), force-release the oldest
+                // buffers so KWin never deadlocks on a full pool.
+                while self.pending_buffers.len() > MAX_PENDING_BUFFERS {
+                    if let Some(old) = self.pending_buffers.pop_front() {
+                        old.release();
+                    }
+                }
+            }
 
             match extracted {
                 Some(ExtractedFrame::Dmabuf(bw, bh, fd)) => {
