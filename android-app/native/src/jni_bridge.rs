@@ -143,10 +143,17 @@ pub fn render_frame(width: u32, height: u32, pixel_data: &[u8]) -> Result<(), St
     };
 
     let mut buf: ndk_sys::ANativeWindow_Buffer = unsafe { std::mem::zeroed() };
+    let t_lock = std::time::Instant::now();
     let lock_result = unsafe { wl_lock_window(window as _, &mut buf) };
+    let lock_ms = t_lock.elapsed().as_millis();
     if lock_result != 0 {
         log::error!("render_frame: ANativeWindow_lock failed with {}", lock_result);
         return Err(format!("lock failed: {}", lock_result));
+    }
+    if lock_ms > 30 {
+        // DIAG-RENDER: lock blocking >30ms is abnormal (SurfaceFlinger
+        // backpressure) and would directly explain a slow render thread.
+        log::warn!("render_frame: ANativeWindow_lock took {lock_ms}ms");
     }
     if buf.width == 0 || buf.height == 0 {
         unsafe { wl_unlock_and_post(window as _); }
@@ -168,6 +175,7 @@ pub fn render_frame(width: u32, height: u32, pixel_data: &[u8]) -> Result<(), St
     // Fast path: byte-identical B,G,R,X memory order; only strides differ,
     // so a row-wise memcpy replaces the old per-pixel channel-swap loop.
     let dst_len = dst_stride * copy_h * BPP;
+    let t_copy = std::time::Instant::now();
     let dst_slice = unsafe { std::slice::from_raw_parts_mut(dst_bits, dst_len) };
     if copy_row_bgra(dst_slice, dst_stride * BPP, pixel_data, src_stride, copy_w, copy_h) {
         log::warn!(
@@ -176,8 +184,19 @@ pub fn render_frame(width: u32, height: u32, pixel_data: &[u8]) -> Result<(), St
             copy_w * copy_h * 4
         );
     }
+    let copy_ms = t_copy.elapsed().as_millis();
 
     unsafe { wl_unlock_and_post(window as _); }
+    // DIAG-RENDER: per-frame cost split — lock (SurfaceFlinger) vs copy
+    // (memcpy). Logged every 60 frames (rate-limited).
+    {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static FRAMES: AtomicU32 = AtomicU32::new(0);
+        let n = FRAMES.fetch_add(1, Ordering::Relaxed);
+        if n % 60 == 0 {
+            log::info!("render_frame: lock={lock_ms}ms copy={copy_ms}ms total={}x{}", width, height);
+        }
+    }
     log::debug!("render_frame: {}x{}", width, height);
     Ok(())
 }
