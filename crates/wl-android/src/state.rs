@@ -311,6 +311,13 @@ impl WlState {
     }
 
     pub fn handle_touch(&mut self, msg: &TouchMessage) {
+        // TOUCH-TRACE: log every injected touch so a plasmashell/KWin
+        // crash can be correlated with the exact event sequence we sent.
+        tracing::info!(
+            touch_id = msg.touch_id, phase = msg.phase, x = msg.x, y = msg.y,
+            time_ms = msg.time_ms, active = self.touch_injector.active_count(),
+            "touch from App"
+        );
         let touch_opt = self.seat.get_touch();
         if let Some(touch) = touch_opt {
             let ptr = self as *mut Self;
