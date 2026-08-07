@@ -277,6 +277,9 @@ extern "system" fn Java_com_wl_android_NativeBridge_nativeInit(
             let mut blanked_while_disconnected = false;
             // DIAG-BLACKSCREEN: rendered-frame counter for the heartbeat log.
             let mut rendered_frames: u64 = 0;
+            // SNAPSHOT-READ: private frame buffer — pixels are copied out of
+            // the shared KWin mapping immediately, then displayed at leisure.
+            let mut snapshot: Vec<u8> = Vec::new();
             // Per-fd mmap cache: KWin's buffer pool rotates through a few
             // fds; mapping each once avoids 32MB mmap+munmap per frame.
             let mut mmap_cache = crate::jni_bridge::FdMmapCache::new();
@@ -346,8 +349,12 @@ extern "system" fn Java_com_wl_android_NativeBridge_nativeInit(
                     }
                 };
                 if let Some(fd) = frame.pixel_fd {
-                    let _ = crate::jni_bridge::render_frame_fd_cached(
-                        frame.width, frame.height, &fd, &mut mmap_cache,
+                    // SNAPSHOT-READ: copy out of the shared mapping into the
+                    // private snapshot buffer IMMEDIATELY (the lock+display
+                    // copy below can wait 0-15ms on SurfaceFlinger, during
+                    // which KWin would rewrite the shared buffer and tear).
+                    let _ = crate::jni_bridge::snapshot_frame_fd_cached(
+                        frame.width, frame.height, &fd, &mut mmap_cache, &mut snapshot,
                     );
                     // DIAG-BLACKSCREEN: heartbeat — every 120 rendered
                     // frames log a line so logcat shows whether frames are
@@ -361,11 +368,15 @@ extern "system" fn Java_com_wl_android_NativeBridge_nativeInit(
                             render_state.lock().unwrap().frame_queue.len(),
                         );
                     }
-                    // Stateless: the frame's pixel fd has been consumed —
-                    // release the memfd so the server can reuse it (one
-                    // RELEASE per consumed/dropped fd keeps the server's
-                    // FIFO ownership count exact).
+                    // Stateless: the snapshot has consumed the pixels —
+                    // release the shared mapping NOW (the private snapshot
+                    // feeds the display copy, so KWin may rewrite freely).
                     drop(fd);
+                    // Display the private snapshot (lock waits no longer
+                    // race KWin's rewrite of the shared buffer).
+                    if !snapshot.is_empty() {
+                        let _ = crate::jni_bridge::render_frame(frame.width, frame.height, &snapshot);
+                    }
                     // Send via the shared input_write stream — no Inner lock
                     // needed (it is an independent Arc<Mutex<UnixStream>>),
                     // so this never contends with the recv thread's frame
