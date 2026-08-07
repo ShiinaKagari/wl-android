@@ -94,14 +94,14 @@ sleep 5
 ### 4a. 帧流动（核心信号）
 
 ```bash
-# 只抓 land-native tag，只找关键行（swapchain 主路径日志是 present:）
-adb logcat -d -s land-native | grep -E "Frame received|render:|present:" | tail -3
-# 等 3 秒再抓，对比 serial 是否递增
+# 只抓 land-native tag，只找关键行（CPU 呈现心跳，每渲染 120 帧输出一条）
+adb logcat -d -s land-native | grep -E "render heartbeat" | tail -3
+# 等 3 秒再抓，对比 rendered_frames 是否增长
 sleep 3
-adb logcat -d -s land-native | grep -E "Frame received|render:|present:" | tail -3
+adb logcat -d -s land-native | grep -E "render heartbeat" | tail -3
 ```
 
-**通过标准**：两次数值递增（serial 变大），出现 `present: slot=N`（无 CPU 像素拷贝）。
+**通过标准**：两次数值 `N frames rendered` 递增（帧持续到达 → CPU 呈现持续推进）。
 
 ### 4b. App 状态
 
@@ -112,8 +112,8 @@ adb shell "ps -A | grep com.wl.android"   # 进程在 = 未闪退
 ### 4c. Server 产帧
 
 ```bash
-NS "grep -c 'blit frame' /tmp/wl-runtime/wl-android.log 2>/dev/null"
-# 数值应在增长（server 启动需带 §3 的重定向）
+NS "grep -c 'fd forwarded directly' /tmp/wl-runtime/wl-android.log 2>/dev/null"
+# 数值应在增长（server 启动需带 §3 的重定向；dmabuf 帧零拷贝转发，state.rs 日志）
 ```
 
 ## 5. 已知环境事实（避免重复踩坑）
@@ -124,8 +124,8 @@ NS "grep -c 'blit frame' /tmp/wl-runtime/wl-android.log 2>/dev/null"
 | plasmashell 直接崩（单独 `plasmashell &`） | startplasma-wayland 依赖已存在的 dbus session；缺 dbus 时 plasmashell 无 session bus 崩 | 先 `dbus-daemon --session --address=unix:path=$XDG_RUNTIME_DIR/bus --fork` 再 `startplasma-wayland`（§3 顺序） |
 | dbus-daemon 拒绝启动 / 权限错 | $XDG_RUNTIME_DIR 权限 0777（adb shell 默认） | `chmod 700 $XDG_RUNTIME_DIR` |
 | 背靠背 TBUF+native_handle 断连（旧 bug） | SOCK_STREAM 下两条消息合并进一次 recvmsg，旧实现丢尾部字节+fd | **已修复**：transport 的 pending 读前瞻缓冲保留合并字节与 fd（P-18/P-19），有回归测试，不再复现 |
-| 日志 "SHM frame dropped" | dmabuf 全局**已启用**（state.rs，blit 主路径要求 dmabuf）；KWin 侧 dmabuf 回退到 SHM 时帧被丢弃 | 确认 server/KWin 都带 KGSL env（`VK_ICD_FILENAMES` / `MESA_LOADER_DRIVER_OVERRIDE=kgsl`）；仅 `LAND_MODE=shm` 保留 SHM 调试路径 |
-| screencap 黑屏 | wl-android 用硬件 overlay 绕过 SurfaceFlinger | **不要用 screencap 验证**，看 App 的 `present: slot=N` 日志 |
+| 日志 "SHM frame dropped" | dmabuf 全局**已启用**（state.rs，dmabuf 零拷贝主路径）；KWin 侧 dmabuf 回退到 SHM 时帧被丢弃（SHM 回退路径，frame_mem.rs 拷贝） | 确认 server/KWin 都带 KGSL env（`VK_ICD_FILENAMES` / `MESA_LOADER_DRIVER_OVERRIDE=kgsl`） |
+| screencap 黑屏 | wl-android 用硬件 overlay 绕过 SurfaceFlinger（v2 时代观测，当前 CPU 呈现路径行为待真机复验） | **不要用 screencap 验证**，看 App 的 `render heartbeat` 日志 |
 | KWin ZINK 报错 | turnip 不支持 ZINK | 非致命，KWin 仍能产帧（dmabuf 路径） |
 | git push 超时 | 设备网络不稳定 | 本地 commit，网络恢复后 push |
 | 容器内 cargo 编译 | host 缺 aarch64 库 | 必须进容器编译 server（§2a） |
@@ -144,8 +144,8 @@ git status --short
 #    gradle → install → 重启 App → 验证
 
 # 验证命令（固定）：
-adb logcat -d -s land-native | grep -E "Frame received|render:|present:" | tail -3
+adb logcat -d -s land-native | grep -E "render heartbeat" | tail -3
 sleep 3
-adb logcat -d -s land-native | grep -E "Frame received|render:|present:" | tail -3
-# serial 递增 = PASS
+adb logcat -d -s land-native | grep -E "render heartbeat" | tail -3
+# N frames rendered 递增 = PASS
 ```

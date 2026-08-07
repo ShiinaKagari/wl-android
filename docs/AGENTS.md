@@ -25,7 +25,7 @@
 - 分析 hot paths、堆分配站点、非必要的 syscall
 
 **角色约束（主 agent 执行时行为）**：
-- 帧路径（`frame_router`、`app_link`、`blit.rs`、`ahb_handle.rs`、`comp/dmabuf.rs`）的**唯一作者**
+- 帧路径（`state.rs`、`app_link.rs`、`transport.rs`、`frame_mem.rs`、`comp/dmabuf.rs`）的**唯一作者**
 - 任何帧路径改动附带 criterion benchmark 对比或 doctor p95 数据，标注 PERF 编号
 - 违反 PERFORMANCE_BOUNDARIES.md 任一 PERF-xx 的代码禁止合入
 - 实现风格：最小堆分配、zerocopy 编解码、无锁数据结构优先
@@ -38,7 +38,7 @@
 - 统计 DESIGN.md 各规则编号（P-xx / H-xx / F-xx / T-xx / O-xx / C-xx）的测试覆盖
 
 **角色约束（主 agent 执行时行为）**：
-- 测试框架（`FakeCompositor`、`mock-app`、`FdCountGuard`、`MockClock`、insta、proptest）的**唯一维护者**
+- 测试框架（`FakeCompositor`、`FdCountGuard`、insta、proptest）的**唯一维护者**
 - 每个里程碑启动时输出该里程碑的**验收测试清单**（引用规则编号）
 - 任何 PR 不带对应测试 → 驳回
 - 每个测试函数名称或文档注释中必须引用一个编号（P-xx / H-xx / F-xx / T-xx / O-xx / C-xx / PERF-xx）
@@ -91,9 +91,9 @@ PM: 分配里程碑 → 输出验收标准
 | `docs/AGENTS.md` | PM | — |
 | `crates/wl-android-common/src/proto.rs` | QA（golden/proptest 基准定义）+ Perf（编解码实现）| PM |
 | `crates/wl-android-common/src/testutil/` | QA | — |
-| `crates/wl-android/src/frame_router.rs` | Perf | QA, PM |
-| `crates/wl-android/src/blit.rs` | Perf | QA, PM |
-| `crates/wl-android/src/ahb_handle.rs` | Perf（GZ-001） | QA, PM |
+| `crates/wl-android/src/state.rs` | Perf | QA, PM |
+| `crates/wl-android/src/transport.rs` | Perf | QA, PM |
+| `crates/wl-android/src/frame_mem.rs` | Perf | QA, PM |
 | `crates/wl-android/src/comp/` | Perf | QA, PM |
 | `crates/wl-android/src/app_link.rs` | Perf | QA, PM |
 | `crates/wl-android/src/doctor.rs` | QA | PM |
@@ -111,5 +111,5 @@ PM: 分配里程碑 → 输出验收标准
 
 explore sub-agent 调用时，prompt 中注明发起角色和目的，格式示例：
 - `[PM explore] 搜索代码库中是否存在 LD_PRELOAD/hook 相关字符串（BOUNDARIES §2 审计）`
-- `[QA explore] 扫描 frame_router.rs 中 F-01~F-07 规则的测试覆盖缺口`
-- `[Perf explore] 查找 blit.rs 中是否存在 per-frame 堆分配站点`
+- `[QA explore] 扫描 state.rs 的 commit 提取与 transport.rs 的 fd 转发路径的测试覆盖缺口`
+- `[Perf explore] 查找 state.rs 的 commit 处理中是否存在每帧堆分配站点`

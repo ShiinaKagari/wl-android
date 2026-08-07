@@ -21,7 +21,7 @@
 | 类别 | 内容 |
 |------|------|
 | Wayland | 以 server 角色实现标准协议：`wl_compositor` `wl_subcompositor` `wl_shm` `wl_output` `wl_seat` `xdg_wm_base` `zwp_linux_dmabuf_v1`(v4 feedback)；协议内协商（格式表、configure、frame callback 节拍） |
-| Vulkan | 公开扩展：`VK_EXT_external_memory_dma_buf`、`VK_KHR_external_memory_fd`、`VK_ANDROID_external_memory_android_hardware_buffer`、`VK_KHR_external_fence_fd`（server SYNC_FD 栅栏导出）、`VK_KHR_external_semaphore_fd`（App 栅栏导入）、`VK_KHR_android_surface`、`VK_KHR_swapchain`（App swapchain 呈现）等 |
+| Vulkan | **当前 v3 架构不使用 Vulkan**：server 侧 dmabuf fd 零拷贝转发（无 GPU blit），App 侧 CPU 渲染（`ANativeWindow_lock`）。blit 时代的扩展清单（swapchain / AHB / external_fence / external_semaphore / android_surface 等）已随 v2 管线删除（commit b3491f4） |
 | Android | SDK / NDK 公开 API（含 `AHardwareBuffer_*` 全部公开函数）；JNI |
 | Linux | POSIX 与稳定内核 UAPI：Unix socket（AF_UNIX `SOCK_STREAM` + u32 长度前缀 + `SCM_RIGHTS`）、dmabuf、memfd |
 | 配置 | 环境变量（`WAYLAND_DISPLAY` 等标准接口）；Magisk 官方机制内的**系统配置**（sepolicy 规则、目录创建） |
@@ -45,7 +45,7 @@
 
 | 编号 | 依赖内容 | 性质说明 | 隔离与防护 | 使用范围 |
 |------|----------|----------|------------|----------|
-| **GZ-001** | ① gralloc handle 内含 dmabuf fd（gralloc4 / Android 12+ 事实标准）② libcutils `native_handle_t` 线格式（`AHardwareBuffer_sendHandleToUnixSocket` 的发送格式：numFds/numInts/ints + SCM_RIGHTS） | 非 hook：仅解析 App 经公开 NDK API `AHardwareBuffer_sendHandleToUnixSocket` 发送到自有 socket 的字节流，不介入任何第三方进程 | 隔离到 `crates/wl-android/src/ahb_handle.rs` 单一模块；契约测试；doctor 启动自检，解析异常时**明确报错**而非静默 | blit + swapchain 路径（v2 主路径，slot 注册） |
+| **GZ-001** | 跨进程 dmabuf fd 传递：KWin commit 提取的 dmabuf fd 经 `SCM_RIGHTS` 零拷贝转发给 App，App `mmap` 后 `ANativeWindow_lock` CPU 呈现（依赖 Linux dma-buf UAPI，fd 有效性依赖合成器遵守 Wayland dmabuf 契约） | 非 hook：仅按标准 Wayland 协议转发合成器提交的 fd，不介入任何第三方进程 | 隔离到 `crates/wl-android/src/comp/dmabuf.rs`（feedback/格式）+ `state.rs`（commit 提取/dup 转发）；fd 生命周期由 FdCountGuard 契约测试覆盖；doctor 启动自检 socket 目录/GPU 设备，异常时**明确报错**而非静默 | dmabuf 零拷贝主路径（fd dup 转发）+ SHM 回退（`frame_mem.rs` memfd 拷贝） |
 
 当前灰区总数：**1**。除登记项外，全项目为 100% 公开契约。
 
@@ -59,14 +59,14 @@
 4. 仅通过公开 API 使用（不 vendoring 后修改）。
 
 已批准依赖：Smithay、calloop、wayland-server/client、nix、zerocopy、drm-fourcc、
-ash、ash-window、raw-window-handle、jni、ndk/ndk-sys、thiserror、tracing、
-android_logger、insta、proptest、cargo-ndk。
+jni、ndk/ndk-sys、thiserror、tracing、android_logger、insta、proptest、cargo-ndk
+（ash、ash-window、raw-window-handle 已随 blit/swapchain 管线删除，从清单移除）。
 
 ## 5. 范围边界（项目不负责）
 
 - ❌ 安装 / 配置 / 排查 Mesa 驱动（用户环境已具备 turnip/freedreno，见 README 环境要求）
 - ❌ 支持 proot 环境
-- ❌ 使用 OpenGL ES（App 渲染仅 Vulkan）
+- ❌ 使用 OpenGL ES（App 渲染仅 CPU：`ANativeWindow_lock` 像素拷贝，无 GPU API）
 - ❌ App 层面申请 root 权限
 - ❌ GUI 进程（server / KWin / Plasma）以 root 运行（必须为普通用户，见 §8.2）
 - ❌ 引入消息队列 / IPC 框架（仅裸二进制 socket 协议）

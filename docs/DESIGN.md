@@ -1,5 +1,7 @@
 # DESIGN.md — wl-android 详细设计
 
+> **SUPERSEDED** — 本文描述 v2 架构（blit/swapchain/AHB/BRDY 握手），该架构已删除（commit b3491f4）。当前为 v3 无状态协议 + dmabuf 零拷贝，见 README.md 与代码。
+
 > 状态：v2 稿（swapchain 拉式解耦）。协议与状态机的任何修改必须先改本文件（含规则编号），再改代码。
 > 规则编号约定：`P-xx` 协议、`H-xx` 握手、`F-xx` fd/buffer 生命周期、`C-xx` 连接、
 > `T-xx` 触摸、`O-xx` 输出/动态配置、`X-xx` 可测性、`V-xx` 真机验收。测试用例必须在名称或注释中
