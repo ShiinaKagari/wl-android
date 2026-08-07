@@ -400,6 +400,7 @@ impl WlState {
         info!(w, h, refresh = refresh_millihz, dpi, frame_mode, "applying config update");
         let size_changed = self.screen_width != w || self.screen_height != h;
         let refresh_changed = self.refresh_millihz != refresh_millihz;
+        let frame_mode_changed = self.frame_mode != frame_mode;
         self.screen_width = w;
         self.screen_height = h;
         self.refresh_millihz = refresh_millihz;
@@ -413,11 +414,11 @@ impl WlState {
         self.output.change_current_state(Some(new_mode), None, None, None);
 
         // VSYNC-PACING (event-driven): the App re-reported the refresh rate
-        // (LTPO switch / mode change). Flush any queued frame callbacks /
-        // feedbacks NOW with the new beat — the next timer tick re-reads
-        // vsync_period() anyway, so this makes the change effective
-        // immediately instead of waiting for the next natural tick.
-        if refresh_changed {
+        // or the pacing mode (LTPO switch / mode change). Flush any queued
+        // frame callbacks / feedbacks NOW with the new beat — the next timer
+        // tick re-reads vsync_period() anyway, so this makes the change
+        // effective immediately instead of waiting for the next natural tick.
+        if refresh_changed || frame_mode_changed {
             self.vsync_tick();
         }
 
@@ -668,8 +669,7 @@ impl WlState {
         }
         let elapsed = std::time::Instant::now().duration_since(self.clock_epoch);
         let now_ms = elapsed.as_millis() as u32;
-        let period_ns = 1_000_000_000_000u64 / self.refresh_millihz.max(1) as u64;
-        let refresh = Refresh::Fixed(std::time::Duration::from_nanos(period_ns));
+        let refresh = Refresh::Fixed(self.effective_period());
         let seq = self.vsync_seq;
         self.vsync_seq += 1;
 
@@ -696,10 +696,24 @@ impl WlState {
         }
     }
 
-    /// VSYNC-PACING: the refresh period for the vsync timer, derived from
-    /// the App-reported refresh rate (CONF).
+    /// VSYNC-PACING: the effective vsync period, honoring the App's frame
+    /// pacing mode (CONF frame_mode):
+    ///   0 free / 1 vsync-align / 2 performance → hardware refresh (144Hz)
+    ///   3 power-save → quarter rate (≈36Hz on a 144Hz panel)
+    /// Frame mode changes take effect on the next tick (the timer reschedules
+    /// with vsync_period() each beat).
     pub fn vsync_period(&self) -> std::time::Duration {
-        std::time::Duration::from_nanos(1_000_000_000_000u64 / self.refresh_millihz.max(1) as u64)
+        self.effective_period()
+    }
+
+    fn effective_period(&self) -> std::time::Duration {
+        let base = std::time::Duration::from_nanos(
+            1_000_000_000_000u64 / self.refresh_millihz.max(1) as u64,
+        );
+        match self.frame_mode {
+            3 => base * 4, // power-save: 144Hz → ~36Hz
+            _ => base,
+        }
     }
 }
 
