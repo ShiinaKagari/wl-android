@@ -399,6 +399,7 @@ impl WlState {
     pub fn apply_config(&mut self, w: u32, h: u32, refresh_millihz: u32, dpi: u32, frame_mode: u32) {
         info!(w, h, refresh = refresh_millihz, dpi, frame_mode, "applying config update");
         let size_changed = self.screen_width != w || self.screen_height != h;
+        let refresh_changed = self.refresh_millihz != refresh_millihz;
         self.screen_width = w;
         self.screen_height = h;
         self.refresh_millihz = refresh_millihz;
@@ -410,6 +411,15 @@ impl WlState {
         self.output.add_mode(new_mode);
         self.output.set_preferred(new_mode);
         self.output.change_current_state(Some(new_mode), None, None, None);
+
+        // VSYNC-PACING (event-driven): the App re-reported the refresh rate
+        // (LTPO switch / mode change). Flush any queued frame callbacks /
+        // feedbacks NOW with the new beat — the next timer tick re-reads
+        // vsync_period() anyway, so this makes the change effective
+        // immediately instead of waiting for the next natural tick.
+        if refresh_changed {
+            self.vsync_tick();
+        }
 
         if size_changed
             && let Some(ref tl) = self.toplevel
