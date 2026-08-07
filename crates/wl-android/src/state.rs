@@ -817,7 +817,20 @@ impl XdgShellHandler for WlState {
             .as_ref()
             .is_some_and(|oc| surface.wl_surface().client().map(|c| c.id()) == Some(oc.clone()));
         if !is_output {
-            tracing::info!("new toplevel created (non-output client — ignored)");
+            // Wayland contract: EVERY xdg_toplevel must receive a configure
+            // before it may render. plasmashell/kded connect to us too
+            // (WAYLAND_DISPLAY inheritance) — skipping their configure left
+            // them waiting forever (plasma-session's WaitForName timeout).
+            // They get a configure (client-requested size, else fullscreen)
+            // but never drive the output.
+            tracing::info!("new toplevel created (non-output client — configure only)");
+            let size = surface
+                .with_pending_state(|s| s.size)
+                .unwrap_or((self.screen_width as i32, self.screen_height as i32).into());
+            surface.with_pending_state(|state| {
+                state.size = Some(size);
+            });
+            surface.send_configure();
             return;
         }
         tracing::info!("new toplevel created (output client)");
