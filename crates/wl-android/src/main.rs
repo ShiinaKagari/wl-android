@@ -131,12 +131,28 @@ fn run_server() -> Result<(), Box<dyn std::error::Error>> {
             let client = match state
                 .display
                 .handle()
-                .insert_client(stream, Arc::new(WlClientState::default()))
+                .insert_client(
+                    stream,
+                    Arc::new(WlClientState {
+                        compositor: Default::default(),
+                        output_client: state.output_client.clone(),
+                    }),
+                )
             {
                 Ok(c) => c,
                 Err(e) => { error!(err = %e, "failed to insert wayland client"); return; }
             };
             info!(id = ?client.id(), "Wayland client connected");
+            // OUTPUT-CLIENT: the FIRST wayland client is the nested
+            // compositor (KWin connects before the plasma components that
+            // inherit WAYLAND_DISPLAY=land-0). Cleared on its disconnect.
+            {
+                let mut oc = state.output_client.lock().unwrap();
+                if oc.is_none() {
+                    *oc = Some(client.id());
+                    info!("output client set to {:?}", client.id());
+                }
+            }
             // Dispatch immediately to send initial globals to the new client
             state.dispatch_wayland();
         })?;

@@ -1,5 +1,6 @@
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixListener;
+use std::sync::Arc;
 
 /// DELAYED-RELEASE: each output wl_buffer is held for this many commits
 /// after extraction, then returned to KWin. The App's MAP_SHARED read of
@@ -30,7 +31,7 @@ use smithay::input::pointer::{ButtonEvent, MotionEvent as PointerMotionEvent};
 use smithay::input::{Seat, SeatHandler, SeatState};
 use smithay::utils::{Logical, Point, Serial};
 use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
-use smithay::reexports::wayland_server::backend::ClientData;
+use smithay::reexports::wayland_server::backend::{ClientData, ClientId, DisconnectReason};
 use smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer;
 use smithay::reexports::wayland_server::protocol::wl_callback::WlCallback;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
@@ -190,6 +191,13 @@ pub struct WlState {
     /// DELAYED_RELEASE_FRAMES commits (App read window) before being
     /// returned to KWin. RELEASE messages are a pure ack (no gating).
     pub pending_buffers: std::collections::VecDeque<WlBuffer>,
+    /// OUTPUT-CLIENT: which wayland client is the nested compositor (KWin)
+    /// whose output surface tree feeds the App. Set on the FIRST wayland
+    /// client connection (KWin connects before plasmashell/kded/Xwayland —
+    /// they all inherit WAYLAND_DISPLAY=land-0); cleared on its disconnect
+    /// so a restarted KWin takes over. Other clients' toplevels never
+    /// replace self.toplevel and their surfaces never forward frames.
+    pub output_client: Arc<std::sync::Mutex<Option<ClientId>>>,
     pub vsync_seq: u64,
 }
 
@@ -278,6 +286,7 @@ impl WlState {
             pending_callbacks: Vec::new(),
             pending_feedbacks: Vec::new(),
             pending_buffers: std::collections::VecDeque::new(),
+            output_client: Arc::new(std::sync::Mutex::new(None)),
             vsync_seq: 1,
         };
 
@@ -493,9 +502,21 @@ impl WlState {
 #[derive(Default)]
 pub struct WlClientState {
     pub compositor: CompositorClientState,
+    /// OUTPUT-CLIENT: shared reference to the server's notion of "which
+    /// wayland client is the output source" (KWin — the nested compositor).
+    /// On disconnect, if this client WAS the output source, clear it so the
+    /// next connecting client (a restarted KWin) takes over.
+    pub output_client: Arc<std::sync::Mutex<Option<ClientId>>>,
 }
 
-impl ClientData for WlClientState {}
+impl ClientData for WlClientState {
+    fn disconnected(&self, id: ClientId, _reason: DisconnectReason) {
+        let mut oc = self.output_client.lock().unwrap();
+        if oc.as_ref() == Some(&id) {
+            *oc = None;
+        }
+    }
+}
 
 /// SURFACE-FILTER: is `target` inside the surface tree rooted at `root`
 /// (root itself, its subsurfaces, and recursively their children)? KWin
@@ -575,9 +596,15 @@ impl CompositorHandler for WlState {
 
     fn commit(&mut self, surface: &WlSurface) {
         let is_output_tree = self
-            .toplevel
+            .output_client
+            .lock()
+            .unwrap()
             .as_ref()
-            .is_some_and(|t| surface_tree_contains(t.wl_surface(), surface));
+            .is_some_and(|oc| surface.client().map(|c| c.id()) == Some(oc.clone()))
+            && self
+                .toplevel
+                .as_ref()
+                .is_some_and(|t| surface_tree_contains(t.wl_surface(), surface));
         let top_id = self.toplevel.as_ref().map(|t| t.wl_surface().id());
         // DIAG: surface identity + tree match, so a single run shows whether
         // the committed surface is the toplevel, a tree child, or the
@@ -601,9 +628,15 @@ impl CompositorHandler for WlState {
         // and presentation feedback still go out for every surface, so
         // KWin's per-surface render loops stay alive.
         let is_output_tree = self
-            .toplevel
+            .output_client
+            .lock()
+            .unwrap()
             .as_ref()
-            .is_some_and(|t| surface_tree_contains(t.wl_surface(), surface));
+            .is_some_and(|oc| surface.client().map(|c| c.id()) == Some(oc.clone()))
+            && self
+                .toplevel
+                .as_ref()
+                .is_some_and(|t| surface_tree_contains(t.wl_surface(), surface));
         // DELAYED-RELEASE: KWin's buffer is held DELAYED_RELEASE_FRAMES
         // commits (App read window), then returned — KWin's frame rate is
         // NOT gated by App consumption (full backpressure serialized KWin
@@ -764,7 +797,22 @@ impl XdgShellHandler for WlState {
     fn xdg_shell_state(&mut self) -> &mut XdgShellState { &mut self.xdg_shell_state }
 
     fn new_toplevel(&mut self, surface: ToplevelSurface) {
-        tracing::info!("new toplevel created");
+        // OUTPUT-CLIENT: only the nested compositor's (KWin's) toplevel is
+        // the output. plasmashell/kded/Xwayland also connect (they inherit
+        // WAYLAND_DISPLAY=land-0) and create their own xdg_toplevels — those
+        // must never replace self.toplevel or the output-tree filter would
+        // misroute frames (black screen / wrong surface).
+        let is_output = self
+            .output_client
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|oc| surface.wl_surface().client().map(|c| c.id()) == Some(oc.clone()));
+        if !is_output {
+            tracing::info!("new toplevel created (non-output client — ignored)");
+            return;
+        }
+        tracing::info!("new toplevel created (output client)");
         surface.with_pending_state(|state| {
             state.size = Some((self.screen_width as i32, self.screen_height as i32).into());
             state.states.set(xdg_toplevel::State::Fullscreen);
