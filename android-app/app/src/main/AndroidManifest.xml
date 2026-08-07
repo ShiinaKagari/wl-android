@@ -3,8 +3,8 @@
 
     <uses-sdk android:minSdkVersion="33" android:targetSdkVersion="36" />
 
-    <uses-feature android:name="android.hardware.vulkan.version" android:version="0x401000" android:required="true" />
-    <uses-feature android:name="android.hardware.vulkan.level" android:required="true" />
+    <!-- Touchscreen: the App renders the desktop and forwards touches; not
+         required (server-side container has none). -->
     <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
 
     <application

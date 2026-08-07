@@ -130,9 +130,11 @@ fn copy_row_bgra(
     truncated
 }
 
-/// SHM/CPU render path: BGRX→BGRA row copy into the ANativeWindow via
-/// `ANativeWindow_lock`. This is the only presentation path (SHM-only
-/// protocol — frames are pixel fds).
+/// Render a frame's pixels into the ANativeWindow via `ANativeWindow_lock`.
+/// `pixel_data` is a full frame (dmabuf or SHM pixel fd, mmap'd by the
+/// caller); B,G,R,X memory order (window format is fixed to BGRA_8888 by
+/// wl_set_format, byte-identical to the KWin BGRX frames — only strides
+/// differ, handled by copy_row_bgra).
 pub fn render_frame(width: u32, height: u32, pixel_data: &[u8]) -> Result<(), String> {
     let guard = WINDOW.lock().unwrap();
     let window = match *guard {
@@ -154,75 +156,25 @@ pub fn render_frame(width: u32, height: u32, pixel_data: &[u8]) -> Result<(), St
 
     log::debug!("render: buf {}x{} stride={} fmt={:#x} bits={:p}", buf.width, buf.height, buf.stride, buf.format, buf.bits);
 
-    let bpp = match buf.format {
-        1 => 4, // WINDOW_FORMAT_RGBA_8888
-        2 => 4, // WINDOW_FORMAT_RGBX_8888
-        4 => 2, // WINDOW_FORMAT_RGB_565
-        _ => 4,
-    };
-
-    if pixel_data.is_empty() {
-        let stride = buf.stride as usize;
-        let bits = buf.bits as *mut u8;
-        let max_h = buf.height.min(50) as usize;
-        let max_w = buf.width.min(50) as usize;
-        for y in 0..max_h {
-            for x in 0..max_w {
-                let off = y * stride * bpp + x * bpp;
-                unsafe {
-                    if bpp == 4 {
-                        *bits.add(off) = 0;
-                        *bits.add(off + 1) = 0;
-                        *bits.add(off + 2) = 0;
-                        *bits.add(off + 3) = 0xFF;
-                    } else {
-                        let rgb565: u16 = 0xF800;
-                        *bits.add(off) = (rgb565 & 0xFF) as u8;
-                        *bits.add(off + 1) = ((rgb565 >> 8) & 0xFF) as u8;
-                    }
-                }
-            }
-        }
-    } else {
-        let dst_stride = buf.stride as usize;
-        let src_stride = (width as usize) * 4;
-        let dst_bits = buf.bits as *mut u8;
-        let copy_w = (buf.width as usize).min(width as usize);
-        let copy_h = (buf.height as usize).min(height as usize);
-        if bpp == 4 {
-            // Fast path: the window is now WINDOW_FORMAT_BGRA_8888 (TODO 9),
-            // whose buffer is B,G,R,X memory order — byte-identical to the
-            // KWin SHM BGRX frames. Only the strides differ, so a per-row
-            // memcpy replaces the old per-pixel channel-swap loop.
-            let dst_len = dst_stride * copy_h * bpp;
-            let dst_slice = unsafe { std::slice::from_raw_parts_mut(dst_bits, dst_len) };
-            if copy_row_bgra(dst_slice, dst_stride * bpp, pixel_data, src_stride, copy_w, copy_h) {
-                log::warn!(
-                    "render_frame: SHM frame truncated ({}B < {}B expected); rows clamped",
-                    pixel_data.len(),
-                    copy_w * copy_h * 4
-                );
-            }
-        } else {
-            // RGB_565 fallback (old window format): keep per-pixel conversion.
-            for y in 0..copy_h {
-                for x in 0..copy_w {
-                    let src_off = y * src_stride + x * 4;
-                    let dst_off = y * dst_stride * bpp + x * bpp;
-                    let b = pixel_data[src_off];
-                    let g = pixel_data[src_off + 1];
-                    let r = pixel_data[src_off + 2];
-                    unsafe {
-                        let r5 = ((r as u16) >> 3) & 0x1F;
-                        let g6 = ((g as u16) >> 2) & 0x3F;
-                        let b5 = ((b as u16) >> 3) & 0x1F;
-                        let rgb565: u16 = (r5 << 11) | (g6 << 5) | b5;
-                        *dst_bits.add(dst_off) = (rgb565 & 0xFF) as u8;
-                        *dst_bits.add(dst_off + 1) = ((rgb565 >> 8) & 0xFF) as u8;
-                    }
-                }
-            }
-        }
+    // Window format is pinned to BGRA_8888 by wl_set_format (bridge.c), so
+    // the buffer is always 4 bytes/pixel (B,G,R,X order). RGB_565 fallback
+    // was removed — the format contract never changes.
+    const BPP: usize = 4;
+    let dst_stride = buf.stride as usize;
+    let src_stride = (width as usize) * 4;
+    let dst_bits = buf.bits as *mut u8;
+    let copy_w = (buf.width as usize).min(width as usize);
+    let copy_h = (buf.height as usize).min(height as usize);
+    // Fast path: byte-identical B,G,R,X memory order; only strides differ,
+    // so a row-wise memcpy replaces the old per-pixel channel-swap loop.
+    let dst_len = dst_stride * copy_h * BPP;
+    let dst_slice = unsafe { std::slice::from_raw_parts_mut(dst_bits, dst_len) };
+    if copy_row_bgra(dst_slice, dst_stride * BPP, pixel_data, src_stride, copy_w, copy_h) {
+        log::warn!(
+            "render_frame: frame truncated ({}B < {}B expected); rows clamped",
+            pixel_data.len(),
+            copy_w * copy_h * 4
+        );
     }
 
     unsafe { wl_unlock_and_post(window as _); }
@@ -332,11 +284,8 @@ pub fn blank_screen() {
         unsafe { wl_unlock_and_post(window as _); }
         return;
     }
-    let bpp = match buf.format {
-        4 => 2,
-        _ => 4,
-    };
-    let stride = buf.stride as usize * bpp;
+    // Window format is pinned to BGRA_8888 (4 bytes/pixel) by wl_set_format.
+    let stride = buf.stride as usize * 4;
     let bits = buf.bits as *mut u8;
     let total = stride * buf.height as usize;
     // SAFETY: bits is the locked window buffer of `total` bytes.
