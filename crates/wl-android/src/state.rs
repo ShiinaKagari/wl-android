@@ -323,6 +323,14 @@ impl WlState {
             s
         };
 
+        // MULTI-TOUCH-POINTER: every touch is ALSO mirrored to the pointer
+        // seat so mouse-only surfaces stay interactive. But the mirror must
+        // never break KWin's pointer button state machine: a two-finger tap
+        // sends DOWN(DOWN) → pointer would see Pressed/Pressed with no
+        // Released between — smithay pushes the button twice and KWin's
+        // internal button tracking asserts/crashes. Fold multi-touch into a
+        // SINGLE button: Pressed on the FIRST finger down, Released on the
+        // LAST finger up, motion for everything in between.
         if let Some(ref toplevel) = self.toplevel
             && let Some(pointer) = self.seat.get_pointer()
         {
@@ -331,6 +339,8 @@ impl WlState {
             let x = msg.x as f64 * self.screen_width as f64;
             let y = msg.y as f64 * self.screen_height as f64;
             let loc: Point<f64, Logical> = (x, y).into();
+            let first = self.touch_injector.active_count() == 1;
+            let last = self.touch_injector.active_count() == 0;
 
             match msg.phase {
                 TOUCH_PHASE_DOWN => {
@@ -339,12 +349,14 @@ impl WlState {
                         serial,
                         time: msg.time_ms,
                     });
-                    pointer.button(self, &ButtonEvent {
-                        serial,
-                        time: msg.time_ms,
-                        button: 0x110, // BTN_LEFT
-                        state: ButtonState::Pressed,
-                    });
+                    if first {
+                        pointer.button(self, &ButtonEvent {
+                            serial,
+                            time: msg.time_ms,
+                            button: 0x110, // BTN_LEFT
+                            state: ButtonState::Pressed,
+                        });
+                    }
                     pointer.frame(self);
                 }
                 TOUCH_PHASE_MOVE => {
@@ -356,12 +368,14 @@ impl WlState {
                     pointer.frame(self);
                 }
                 TOUCH_PHASE_UP => {
-                    pointer.button(self, &ButtonEvent {
-                        serial,
-                        time: msg.time_ms,
-                        button: 0x110, // BTN_LEFT
-                        state: ButtonState::Released,
-                    });
+                    if last {
+                        pointer.button(self, &ButtonEvent {
+                            serial,
+                            time: msg.time_ms,
+                            button: 0x110, // BTN_LEFT
+                            state: ButtonState::Released,
+                        });
+                    }
                     pointer.frame(self);
                 }
                 _ => {}

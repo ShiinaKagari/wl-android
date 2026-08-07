@@ -28,6 +28,14 @@ impl TouchInjector {
         self.logical_height = h as f64;
     }
 
+    /// Number of fingers currently down. MULTI-TOUCH-POINTER: the pointer
+    /// fallback path needs to know when the FIRST finger goes down (send a
+    /// single Pressed) and the LAST goes up (send the matching Released) so
+    /// KWin's pointer button state machine never sees an unbalanced press.
+    pub fn active_count(&self) -> usize {
+        self.active.len()
+    }
+
     fn slot_for(touch_id: i32) -> TouchSlot {
         // TouchSlot from an optional u32 id — use touch_id as the slot id
         TouchSlot::from(Some(touch_id as u32))
