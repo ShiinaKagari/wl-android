@@ -1,7 +1,6 @@
 mod session;
 mod jni_bridge;
 
-use std::collections::VecDeque;
 use std::io::Write;
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
@@ -24,28 +23,105 @@ pub enum AppState {
     Disconnected = 4,
 }
 
-#[derive(Debug)]
-pub struct FrameData {
-    pub width: u32,
-    pub height: u32,
-    /// RENDER-DECOUPLE: pixel fd for the SHM path. The recv thread enqueues
-    /// the fd (ownership transfer) instead of rendering inline; the dedicated
-    /// render thread mmaps it, copies into the window, drops it, and replies
-    /// with a RELEASE so the server can reuse the memfd.
-    pub pixel_fd: Option<OwnedFd>,
+type Handle = i64;
+
+// ── SNAPSHOT-POOL ──────────────────────────────────────────────────────
+// FRONTEND-TEARING FIX: the snapshot (copy out of KWin's shared mapping)
+// must happen on the RECV thread the instant a frame arrives — the render
+// thread can be delayed 0-21ms by ANativeWindow_lock waits, by which time
+// KWin (1-frame delayed release) has rewritten the buffer. State protocol:
+//   FREE    recv may write (mmap copy)
+//   READY   recv finished; render may take
+//   READING render took; recv must NOT touch — data is stable while the
+//           render thread locks ANativeWindow and copies
+// data is UnsafeCell: access is serialized by the state protocol
+// (single writer in FREE, single reader in READING), never concurrent.
+const SNAP_FREE: u8 = 0;
+const SNAP_READY: u8 = 1;
+const SNAP_READING: u8 = 2;
+
+struct SnapshotBuf {
+    data: std::cell::UnsafeCell<Vec<u8>>,
+    w: std::sync::atomic::AtomicU32,
+    h: std::sync::atomic::AtomicU32,
+    state: std::sync::atomic::AtomicU8,
 }
 
-type Handle = i64;
+// SAFETY: the state protocol guarantees no concurrent data access (recv
+// writes only in FREE, render reads only in READING).
+unsafe impl Sync for SnapshotBuf {}
+
+struct SnapshotPool {
+    bufs: [SnapshotBuf; 2],
+}
+
+impl SnapshotPool {
+    fn new() -> Self {
+        let mk = |state: u8| SnapshotBuf {
+            data: std::cell::UnsafeCell::new(Vec::new()),
+            w: std::sync::atomic::AtomicU32::new(0),
+            h: std::sync::atomic::AtomicU32::new(0),
+            state: std::sync::atomic::AtomicU8::new(state),
+        };
+        Self { bufs: [mk(SNAP_FREE), mk(SNAP_FREE)] }
+    }
+
+    /// recv thread: snapshot into the first FREE buffer via `f`. Returns
+    /// false when both buffers are busy (latest-wins drop — the caller
+    /// still owes a RELEASE for the dropped frame) or f failed.
+    fn write_with(&self, w: u32, h: u32, f: impl FnOnce(&mut Vec<u8>) -> bool) -> bool {
+        for b in &self.bufs {
+            if b.state.load(std::sync::atomic::Ordering::Relaxed) == SNAP_FREE {
+                // SAFETY: FREE guarantees recv is the only writer.
+                let data = unsafe { &mut *b.data.get() };
+                if !f(data) {
+                    return false;
+                }
+                b.w.store(w, std::sync::atomic::Ordering::Relaxed);
+                b.h.store(h, std::sync::atomic::Ordering::Relaxed);
+                b.state.store(SNAP_READY, std::sync::atomic::Ordering::Release);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// render thread: take the newest READY buffer (mark READING). Returns
+    /// (idx, w, h) or None.
+    fn take_ready(&self) -> Option<(usize, u32, u32)> {
+        for (i, b) in self.bufs.iter().enumerate().rev() {
+            if b.state.load(std::sync::atomic::Ordering::Relaxed) == SNAP_READY {
+                b.state.store(SNAP_READING, std::sync::atomic::Ordering::Relaxed);
+                return Some((
+                    i,
+                    b.w.load(std::sync::atomic::Ordering::Relaxed),
+                    b.h.load(std::sync::atomic::Ordering::Relaxed),
+                ));
+            }
+        }
+        None
+    }
+
+    /// render thread: data of a READING buffer — stable (recv skips it).
+    fn data(&self, idx: usize) -> &[u8] {
+        // SAFETY: idx was taken via take_ready (READING); recv never writes
+        // a READING buffer.
+        unsafe { &(*self.bufs[idx].data.get()) }
+    }
+
+    /// render thread: finished displaying — release the buffer to recv.
+    fn done(&self, idx: usize) {
+        self.bufs[idx].state.store(SNAP_FREE, std::sync::atomic::Ordering::Release);
+    }
+}
+
+static SNAPSHOT_POOL: std::sync::OnceLock<SnapshotPool> = std::sync::OnceLock::new();
+// ── end SNAPSHOT-POOL ─────────────────────────────────────────────────
 
 struct Inner {
     session: Option<AppSession>,
     state: AppState,
-    /// RENDER-DECOUPLE: recv thread pushes frames here; the render thread
-    /// pops the NEWEST one (latest-wins) so at most two frames are ever in
-    /// flight — safe against the server's 3-buffer FrameCache rotation.
-    /// Wakeup goes through the process-global FRAME_CV (not a field, so the
-    /// render thread's wait never borrows through the mutex it parks on).
-    frame_queue: VecDeque<FrameData>,
+
     /// PERF-13: dedicated write path for input (Touch/Key) — a clone of the
     /// session's write stream, guarded by its own mutex so UI-thread input
     /// never contends with the recv thread's Inner lock (frame bookkeeping).
@@ -150,7 +226,7 @@ extern "system" fn Java_com_wl_android_NativeBridge_nativeInit(
     let state = Arc::new(Mutex::new(Inner {
         session: None,
         state: AppState::Init,
-        frame_queue: VecDeque::new(),
+
         input_write: Mutex::new(None),
         pending_config: None,
         stopped: std::sync::atomic::AtomicBool::new(false),
@@ -209,13 +285,53 @@ extern "system" fn Java_com_wl_android_NativeBridge_nativeInit(
                         },
                         move |width, height, pixel_fd: Option<OwnedFd>| {
                             log::debug!("FRAME: {width}x{height} pixels={}", pixel_fd.is_some());
-                            // RENDER-DECOUPLE: the pixel fd is enqueued
-                            // (latest-wins in the render thread); the recv
-                            // thread never touches ANativeWindow.
-                            if let Ok(mut inner) = on_frame_state.lock() {
-                                inner.state = AppState::Active;
-                                inner.frame_queue.push_back(FrameData { width, height, pixel_fd });
-                                crate::FRAME_CV.notify_one();
+                            // SNAPSHOT-POOL: copy out of the shared mapping
+                            // NOW (recv thread, no ANativeWindow waits) —
+                            // the render thread's later display copy can
+                            // never race KWin's rewrite. RELEASE follows
+                            // immediately.
+                            thread_local! {
+                                static RECV_MMAP_CACHE: std::cell::RefCell<crate::jni_bridge::FdMmapCache> =
+                                    std::cell::RefCell::new(crate::jni_bridge::FdMmapCache::new());
+                            }
+                            if let Some(fd) = pixel_fd {
+                                let wrote = RECV_MMAP_CACHE.with(|cache| {
+                                    let mut cache = cache.borrow_mut();
+                                    SNAPSHOT_POOL.get_or_init(SnapshotPool::new).write_with(
+                                        width, height,
+                                        |out| {
+                                            match crate::jni_bridge::snapshot_frame_into(
+                                                width, height, &fd, &mut cache, out,
+                                            ) {
+                                                Ok(()) => true,
+                                                Err(e) => {
+                                                    log::warn!("snapshot failed: {e}");
+                                                    false
+                                                }
+                                            }
+                                        },
+                                    )
+                                });
+                                if let Ok(mut inner) = on_frame_state.lock() {
+                                    inner.state = AppState::Active;
+                                    crate::FRAME_CV.notify_one();
+                                    // RELEASE: snapshot consumed the shared
+                                    // mapping; KWin may rewrite freely.
+                                    if let Some(ref ws) = inner.input_write.lock().unwrap().clone() {
+                                        let data = wl_android_common::proto::encode(
+                                            &wl_android_common::proto::Message::Release(
+                                                wl_android_common::proto::ReleaseMessage::new(),
+                                            ),
+                                        );
+                                        let mut buf = Vec::with_capacity(4 + data.len());
+                                        buf.extend_from_slice(&(data.len() as u32).to_le_bytes());
+                                        buf.extend_from_slice(&data);
+                                        let _ = ws.lock().unwrap().write(&buf);
+                                    }
+                                    if !wrote {
+                                        log::debug!("snapshot pool busy — dropped frame");
+                                    }
+                                }
                             }
                         },
                         move |w, h, _r, _dpi, _mode| {
@@ -277,125 +393,50 @@ extern "system" fn Java_com_wl_android_NativeBridge_nativeInit(
             let mut blanked_while_disconnected = false;
             // DIAG-BLACKSCREEN: rendered-frame counter for the heartbeat log.
             let mut rendered_frames: u64 = 0;
-            // SNAPSHOT-READ: private frame buffer — pixels are copied out of
-            // the shared KWin mapping immediately, then displayed at leisure.
-            let mut snapshot: Vec<u8> = Vec::new();
-            // Per-fd mmap cache: KWin's buffer pool rotates through a few
-            // fds; mapping each once avoids 32MB mmap+munmap per frame.
-            let mut mmap_cache = crate::jni_bridge::FdMmapCache::new();
             loop {
-                let frame = loop {
+                // SNAPSHOT-POOL: take the newest READY snapshot (marked
+                // READING — recv cannot touch it). Inner lock is held only
+                // for the stop/blank checks, never across the copy.
+                let taken = {
                     let mut guard = render_state.lock().unwrap();
                     if guard.stopped.load(std::sync::atomic::Ordering::Relaxed) {
                         log::info!("render_thread: stopped by destroy");
                         return;
                     }
-                    match guard.frame_queue.pop_back() {
-                        Some(f) => {
-                            // latest-wins: every older queued frame is
-                            // dropped NOW — each one still owes the server a
-                            // RELEASE (its memfd is in flight until the App
-                            // says it is done with it). One RELEASE per
-                            // dropped/consumed fd keeps the server's FIFO
-                            // ownership count exact; leaking them would
-                            // wedge one buffer in flight forever.
-                            let mut dropped = 0usize;
-                            while let Some(old) = guard.frame_queue.pop_front() {
-                                if old.pixel_fd.is_some() {
-                                    dropped += 1;
-                                }
-                            }
-                            // Send the releases OUTSIDE the Inner lock: clone
-                            // the shared write stream, then write.
-                            let ws = guard.input_write.lock().unwrap().clone();
-                            if dropped > 0 {
-                                if let Some(ref ws) = ws {
-                                    let data = wl_android_common::proto::encode(
-                                        &wl_android_common::proto::Message::Release(
-                                            wl_android_common::proto::ReleaseMessage::new(),
-                                        ),
-                                    );
-                                    let mut buf = Vec::with_capacity(4 + data.len());
-                                    buf.extend_from_slice(&(data.len() as u32).to_le_bytes());
-                                    buf.extend_from_slice(&data);
-                                    let mut s = ws.lock().unwrap();
-                                    for _ in 0..dropped {
-                                        let _ = s.write(&buf);
-                                    }
-                                }
-                            }
+                    let pool = SNAPSHOT_POOL.get_or_init(SnapshotPool::new);
+                    match pool.take_ready() {
+                        Some(t) => {
                             blanked_while_disconnected = false;
-                            break f;
+                            Some(t)
                         }
                         None => {
-                            // CONN-STATE: no frame pending and the session is
-                            // gone → blank the screen once (disconnect shows
-                            // black instead of a stale frozen frame). The
-                            // Java overlay adds the Disconnected/Reconnection
-                            // text on top.
                             let disconnected = guard.state != AppState::Active;
                             if disconnected && !blanked_while_disconnected {
                                 blanked_while_disconnected = true;
                                 crate::jni_bridge::blank_screen();
                             }
-                            // Timed park: re-check state even without a new
-                            // frame (a reconnect that never delivers a frame
-                            // would otherwise leave a stale blank on resume).
                             guard = crate::FRAME_CV
                                 .wait_timeout(guard, std::time::Duration::from_millis(100))
                                 .unwrap()
                                 .0;
+                            None
                         }
                     }
                 };
-                if let Some(fd) = frame.pixel_fd {
-                    // SNAPSHOT-READ: copy out of the shared mapping into the
-                    // private snapshot buffer IMMEDIATELY (the lock+display
-                    // copy below can wait 0-15ms on SurfaceFlinger, during
-                    // which KWin would rewrite the shared buffer and tear).
-                    let _ = crate::jni_bridge::snapshot_frame_fd_cached(
-                        frame.width, frame.height, &fd, &mut mmap_cache, &mut snapshot,
+                let Some((idx, w, h)) = taken else { continue };
+                // Display the stable snapshot (READING protects it from recv
+                // while we wait on ANativeWindow_lock — no Inner lock held).
+                let data = SNAPSHOT_POOL.get_or_init(SnapshotPool::new).data(idx);
+                let _ = crate::jni_bridge::render_frame(w, h, data);
+                // Release the buffer back to recv.
+                SNAPSHOT_POOL.get_or_init(SnapshotPool::new).done(idx);
+                rendered_frames += 1;
+                if rendered_frames % 120 == 0 {
+                    log::info!(
+                        "render heartbeat: {rendered_frames} frames rendered ({}x{})",
+                        w,
+                        h,
                     );
-                    // DIAG-BLACKSCREEN: heartbeat — every 120 rendered
-                    // frames log a line so logcat shows whether frames are
-                    // arriving and being rendered (vs. stuck on blank).
-                    rendered_frames += 1;
-                    if rendered_frames % 120 == 0 {
-                        log::info!(
-                            "render heartbeat: {rendered_frames} frames rendered ({}x{}), queue_depth={}",
-                            frame.width,
-                            frame.height,
-                            render_state.lock().unwrap().frame_queue.len(),
-                        );
-                    }
-                    // Stateless: the snapshot has consumed the pixels —
-                    // release the shared mapping NOW (the private snapshot
-                    // feeds the display copy, so KWin may rewrite freely).
-                    drop(fd);
-                    // Display the private snapshot (lock waits no longer
-                    // race KWin's rewrite of the shared buffer).
-                    if !snapshot.is_empty() {
-                        let _ = crate::jni_bridge::render_frame(frame.width, frame.height, &snapshot);
-                    }
-                    // Send via the shared input_write stream — no Inner lock
-                    // needed (it is an independent Arc<Mutex<UnixStream>>),
-                    // so this never contends with the recv thread's frame
-                    // bookkeeping.
-                    let ws = {
-                        let inner = render_state.lock().unwrap();
-                        inner.input_write.lock().unwrap().clone()
-                    };
-                    if let Some(ws) = ws {
-                        let data = wl_android_common::proto::encode(
-                            &wl_android_common::proto::Message::Release(
-                                wl_android_common::proto::ReleaseMessage::new(),
-                            ),
-                        );
-                        let mut buf = Vec::with_capacity(4 + data.len());
-                        buf.extend_from_slice(&(data.len() as u32).to_le_bytes());
-                        buf.extend_from_slice(&data);
-                        let _ = ws.lock().unwrap().write(&buf);
-                    }
                 }
             }
         });

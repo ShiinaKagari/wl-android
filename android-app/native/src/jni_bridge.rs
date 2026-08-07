@@ -258,28 +258,27 @@ impl FdMmapCache {
     }
 }
 
-/// SNAPSHOT-READ: copy the frame's pixels out of the shared mapping into a
-/// private buffer IMMEDIATELY (before any ANativeWindow lock — lock waits
-/// can take 0-15ms, during which KWin would rewrite the buffer under a
-/// delayed release and tear the picture). The private snapshot then feeds
-/// the display copy at leisure. Returns the snapshot slice.
-pub fn snapshot_frame_fd_cached<'a>(
+/// SNAPSHOT-POOL: copy the frame's pixels out of the shared mapping into
+/// `out` IMMEDIATELY (recv thread, before KWin can rewrite the buffer under
+/// a delayed release). The private snapshot then feeds the display copy at
+/// leisure. Returns () on success.
+pub fn snapshot_frame_into(
     width: u32,
     height: u32,
     pixel_fd: &std::os::fd::OwnedFd,
     cache: &mut FdMmapCache,
-    out: &'a mut Vec<u8>,
-) -> Result<&'a [u8], String> {
+    out: &mut Vec<u8>,
+) -> Result<(), String> {
     use std::os::fd::AsRawFd;
     let size = width as usize * height as usize * 4;
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
     if unsafe { libc::fstat(pixel_fd.as_raw_fd(), &mut st) } != 0 {
-        log::error!("snapshot_frame_fd_cached: fstat failed; dropping frame");
+        log::error!("snapshot_frame_into: fstat failed; dropping frame");
         return Err("fstat failed".into());
     }
     let map_len = (st.st_size as usize).min(size);
     if map_len == 0 {
-        log::warn!("snapshot_frame_fd_cached: empty fd; dropping frame");
+        log::warn!("snapshot_frame_into: empty fd; dropping frame");
         return Err("empty fd".into());
     }
     let (ptr, _) = cache.map(pixel_fd.as_raw_fd(), map_len).ok_or_else(|| "mmap failed".to_string())?;
@@ -289,7 +288,7 @@ pub fn snapshot_frame_fd_cached<'a>(
     let slice = unsafe { std::slice::from_raw_parts(ptr, map_len) };
     out.resize(map_len, 0u8);
     out[..map_len].copy_from_slice(slice);
-    Ok(&out[..map_len])
+    Ok(())
 }
 
 /// CONN-STATE: blank the ANativeWindow to pure black. Called by the render
