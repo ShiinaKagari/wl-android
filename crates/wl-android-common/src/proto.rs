@@ -36,24 +36,8 @@ pub const TOUCH_PHASE_CANCEL: u32 = 3;
 pub const TOUCH_PHASE_FRAME: u32 = 4;
 
 // =============================================================================
-// Limits
+// Message structure follows (ConfigMessage, FrameMessage, ...)
 // =============================================================================
-
-pub const MAX_PLANES: usize = 4;
-
-// =============================================================================
-// DRM constants (not from a lib yet, inlined for now)
-// =============================================================================
-
-pub const DRM_FORMAT_MOD_LINEAR: u64 = 0;
-pub const DRM_FORMAT_XRGB8888: u32 = fourcc(b"XR24");
-pub const DRM_FORMAT_ARGB8888: u32 = fourcc(b"AR24");
-pub const DRM_FORMAT_XBGR8888: u32 = fourcc(b"XB24");
-pub const DRM_FORMAT_ABGR8888: u32 = fourcc(b"AB24");
-
-const fn fourcc(s: &[u8; 4]) -> u32 {
-    u32::from_le_bytes(*s)
-}
 
 // =============================================================================
 // 4.1 ConfigMessage (App → server, 32 B; server → App as ConfigUpdate, 32 B)
