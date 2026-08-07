@@ -71,7 +71,7 @@ pub fn set_render_size(width: u32, height: u32) {
 ///
 /// Per-row clamping guarantees we never read past the end of `src`, even when
 /// it is shorter than the full expected `copy_w * copy_h * 4` bytes (e.g. an
-/// fstat-truncated SHM frame, TODO 7), and never write past `dst`.
+/// fstat-truncated SHM frame), and never write past `dst`.
 ///
 /// Returns `true` if a truncated source or destination was detected and one or
 /// more rows were clamped or skipped (caller logs a warning).

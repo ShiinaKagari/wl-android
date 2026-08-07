@@ -1,9 +1,0 @@
-[workspace]
-
-[package]
-name = "brdy-harness"
-version = "0.1.0"
-edition = "2024"
-
-[dependencies]
-wl-android-common = { path = "../../../crates/wl-android-common" }

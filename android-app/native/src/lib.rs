@@ -469,9 +469,10 @@ extern "system" fn Java_com_wl_android_NativeBridge_nativeOnKey(
 /// write end), never the Inner lock that the recv thread holds for frame
 /// handling. Drops the message when no session is connected.
 ///
-/// The underlying UnixStream is the SAME mutex-guarded write end as
-/// send_release/send_config — all App→server sends serialize through it, so
-/// message bytes can never interleave on the SOCK_STREAM.
+/// The underlying UnixStream is the SAME mutex-guarded write end that
+/// send_config and the render thread's RELEASE writes use — all App→server
+/// sends serialize through it, so message bytes can never interleave on the
+/// SOCK_STREAM.
 fn send_input_message(state: &StateRef, msg: &wl_android_common::proto::Message) {
     let Ok(inner) = state.lock() else {
         log::warn!("send_input_message: state lock failed");

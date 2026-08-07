@@ -76,9 +76,9 @@ class MainActivity : Activity(), SurfaceHolder.Callback, StatusListener {
         }
 
         // CONN-STATE overlay: a semi-transparent black layer with the
-        // Disconnected / Reconnection status text, shown above the SurfaceView
-        // whenever nativeGetState is not Active. The native side blanks the
-        // actual surface; this layer only carries the text.
+        // Disconnected / Reconnection status text, shown above the SurfaceView.
+        // The native side blanks the actual surface and calls onStateChanged
+        // (event-driven) to drive this layer's text/visibility.
         statusText = TextView(this).apply {
             setTextColor(android.graphics.Color.WHITE)
             textSize = 24f

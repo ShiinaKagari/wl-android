@@ -53,10 +53,4 @@ fn count_open_fds() -> usize {
         .unwrap_or(0)
 }
 
-/// Read valid fd count from /proc/self/fd, returning None if unavailable.
-pub fn try_count_open_fds() -> Option<usize> {
-    match std::fs::read_dir("/proc/self/fd") {
-        Ok(entries) => Some(entries.count()),
-        Err(_) => None,
-    }
-}
+

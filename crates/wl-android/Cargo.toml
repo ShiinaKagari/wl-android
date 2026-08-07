@@ -7,12 +7,10 @@ license.workspace = true
 
 [dependencies]
 calloop = "0.14.4"
-calloop-wayland-source = "0.4.1"
 drm-fourcc = "2.2.0"
 nix = { version = "0.31.3", features = ["socket", "uio", "fs", "mman"] }
 libc = "0.2"
-smithay = { version = "0.7.0", default-features = false, features = ["wayland_frontend", "backend_vulkan", "desktop"] }
-thiserror = "2.0.19"
+smithay = { version = "0.7.0", default-features = false, features = ["wayland_frontend"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 wayland-protocols = { version = "0.32.13", features = ["server"] }

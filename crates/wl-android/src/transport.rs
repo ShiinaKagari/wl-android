@@ -242,12 +242,6 @@ impl Transport {
     }
 }
 
-impl AsRawFd for Transport {
-    fn as_raw_fd(&self) -> RawFd {
-        self.stream.as_raw_fd()
-    }
-}
-
 // ── Tests ──
 
 #[cfg(test)]

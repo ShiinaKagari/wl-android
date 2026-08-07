@@ -11,3 +11,4 @@ android-app/build/
 android-app/local.properties
 android-app/.kotlin/
 android-app/.idea/
+android-app/app/src/main/jniLibs/
