@@ -149,11 +149,15 @@ fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     // source so vsync ticks are never starved by App traffic.
     let vsync_period = state.vsync_period();
     let vsync_timer = calloop::timer::Timer::from_duration(vsync_period);
+    // DYNAMIC-PERIOD: each tick reschedules using the CURRENT refresh
+    // rate from CONF — a runtime refresh change (LTPO switch, App re-report)
+    // takes effect on the next tick instead of staying stuck at the
+    // startup period.
     event_loop
         .handle()
-        .insert_source(vsync_timer, move |_, _meta, state| {
+        .insert_source(vsync_timer, |_, _meta, state| {
             state.vsync_tick();
-            calloop::timer::TimeoutAction::ToDuration(vsync_period)
+            calloop::timer::TimeoutAction::ToDuration(state.vsync_period())
         })?;
     info!(?vsync_period, "vsync timer started");
 
