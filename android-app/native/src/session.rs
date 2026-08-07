@@ -175,46 +175,28 @@ impl AppSession {
         self.send_message(&Message::Config(conf))
     }
 
-    /// Buffer-ownership signal: the App finished consuming a frame's pixel
-    /// fd and the server may reuse that memfd. Order-only (FIFO on the
-    /// server side) — one release per consumed frame.
-    /// Production sends RELEASE directly via the shared input_write stream
-    /// (render thread, no Inner lock); kept for the wire-level tests.
-    #[allow(dead_code)]
-    pub fn send_release(&self) -> io::Result<()> {
-        self.send_message(&Message::Release(proto::ReleaseMessage::new()))
-    }
-
     // ── Recv (blocking, runs on dedicated thread) ──
 
-    /// Stateless receive loop: send the initial CONF event, then drain
-    /// Frame / ConfigUpdate events. No handshake, no ack — every message is
-    /// an independent event.
+    /// Stateless receive loop: drain Frame / ConfigUpdate events. No
+    /// handshake, no ack — every message is an independent event. CONF is
+    /// sent by the UI layer (nativeOnConfig), flushed on connect by the
+    /// on_connected callback.
     pub fn run_loop(
         read_stream: UnixStream,
-        write_stream: Arc<std::sync::Mutex<UnixStream>>,
         on_connected: impl FnOnce(),
         on_frame: impl Fn(u32, u32, Option<OwnedFd>),
         on_config_update: impl Fn(u32, u32, u32, u32, u32),
     ) -> io::Result<()> {
         log::debug!("run_loop: entered");
         let mut reader = PendingReader::new(read_stream);
-        let wr = write_stream;
 
-        // 1. Send CONF (a plain event, not a handshake) — the server applies
-        // it and mirrors the effective geometry back via ConfigUpdate.
-        // NOTE: the length prefix is a u32 LE (4 bytes) — writing
-        // `usize.to_le_bytes()` (8 bytes) leaks 4 zero bytes into the
-        // stream that the server reads as a message (bad magic) and tears
-        // the session down.
-        let conf_data = proto::encode(&Message::Config(proto::ConfigMessage::new(3392, 2400, 144000, 289, 0, 0)));
-        {
-            let mut s = wr.lock().unwrap();
-            s.write_all(&(conf_data.len() as u32).to_le_bytes())?;
-            s.write_all(&conf_data)?;
-            s.flush()?;
-        }
-        log::info!("CONF sent, entering event loop");
+        // CONF is NOT sent here: the UI layer (ScreenInfoCollector) owns the
+        // real, dynamically-collected config (resolution/refresh/DPI from
+        // Android) and sends it via nativeOnConfig — flushed on connect by
+        // the on_connected callback if it fired earlier. A hardcoded CONF
+        // here (v1 leftover: 3392x2400@144000@289) would race the real one
+        // and briefly configure the server with stale geometry.
+        log::info!("run_loop: waiting for UI config (CONF via nativeOnConfig)");
         on_connected();
 
         // 2. Event loop
@@ -377,7 +359,7 @@ mod tests {
     fn release_message_roundtrip() {
         let (app, mut srv) = UnixStream::pair().unwrap();
         let session = AppSession { write_stream: Arc::new(app) };
-        session.send_release().expect("send RELEASE");
+        session.send_message(&Message::Release(proto::ReleaseMessage::new())).expect("send RELEASE");
 
         use std::io::Read;
         let mut len_buf = [0u8; 4];

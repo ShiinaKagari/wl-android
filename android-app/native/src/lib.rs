@@ -17,7 +17,6 @@ use crate::session::AppSession;
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum AppState {
     Init = 0,
-    Handshake = 1,
     Active = 2,
     /// CONN-STATE: the recv thread's run_loop failed (server died / socket
     /// error). Java's status overlay maps this to "Disconnected"; while the
@@ -186,17 +185,13 @@ extern "system" fn Java_com_wl_android_NativeBridge_nativeInit(
                         if let Some(ws) = inner.session.as_ref().map(|s| s.write_stream.clone()) {
                             inner.input_write.lock().unwrap().replace(ws);
                         }
-                        inner.state = AppState::Handshake;
-                        notify_status(AppState::Handshake);
+                        // Stateless protocol: no handshake — run_loop's
+                        // on_connected callback marks Active right away.
                     }
                     let on_frame_state = state_clone.clone();
                     let on_connected_state = state_clone.clone();
                     let result = AppSession::run_loop(
                         read_stream,
-                        {
-                            let inner = state_clone.lock().unwrap();
-                            inner.session.as_ref().unwrap().write_stream.clone()
-                        },
                         move || {
                             // Stateless protocol: the session is live the
                             // moment it connects (no handshake to wait for).
@@ -335,8 +330,7 @@ extern "system" fn Java_com_wl_android_NativeBridge_nativeInit(
                             // black instead of a stale frozen frame). The
                             // Java overlay adds the Disconnected/Reconnection
                             // text on top.
-                            let disconnected =
-                                guard.state != AppState::Active && guard.state != AppState::Handshake;
+                            let disconnected = guard.state != AppState::Active;
                             if disconnected && !blanked_while_disconnected {
                                 blanked_while_disconnected = true;
                                 crate::jni_bridge::blank_screen();
@@ -411,11 +405,6 @@ extern "system" fn Java_com_wl_android_NativeBridge_nativeSetSurface(
         log::info!("nativeSetSurface: surface cleared — CPU path stays dormant until re-set");
         return;
     }
-    let Some(state) = find(handle) else {
-        log::error!("nativeSetSurface: unknown handle {handle}");
-        return;
-    };
-    let _inner = state.lock().unwrap();
     // SHM-only stateless protocol: frames are pixel fds, rendered via
     // ANativeWindow_lock in the render thread. No Vulkan swapchain, no caps.
     log::info!("nativeSetSurface: surface set — CPU presentation path");
