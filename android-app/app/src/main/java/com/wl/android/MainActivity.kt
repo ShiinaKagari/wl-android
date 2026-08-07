@@ -252,7 +252,9 @@ class MainActivity : Activity(), SurfaceHolder.Callback, StatusListener {
             }
         }
 
-        collector.start()
+        // CONF TIMING: foreground entry re-syncs full-rate config (frame_mode=0)
+        // and starts listening to display changes.
+        collector.onAppForeground()
 
         // Focus can be stolen (e.g. keyguard dismissal, dialog), re-grab after resume.
         surfaceView.post { surfaceView.requestFocus() }
@@ -294,7 +296,10 @@ class MainActivity : Activity(), SurfaceHolder.Callback, StatusListener {
     }
 
     override fun onPause() {
-        collector.stop()
+        // CONF TIMING: background drops to power-save (frame_mode=3) so the
+        // backend quarters the vsync beat and stops listening to display
+        // changes — background churn never reaches KWin.
+        collector.onAppBackground()
         super.onPause()
     }
 
