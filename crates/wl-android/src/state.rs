@@ -1,11 +1,14 @@
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixListener;
 
-/// RELEASE-BACKPRESSURE fuse: if the App stops consuming (stall, dropped
-/// session), force-release the oldest pending buffers past this many so
-/// KWin's EGL pool can never deadlock. KWin typically uses 2-3 buffers; 4
-/// gives the App generous latency while keeping the pool alive.
-const MAX_PENDING_BUFFERS: usize = 4;
+/// DELAYED-RELEASE: each output wl_buffer is held for this many commits
+/// after extraction, then returned to KWin. The App's MAP_SHARED read of
+/// the forwarded dmabuf fd happens only during its memcpy (lock waits do
+/// not read), ~3-6ms — two frames at 144Hz (~14ms) covers it with margin,
+/// so KWin's rewrite can never race the App's read (no tearing), while
+/// KWin's frame rate stays its own capability (NOT gated by App
+/// consumption). Must stay < KWin's pool size (typically 2-3).
+const DELAYED_RELEASE_FRAMES: usize = 2;
 
 use smithay::delegate_compositor;
 use smithay::delegate_content_type;
@@ -180,9 +183,9 @@ pub struct WlState {
     /// KWin rendering at min(144Hz, its own capability).
     pub pending_callbacks: Vec<WlCallback>,
     pub pending_feedbacks: Vec<PresentationFeedbackCallback>,
-    /// RELEASE-BACKPRESSURE: FIFO of output-surface wl_buffers awaiting the
-    /// App's consumption signal. Pop front + release on each RELEASE
-    /// message; force-released oldest-first past MAX_PENDING_BUFFERS.
+    /// DELAYED-RELEASE: FIFO of output-surface wl_buffers held for
+    /// DELAYED_RELEASE_FRAMES commits (App read window) before being
+    /// returned to KWin. RELEASE messages are a pure ack (no gating).
     pub pending_buffers: std::collections::VecDeque<WlBuffer>,
     pub vsync_seq: u64,
 }
@@ -598,24 +601,18 @@ impl CompositorHandler for WlState {
             .toplevel
             .as_ref()
             .is_some_and(|t| surface_tree_contains(t.wl_surface(), surface));
-        // RELEASE-BACKPRESSURE: KWin's buffer is NOT released immediately —
-        // it is queued and released when the App reports consumption
-        // (RELEASE message). The App's MAP_SHARED read of the forwarded
-        // dmabuf fd can then never race KWin's rewrite of the same buffer
-        // (which froze the picture with tearing during animations and
-        // stressed KWin's EGL pipeline into crashing under 144Hz). KWin's
-        // frame rate is naturally capped at the App's consumption rate, so
-        // the EGL pool can never exhaust (the old 0x3001 crash required
-        // holding buffers with NO releases coming back; here every frame
-        // yields exactly one RELEASE).
+        // DELAYED-RELEASE: KWin's buffer is held DELAYED_RELEASE_FRAMES
+        // commits (App read window), then returned — KWin's frame rate is
+        // NOT gated by App consumption (full backpressure serialized KWin
+        // rendering + App rendering per frame: 20-33fps). The App's
+        // MAP_SHARED read only spans its memcpy (~3-6ms), far inside the
+        // window, so no tearing; and KWin reuses buffers 2 frames old, so
+        // its EGL pipeline is never stressed by same-frame reuse.
         if is_output_tree {
             let (extracted, buffer) = extract_tree(surface, &mut self.frame_mem);
             if let Some(buf) = buffer {
                 self.pending_buffers.push_back(buf);
-                // BACKPRESSURE-FUSE: if the App ever stops consuming
-                // (dropped session, stall), force-release the oldest
-                // buffers so KWin never deadlocks on a full pool.
-                while self.pending_buffers.len() > MAX_PENDING_BUFFERS {
+                while self.pending_buffers.len() > DELAYED_RELEASE_FRAMES {
                     if let Some(old) = self.pending_buffers.pop_front() {
                         old.release();
                     }

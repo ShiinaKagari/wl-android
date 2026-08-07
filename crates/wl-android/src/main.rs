@@ -301,15 +301,11 @@ fn handle_land_input(state: &mut WlState) -> bool {
     };
     match session.recv_message() {
         Ok(Some(msg)) => match msg {
-            // RELEASE-BACKPRESSURE: the App consumed one frame — release
-            // the oldest queued KWin buffer (FIFO, one RELEASE per frame).
-            // The App's MAP_SHARED read of the forwarded fd can no longer
-            // race KWin's rewrite of the same dmabuf (tearing fix).
+            // Consumption ack (DELAYED-RELEASE): pure accounting — KWin
+            // buffers are returned by the commit-time delay, not gated on
+            // this (full backpressure serialized KWin+App rendering).
             wl_android_common::proto::Message::Release(_) => {
-                if let Some(buf) = state.pending_buffers.pop_front() {
-                    tracing::debug!("RELEASE: returning KWin buffer to pool");
-                    buf.release();
-                }
+                tracing::debug!("App released a frame");
                 false
             }
             wl_android_common::proto::Message::Touch(tm) => {
