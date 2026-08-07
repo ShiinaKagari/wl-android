@@ -646,24 +646,32 @@ impl CompositorHandler for WlState {
         // its EGL pipeline is never stressed by same-frame reuse.
         if is_output_tree {
             let (extracted, buffer) = extract_tree(surface, &mut self.frame_mem);
-            if let Some(buf) = buffer {
-                self.pending_buffers.push_back(buf);
-                while self.pending_buffers.len() > DELAYED_RELEASE_FRAMES {
-                    if let Some(old) = self.pending_buffers.pop_front() {
-                        old.release();
+            // RELEASE-POLICY: only frames FORWARDED to the App (full output
+            // size) get the delayed release (App read window). Filtered
+            // frames — the 32x32 cursor sprite INSIDE the toplevel tree —
+            // are released IMMEDIATELY: the App never reads them, and
+            // holding them starved KWin's small cursor buffer pool, which
+            // stalled its compositing (output frames stopped, KDE died).
+            let forwardable = matches!(&extracted,
+                Some(ExtractedFrame::Dmabuf(bw, bh, _)) if *bw == self.screen_width && *bh == self.screen_height)
+                || matches!(&extracted,
+                    Some(ExtractedFrame::Shm(bw, bh, _)) if *bw == self.screen_width && *bh == self.screen_height);
+            if forwardable {
+                if let Some(buf) = buffer {
+                    self.pending_buffers.push_back(buf);
+                    while self.pending_buffers.len() > DELAYED_RELEASE_FRAMES {
+                        if let Some(old) = self.pending_buffers.pop_front() {
+                            old.release();
+                        }
                     }
                 }
+            } else if let Some(buf) = buffer {
+                // cursor/aux: no App read — return to KWin immediately.
+                buf.release();
             }
 
             match extracted {
                 Some(ExtractedFrame::Dmabuf(bw, bh, fd)) => {
-                    // FRAME-SIZE-FILTER: only frames matching the output
-                    // size reach the App. KWin's cursor sprite is a
-                    // subsurface INSIDE the toplevel tree (32x32, animates
-                    // at frame rate while the desktop is static), so the
-                    // surface-tree filter cannot exclude it — forwarding it
-                    // would let the App's latest-wins renderer paint the
-                    // tiny cursor frame as the whole picture.
                     if bw == self.screen_width && bh == self.screen_height {
                         tracing::info!(bw, bh, "dmabuf frame — fd forwarded directly (zero copy)");
                         if let Some(session) = &mut self.app_session {
