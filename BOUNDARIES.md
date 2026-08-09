@@ -138,3 +138,17 @@ jni、ndk/ndk-sys、thiserror、tracing、android_logger、insta、proptest、ca
 
 **验证方式**：运行中的桌面栈进程（server / kwin_wayland / plasmashell 等）
 `ps -o user=` 必须为非 root 用户；`XDG_RUNTIME_DIR` 必须指向 `/run/user/<uid>` 且属主正确。
+
+### 8.3 桌面会话启动唯一入口（强制）
+
+**所有 plasma / kde 相关程序（plasmashell、kwin_wayland、plasma_session、ksmserver、
+kactivitymanagerd 等）严禁单独启动**——必须且只能通过 `startplasma-wayland` 命令
+启动整个会话（先起 wl-android server，再 `startplasma-wayland`）。
+
+- ❌ 禁止单独运行 / strace / gdb / 手动拉起任何 KDE 组件（会脱离会话的
+  D-Bus 总线、systemd user 服务联动与正确环境，导致 plasmashell 卡死或崩溃）
+- ❌ 禁止用 `droidspaces run` 直跑 plasmashell/kwin 等做"测试"
+- ✅ 观察 KDE 组件状态用 journald / 日志文件 / `ps` 等只读手段
+- ✅ 完整启动/重启桌面栈的唯一入口：`tools/start-stack.sh`（内部按
+  server → startplasma-wayland 顺序执行）
+
