@@ -318,10 +318,17 @@ impl WlState {
             time_ms = msg.time_ms, active = self.touch_injector.active_count(),
             "touch from App"
         );
+        // TIME-NORMALIZE: the App's time_ms is Android uptime (huge, ~1.3e8ms);
+        // KWin expects monotonic-relative event times and its animation/input
+        // deltas go crazy when handed a timestamp 37 hours in the past —
+        // plasmashell enters a request storm after a touch and gets SIGKILLed.
+        // Remap to ms since server start (same basis as vsync's now_ms).
+        let elapsed = std::time::Instant::now().duration_since(self.clock_epoch);
+        let now_ms = elapsed.as_millis() as u32;
         let touch_opt = self.seat.get_touch();
         if let Some(touch) = touch_opt {
             let ptr = self as *mut Self;
-            unsafe { (*ptr).touch_injector.handle(msg, &touch, &mut *ptr); }
+            unsafe { (*ptr).touch_injector.handle(msg, &touch, &mut *ptr, now_ms); }
         }
 
         let serial = {
@@ -329,6 +336,10 @@ impl WlState {
             self.next_serial += 1;
             s
         };
+
+        // Use the normalized time for pointer events too (same basis as
+        // vsync and touch).
+        let msg_time = now_ms;
 
         // MULTI-TOUCH-POINTER: every touch is ALSO mirrored to the pointer
         // seat so mouse-only surfaces stay interactive. But the mirror must
@@ -354,12 +365,12 @@ impl WlState {
                     pointer.motion(self, Some((surface, surface_pos)), &PointerMotionEvent {
                         location: loc,
                         serial,
-                        time: msg.time_ms,
+                        time: msg_time,
                     });
                     if first {
                         pointer.button(self, &ButtonEvent {
                             serial,
-                            time: msg.time_ms,
+                            time: msg_time,
                             button: 0x110, // BTN_LEFT
                             state: ButtonState::Pressed,
                         });
@@ -370,7 +381,7 @@ impl WlState {
                     pointer.motion(self, Some((surface, surface_pos)), &PointerMotionEvent {
                         location: loc,
                         serial,
-                        time: msg.time_ms,
+                        time: msg_time,
                     });
                     pointer.frame(self);
                 }
@@ -378,7 +389,7 @@ impl WlState {
                     if last {
                         pointer.button(self, &ButtonEvent {
                             serial,
-                            time: msg.time_ms,
+                            time: msg_time,
                             button: 0x110, // BTN_LEFT
                             state: ButtonState::Released,
                         });

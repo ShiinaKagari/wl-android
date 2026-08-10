@@ -53,6 +53,7 @@ impl TouchInjector {
         msg: &TouchMessage,
         touch: &smithay::input::touch::TouchHandle<D>,
         data: &mut D,
+        event_time_ms: u32,
     ) {
         match msg.phase {
             TOUCH_PHASE_DOWN => {
@@ -69,7 +70,7 @@ impl TouchInjector {
                         slot,
                         location: Point::from((x, y)),
                         serial: self.new_serial(),
-                        time: msg.time_ms,
+                        time: event_time_ms,
                     },
                 );
             }
@@ -83,7 +84,7 @@ impl TouchInjector {
                         &MotionEvent {
                             slot: Self::slot_for(msg.touch_id),
                             location: Point::from((x, y)),
-                            time: msg.time_ms,
+                            time: event_time_ms,
                         },
                     );
                 }
@@ -96,7 +97,7 @@ impl TouchInjector {
                         &UpEvent {
                             slot: Self::slot_for(msg.touch_id),
                             serial: self.new_serial(),
-                            time: msg.time_ms,
+                            time: event_time_ms,
                         },
                     );
                 }
