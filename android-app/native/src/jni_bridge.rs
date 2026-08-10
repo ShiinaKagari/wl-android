@@ -10,6 +10,44 @@ unsafe extern "C" {
     fn wl_acquire_window(window: *mut std::ffi::c_void);
     fn wl_set_format(window: *mut std::ffi::c_void) -> std::ffi::c_int;
     fn wl_set_dimensions(window: *mut std::ffi::c_void, width: std::ffi::c_int, height: std::ffi::c_int) -> std::ffi::c_int;
+    /// AHB-PROBE: try to import an external dmabuf fd into an AHardwareBuffer
+    /// via gralloc. Returns 0 (API absent), 1 (import OK), or -errno (failed).
+    /// On success, `pixel_probe` (16 bytes) receives the first pixels read
+    /// back through AHardwareBuffer_lock, proving the buffer is GPU-reachable.
+    fn wl_probe_ahardwarebuffer_import(
+        dmabuf_fd: std::ffi::c_int,
+        width: std::ffi::c_int,
+        height: std::ffi::c_int,
+        stride: std::ffi::c_int,
+        pixel_probe: *mut u8,
+    ) -> std::ffi::c_int;
+}
+
+/// AHB-PROBE (GLOBAL): exposes the probe to lib.rs. Runs on the recv thread
+/// for the first few dmabuf frames only.
+pub fn probe_ahardwarebuffer_import(
+    fd: &std::os::fd::OwnedFd,
+    width: u32,
+    height: u32,
+    stride: u32,
+) -> Result<(), String> {
+    use std::os::fd::AsRawFd;
+    let mut pixel_probe = [0u8; 16];
+    let rc = unsafe {
+        wl_probe_ahardwarebuffer_import(
+            fd.as_raw_fd(),
+            width as _,
+            height as _,
+            stride as _,
+            pixel_probe.as_mut_ptr(),
+        )
+    };
+    match rc {
+        0 => log::info!("AHB-PROBE: createFromHandle API not present (0)"),
+        1 => log::info!("AHB-PROBE: import OK — first pixels {:02x?}", &pixel_probe),
+        err => log::info!("AHB-PROBE: import failed rc={err} (createFromHandle={rc})"),
+    }
+    Ok(())
 }
 
 static WINDOW: Mutex<Option<usize>> = Mutex::new(None);

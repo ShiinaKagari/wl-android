@@ -295,6 +295,19 @@ extern "system" fn Java_com_wl_android_NativeBridge_nativeInit(
                                     std::cell::RefCell::new(crate::jni_bridge::FdMmapCache::new());
                             }
                             if let Some(fd) = pixel_fd {
+                                // AHB-PROBE: import the first few dmabuf frames
+                                // into an AHardwareBuffer to verify gralloc
+                                // accepts KWin-allocated buffers (route A of
+                                // the GPU-present path).
+                                {
+                                    use std::sync::atomic::{AtomicU32, Ordering};
+                                    static PROBED: AtomicU32 = AtomicU32::new(0);
+                                    if PROBED.fetch_add(1, Ordering::Relaxed) < 5 {
+                                        let _ = crate::jni_bridge::probe_ahardwarebuffer_import(
+                                            &fd, width, height, width,
+                                        );
+                                    }
+                                }
                                 let wrote = RECV_MMAP_CACHE.with(|cache| {
                                     let mut cache = cache.borrow_mut();
                                     SNAPSHOT_POOL.get_or_init(SnapshotPool::new).write_with(
