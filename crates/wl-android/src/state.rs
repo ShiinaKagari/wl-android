@@ -325,10 +325,19 @@ impl WlState {
         // Remap to ms since server start (same basis as vsync's now_ms).
         let elapsed = std::time::Instant::now().duration_since(self.clock_epoch);
         let now_ms = elapsed.as_millis() as u32;
+        // TOUCH-INJECT-TOGGLE: WL_DISABLE_TOUCH_INJECT=1 skips the
+        // touch-injector path and only mirrors to the pointer seat — a
+        // bisect switch to isolate which injection path kills plasmashell.
+        static DISABLE_TOUCH_INJECT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let disable_touch = *DISABLE_TOUCH_INJECT.get_or_init(|| {
+            std::env::var("WL_DISABLE_TOUCH_INJECT").is_ok()
+        });
         let touch_opt = self.seat.get_touch();
-        if let Some(touch) = touch_opt {
-            let ptr = self as *mut Self;
-            unsafe { (*ptr).touch_injector.handle(msg, &touch, &mut *ptr, now_ms); }
+        if !disable_touch {
+            if let Some(touch) = touch_opt {
+                let ptr = self as *mut Self;
+                unsafe { (*ptr).touch_injector.handle(msg, &touch, &mut *ptr, now_ms); }
+            }
         }
 
         let serial = {
