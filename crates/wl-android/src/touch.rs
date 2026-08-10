@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use smithay::backend::input::TouchSlot;
 use smithay::input::touch::{DownEvent, MotionEvent, UpEvent};
-use smithay::utils::{Point, Serial};
+use smithay::utils::{Logical, Point, Serial};
 use tracing::debug;
 use wl_android_common::proto::{TouchMessage, TOUCH_PHASE_CANCEL, TOUCH_PHASE_DOWN, TOUCH_PHASE_FRAME, TOUCH_PHASE_MOVE, TOUCH_PHASE_UP};
 
@@ -48,12 +48,19 @@ impl TouchInjector {
     }
 
     /// Handle a touch message.
+    ///
+    /// `focus` is the toplevel surface + its origin in global space. Without
+    /// it smithay treats the touch as having no target and DROPS the event —
+    /// the App's touches never reach KWin (desktop unresponsive). The pointer
+    /// mirror path passes the same surface; here we must pass it too so the
+    /// wl_touch events actually get delivered.
     pub fn handle<D: smithay::input::SeatHandler + 'static>(
         &mut self,
         msg: &TouchMessage,
         touch: &smithay::input::touch::TouchHandle<D>,
         data: &mut D,
         event_time_ms: u32,
+        focus: Option<(<D as smithay::input::SeatHandler>::TouchFocus, Point<f64, Logical>)>,
     ) {
         match msg.phase {
             TOUCH_PHASE_DOWN => {
@@ -65,7 +72,7 @@ impl TouchInjector {
 
                 touch.down(
                     data,
-                    None,
+                    focus,
                     &DownEvent {
                         slot,
                         location: Point::from((x, y)),
@@ -80,7 +87,7 @@ impl TouchInjector {
                     let y = msg.y as f64 * self.logical_height;
                     touch.motion(
                         data,
-                        None,
+                        focus,
                         &MotionEvent {
                             slot: Self::slot_for(msg.touch_id),
                             location: Point::from((x, y)),

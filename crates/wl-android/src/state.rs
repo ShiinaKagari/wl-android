@@ -328,7 +328,15 @@ impl WlState {
         let touch_opt = self.seat.get_touch();
         if let Some(touch) = touch_opt {
             let ptr = self as *mut Self;
-            unsafe { (*ptr).touch_injector.handle(msg, &touch, &mut *ptr, now_ms); }
+            // TOUCH-FOCUS: pass the KWin toplevel surface so wl_touch events
+            // are actually delivered (focus=None drops them — desktop never
+            // sees touches). Same target as the pointer mirror path.
+            let focus = self.toplevel.as_ref().map(|t| {
+                let s = t.wl_surface().clone();
+                let loc: Point<f64, Logical> = (0.0, 0.0).into();
+                (s, loc)
+            });
+            unsafe { (*ptr).touch_injector.handle(msg, &touch, &mut *ptr, now_ms, focus); }
         }
 
         let serial = {
@@ -341,15 +349,11 @@ impl WlState {
         // vsync and touch).
         let msg_time = now_ms;
 
-        // MULTI-TOUCH-POINTER: every touch is ALSO mirrored to the pointer
-        // seat so mouse-only surfaces stay interactive. But the mirror must
-        // never break KWin's pointer button state machine: a two-finger tap
-        // sends DOWN(DOWN) → pointer would see Pressed/Pressed with no
-        // Released between — smithay pushes the button twice and KWin's
-        // internal button tracking asserts/crashes. Fold multi-touch into a
-        // SINGLE button: Pressed on the FIRST finger down, Released on the
-        // LAST finger up, motion for everything in between.
-        if let Some(ref toplevel) = self.toplevel
+        // POINTER-MIRROR-TEST: temporarily disabled to bisect whether the
+        // dual injection (wl_touch + wl_pointer) confuses KWin and kills
+        // plasmashell. Pointer-only mode (touch inject disabled) was stable.
+        if false
+            && let Some(ref toplevel) = self.toplevel
             && let Some(pointer) = self.seat.get_pointer()
         {
             let surface = toplevel.wl_surface().clone();
