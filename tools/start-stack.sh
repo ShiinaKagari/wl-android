@@ -13,16 +13,35 @@ runuser_env() {
     # startup and the shell BLOCKS mid-init (no crash, just frozen with
     # "Failed to acquire watch file descriptor Too many open files").
     # Raise to the hard limit (32768) before launching anything.
-    runuser -u kagari -- sh -c 'ulimit -n 32768; exec env XDG_RUNTIME_DIR=/run/user/1000 WAYLAND_DISPLAY=land-0 LAND_SOCKET=/run/wl-android/land.sock VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/freedreno_icd.aarch64.json MESA_LOADER_DRIVER_OVERRIDE=kgsl vblank_mode=3 EGL_PLATFORM=wayland QT_QPA_PLATFORM=wayland KWIN_COMPOSE=O2 "$@"' -- "$@"
+    # ulimit -c: allow core dumps so plasmashell crashes leave a file for
+    # analysis (default 0 = no core, silent death with no trace).
+    runuser -u kagari -- sh -c 'ulimit -n 32768; ulimit -c unlimited; exec env XDG_RUNTIME_DIR=/run/user/1000 WAYLAND_DISPLAY=land-0 LAND_SOCKET=/run/wl-android/land.sock VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/freedreno_icd.aarch64.json MESA_LOADER_DRIVER_OVERRIDE=kgsl vblank_mode=3 EGL_PLATFORM=wayland QT_QPA_PLATFORM=wayland KWIN_COMPOSE=O2 "$@"' -- "$@"
 }
 
 start_server() {
+    echo "==> killing any existing wl-android server(s)"
+    # Single-instance guarantee: a stale server would keep holding land.sock
+    # and strand the App on a server KWin never talks to (black screen while
+    # everything looks alive). Kill ALL before starting one.
+    # NOTE: match the server binary path exactly — a loose -f pattern also
+    # matches the runuser wrapper command line and kills it, which takes the
+    # freshly-started server down with it (observed: "Killed runuser").
+    pkill -9 -x wl-android 2>/dev/null
+    pkill -9 -f "target/release/wl-android run$" 2>/dev/null
+    sleep 1
+    rm -f /run/wl-android/land.sock
+
     echo "==> starting wl-android (kagari)"
+    # Logs must be writable by kagari (this script runs as root via
+    # droidspaces; a root-owned log from a previous run makes the redirect
+    # fail silently and the server never starts).
     rm -f /tmp/wl-android.log
+    touch /tmp/wl-android.log && chown kagari:kagari /tmp/wl-android.log && chmod 666 /tmp/wl-android.log
     runuser_env setsid /home/kagari/wl-android/target/release/wl-android run \
         > /tmp/wl-android.log 2>&1 < /dev/null &
     sleep 2
-    ps aux | grep "wl-android run" | grep -v grep
+    echo "==> running servers (must be 1):"
+    ps aux | grep "wl-android run" | grep -v grep | grep -v runuser
     echo "==> server log tail:"
     tail -3 /tmp/wl-android.log
 }
@@ -46,6 +65,7 @@ start_plasma() {
             WAYLAND_DISPLAY QT_QPA_PLATFORM LAND_SOCKET XDG_RUNTIME_DIR 2>&1 || true
 
     rm -f /tmp/plasma.log
+    touch /tmp/plasma.log && chown kagari:kagari /tmp/plasma.log && chmod 666 /tmp/plasma.log
     runuser_env setsid dbus-run-session startplasma-wayland \
         > /tmp/plasma.log 2>&1 < /dev/null &
     sleep 8
