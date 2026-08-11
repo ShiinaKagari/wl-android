@@ -295,19 +295,6 @@ extern "system" fn Java_com_wl_android_NativeBridge_nativeInit(
                                     std::cell::RefCell::new(crate::jni_bridge::FdMmapCache::new());
                             }
                             if let Some(fd) = pixel_fd {
-                                // AHB-PROBE: import the first few dmabuf frames
-                                // into an AHardwareBuffer to verify gralloc
-                                // accepts KWin-allocated buffers (route A of
-                                // the GPU-present path).
-                                {
-                                    use std::sync::atomic::{AtomicU32, Ordering};
-                                    static PROBED: AtomicU32 = AtomicU32::new(0);
-                                    if PROBED.fetch_add(1, Ordering::Relaxed) < 5 {
-                                        let _ = crate::jni_bridge::probe_ahardwarebuffer_import(
-                                            &fd, width, height, width,
-                                        );
-                                    }
-                                }
                                 let wrote = RECV_MMAP_CACHE.with(|cache| {
                                     let mut cache = cache.borrow_mut();
                                     SNAPSHOT_POOL.get_or_init(SnapshotPool::new).write_with(
@@ -350,6 +337,9 @@ extern "system" fn Java_com_wl_android_NativeBridge_nativeInit(
                         move |w, h, _r, _dpi, _mode| {
                             log::info!("config_update: {w}x{h}");
                             crate::jni_bridge::set_render_size(w, h);
+                            if crate::jni_bridge::gpu_ready() {
+                                crate::jni_bridge::gpu_resize(w, h);
+                            }
                         },
                     );
                     match result {
@@ -426,7 +416,11 @@ extern "system" fn Java_com_wl_android_NativeBridge_nativeInit(
                             let disconnected = guard.state != AppState::Active;
                             if disconnected && !blanked_while_disconnected {
                                 blanked_while_disconnected = true;
-                                crate::jni_bridge::blank_screen();
+                                if crate::jni_bridge::gpu_ready() {
+                                    crate::jni_bridge::gpu_blank();
+                                } else {
+                                    crate::jni_bridge::blank_screen();
+                                }
                             }
                             guard = crate::FRAME_CV
                                 .wait_timeout(guard, std::time::Duration::from_millis(100))
@@ -440,7 +434,30 @@ extern "system" fn Java_com_wl_android_NativeBridge_nativeInit(
                 // Display the stable snapshot (READING protects it from recv
                 // while we wait on ANativeWindow_lock — no Inner lock held).
                 let data = SNAPSHOT_POOL.get_or_init(SnapshotPool::new).data(idx);
-                let _ = crate::jni_bridge::render_frame(w, h, data);
+                // GPU-BLIT: set up the EGL renderer once (first frame, window
+                // available). Falls back to CPU if EGL is unavailable.
+                {
+                    use std::sync::atomic::{AtomicBool, Ordering};
+                    static GPU_INIT_ATTEMPTED: AtomicBool = AtomicBool::new(false);
+                    if !crate::jni_bridge::gpu_ready()
+                        && !GPU_INIT_ATTEMPTED.swap(true, Ordering::Relaxed)
+                    {
+                        let win = crate::jni_bridge::current_window();
+                        if !win.is_null() {
+                            crate::jni_bridge::gpu_setup(win, w, h);
+                        }
+                    }
+                }
+                // GPU-BLIT: present via PBO-pipelined blit; CPU memcpy path is
+                // the fallback (GPU not ready, or a frame failed to present).
+                let presented = if crate::jni_bridge::gpu_ready() {
+                    crate::jni_bridge::gpu_present(data, w, h)
+                } else {
+                    false
+                };
+                if !presented {
+                    let _ = crate::jni_bridge::render_frame(w, h, data);
+                }
                 // Release the buffer back to recv.
                 SNAPSHOT_POOL.get_or_init(SnapshotPool::new).done(idx);
                 rendered_frames += 1;

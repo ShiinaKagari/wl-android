@@ -10,44 +10,75 @@ unsafe extern "C" {
     fn wl_acquire_window(window: *mut std::ffi::c_void);
     fn wl_set_format(window: *mut std::ffi::c_void) -> std::ffi::c_int;
     fn wl_set_dimensions(window: *mut std::ffi::c_void, width: std::ffi::c_int, height: std::ffi::c_int) -> std::ffi::c_int;
-    /// AHB-PROBE: try to import an external dmabuf fd into an AHardwareBuffer
-    /// via gralloc. Returns 0 (API absent), 1 (import OK), or -errno (failed).
-    /// On success, `pixel_probe` (16 bytes) receives the first pixels read
-    /// back through AHardwareBuffer_lock, proving the buffer is GPU-reachable.
-    fn wl_probe_ahardwarebuffer_import(
-        dmabuf_fd: std::ffi::c_int,
+    /// EGL-BENCH: measure memcpy vs glTexImage2D upload vs swap on a real
+    /// frame. Returns 0 on success (logs EGL-BENCH lines), -1 if EGL unusable.
+    fn wl_bench_egl(
+        window: *mut std::ffi::c_void,
+        pixels: *const u8,
         width: std::ffi::c_int,
         height: std::ffi::c_int,
-        stride: std::ffi::c_int,
-        pixel_probe: *mut u8,
     ) -> std::ffi::c_int;
+    // ── GPU-BLIT: PBO-pipelined EGL fullscreen blit (c/egl_blit.c) ──
+    fn wl_gpu_setup(window: *mut std::ffi::c_void, w: std::ffi::c_int, h: std::ffi::c_int) -> std::ffi::c_int;
+    fn wl_gpu_present(pixels: *const u8, w: std::ffi::c_int, h: std::ffi::c_int) -> std::ffi::c_int;
+    fn wl_gpu_resize(w: std::ffi::c_int, h: std::ffi::c_int) -> std::ffi::c_int;
+    fn wl_gpu_blank() -> std::ffi::c_int;
+    fn wl_gpu_is_ready() -> std::ffi::c_int;
 }
 
-/// AHB-PROBE (GLOBAL): exposes the probe to lib.rs. Runs on the recv thread
-/// for the first few dmabuf frames only.
-pub fn probe_ahardwarebuffer_import(
-    fd: &std::os::fd::OwnedFd,
-    width: u32,
-    height: u32,
-    stride: u32,
-) -> Result<(), String> {
-    use std::os::fd::AsRawFd;
-    let mut pixel_probe = [0u8; 16];
-    let rc = unsafe {
-        wl_probe_ahardwarebuffer_import(
-            fd.as_raw_fd(),
-            width as _,
-            height as _,
-            stride as _,
-            pixel_probe.as_mut_ptr(),
-        )
-    };
-    match rc {
-        0 => log::info!("AHB-PROBE: createFromHandle API not present (0)"),
-        1 => log::info!("AHB-PROBE: import OK — first pixels {:02x?}", &pixel_probe),
-        err => log::info!("AHB-PROBE: import failed rc={err} (createFromHandle={rc})"),
+/// GPU-BLIT: one-time EGL/GLES setup on the render thread. Call with the
+/// ANativeWindow once available; falls back to CPU path on failure.
+pub fn gpu_setup(window: *mut std::ffi::c_void, w: u32, h: u32) -> bool {
+    let rc = unsafe { wl_gpu_setup(window, w as _, h as _) };
+    if rc == 0 {
+        log::info!("GPU-BLIT: renderer ready ({w}x{h})");
+    } else {
+        log::warn!("GPU-BLIT: init failed rc={rc} — CPU path stays active");
     }
-    Ok(())
+    rc == 0
+}
+
+/// GPU-BLIT: present one frame via the PBO-pipelined blit. Returns true if
+/// the frame was presented (GPU path active), false to fall back to CPU.
+pub fn gpu_present(pixels: &[u8], w: u32, h: u32) -> bool {
+    let rc = unsafe { wl_gpu_present(pixels.as_ptr(), w as _, h as _) };
+    rc == 0
+}
+
+/// GPU-BLIT: render-size change (CONFU). Returns true on success.
+pub fn gpu_resize(w: u32, h: u32) -> bool {
+    unsafe { wl_gpu_resize(w as _, h as _) == 0 }
+}
+
+/// GPU-BLIT: blank the EGL surface to black (session disconnected).
+pub fn gpu_blank() -> bool {
+    unsafe { wl_gpu_blank() == 0 }
+}
+
+/// GPU-BLIT: is the GPU renderer set up and usable?
+pub fn gpu_ready() -> bool {
+    unsafe { wl_gpu_is_ready() != 0 }
+}
+
+/// EGL-BENCH: run the GPU-blit bandwidth benchmark once per process using a
+/// real SnapshotPool frame. Called from the render thread with the window +
+/// frame pixels. Logs memcpy/upload/swap timings to the EGL-BENCH tag.
+pub fn bench_egl(window: *mut std::ffi::c_void, pixels: &[u8], w: u32, h: u32) {
+    let rc = unsafe {
+        wl_bench_egl(window, pixels.as_ptr(), w as _, h as _)
+    };
+    if rc != 0 {
+        log::warn!("EGL-BENCH: benchmark unavailable rc={rc}");
+    }
+}
+
+/// Current ANativeWindow pointer (0 when none set). EGL-BENCH needs it to
+/// create a window surface; the render thread calls this once at first frame.
+pub fn current_window() -> *mut std::ffi::c_void {
+    match *WINDOW.lock().unwrap() {
+        Some(w) if w != 0 => w as *mut std::ffi::c_void,
+        _ => std::ptr::null_mut(),
+    }
 }
 
 static WINDOW: Mutex<Option<usize>> = Mutex::new(None);
