@@ -85,16 +85,19 @@ class TouchForwarder(
                 // State transition: deliver immediately, drop any cached
                 // MOVE for this pointer (the state has changed).
                 //
-                // FRAME-BOUNDARY FIX: no FRAME is sent right after DOWN/UP.
-                // The wayland touch protocol groups events: DOWN belongs to
-                // the same logical frame as the MOVE(s) that follow it, and
-                // FRAME closes that group. Sending FRAME immediately after
-                // DOWN split the group (DOWN→FRAME→MOVE) which KWin's touch
-                // state machine rejected — plasmashell got a bogus stream and
-                // was killed. The next MOVE batch (Choreographer callback)
-                // or a subsequent UP terminates the frame instead.
+                // FRAME-BOUNDARY: no FRAME is sent right after DOWN — the
+                // MOVE(s) that follow belong to the same wayland touch frame
+                // group. But UP/CANCEL MUST close the group with a FRAME: a
+                // tap is DOWN→UP with no MOVE, and without the trailing FRAME
+                // the compositor never sees the touch sequence terminate. Its
+                // touch state stays "a point is still active"; the next DOWN
+                // collides and the whole stream desyncs (KWin: "touch move
+                // that never has been down" → plasmashell state corruption).
                 pendingMoves.remove(id)
                 onTouch(id, nx, ny, phase, event.eventTime.toInt())
+                if (phase == TOUCH_UP || phase == TOUCH_CANCEL) {
+                    onTouch(0, 0f, 0f, TOUCH_FRAME, event.eventTime.toInt())
+                }
             }
         }
     }
