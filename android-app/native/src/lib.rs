@@ -223,6 +223,19 @@ extern "system" fn Java_com_wl_android_NativeBridge_nativeInit(
     };
     log::info!("nativeInit: connecting to {path}");
 
+    // INIT-IDEMPOTENT: if a session already exists for this process (e.g.
+    // the Activity was recreated and onCreate ran nativeInit again), reuse it
+    // instead of spawning a SECOND recv thread. Two recv threads each open
+    // their own land connection; the server's replace-on-new-connect (C-01)
+    // then kills one connection per accept, so the killed thread reconnects,
+    // which kills the other — an infinite reconnect loop (socket closed every
+    // second). Returning the existing handle keeps the original recv thread
+    // (and its live connection) untouched.
+    if let Some((handle, _)) = STATE_MAP.lock().unwrap().first().cloned() {
+        log::info!("nativeInit: reusing existing state handle={handle}");
+        return handle;
+    }
+
     let state = Arc::new(Mutex::new(Inner {
         session: None,
         state: AppState::Init,
